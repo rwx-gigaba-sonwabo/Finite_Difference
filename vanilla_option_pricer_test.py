@@ -5,6 +5,7 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import QuantLib as ql
 import numpy as np
+import pandas as pd
 
 class VanillaOptionPricerTest:
     """
@@ -19,9 +20,10 @@ class VanillaOptionPricerTest:
     def __init__(self,
                  spot_price: float,
                  strike_price: float,
-                 risk_free_rate: float,
+                 discount_curve,
+                 forward_curve,
                  volatility: float,
-                 dividend_yield: float,
+                 dividend_schedule: list[tuple[ql.Date, float]],
                  valuation_date: ql.Date,
                  maturity_date: ql.Date,
                  contracts: int,
@@ -46,9 +48,10 @@ class VanillaOptionPricerTest:
         # Store parameters
         self.spot_price = spot_price
         self.strike_price = strike_price
-        self.risk_free_rate = risk_free_rate
+        self.discount_curve = discount_curve
+        self.forward_curve = forward_curve
         self.volatility = volatility
-        self.dividend_yield = dividend_yield
+        self.dividend_schedule = dividend_schedule
         self.valuation_date = valuation_date
         self.maturity_date = maturity_date
         self.contracts = int(contracts)
@@ -64,6 +67,14 @@ class VanillaOptionPricerTest:
         self.calendar = calendar
         self.day_counter = day_counter
         self.trade_number = trade_number
+
+        # Check if the dividend schedule is empty
+        if not self.dividend_schedule:
+            self.dividend_schedule_ql = []  # No dividends expected
+        else:
+            self.dividend_schedule_ql = [
+                ql.FixedDividend(amount, pay_date) for pay_date, amount in self.dividend_schedule
+            ]
 
         # Set up time-period adjustments
         # Time to expiry from valuation to maturity
@@ -96,32 +107,42 @@ class VanillaOptionPricerTest:
         )
 
         # Set up market data curves (continuous compounding)
+        self.discount_curve = self._add_nacc_and_dfs(self.discount_curve)
+        self.forward_curve = self._add_nacc_and_dfs(self.forward_curve)
+        self.discount_rate = self.get_nacc_rate(self.discount_end)
+        self.carry_rate = self.get_forward_nacc_rate(self.carry_start, self.carry_end)
+        self.dividend_yield = self.dividend_yield_nacc()
         self.underlying = ql.SimpleQuote(self.spot_price)
+        self.pv_dividends = self.pv_dividend()
 
-        # curves anchored at t + option_spot_days
+        # curves anchored at t
         self.dividend_curve = ql.FlatForward(
-            self.option_spot_days, self.calendar,
-            0, self.day_counter,
-            ql.Continuous, ql.Annual
+            0,
+            self.calendar,
+            0,
+            self.day_counter,
+            ql.Continuous,  # Compounding type
+            ql.Annual  # Frequency
         )
 
-        self.risk_free_curve = ql.FlatForward(
-            self.underlying_spot_days, self.calendar,
-            risk_free_rate, self.day_counter,
+        self.carry_curve = ql.FlatForward(
+            0, self.calendar,
+            self.discount_rate, self.day_counter,
             ql.Continuous, ql.Annual
         )
 
         self.volatility_curve = ql.BlackConstantVol(
-            self.option_spot_days, self.calendar,
+            0, self.calendar,
             volatility, self.day_counter
         )
 
-        # -------- Spot alignment: make drift run over [t+optSpot → t+U] before PDE --------
-        # a drift with (r - q) reproduces your intended forward window.
-        tau_value_to_cs = self.day_counter.yearFraction(self.discount_start, self.carry_start)
+        self.yield_curve = self.build_quantlib_yield_curve_ts(self.discount_curve)
+
+        tau_value_to_cs = self.day_counter.yearFraction(self.valuation_date, self.carry_start)
+        nacc_rate_value_to_cs = self.get_nacc_rate(self.carry_start)
         tau_carry_start_to_carry_end = self.day_counter.yearFraction(self.carry_start, self.carry_end)
-        self.s_physical = self.spot_price * np.exp(-(self.risk_free_rate - self.dividend_yield) * tau_value_to_cs)
-        self.s_cash = self.spot_price * np.exp(-self.dividend_yield * tau_carry_start_to_carry_end)
+        self.s_physical = self.spot_price * np.exp(- self.dividend_yield * tau_carry_start_to_carry_end) * np.exp(-self.discount_rate * tau_value_to_cs)
+        self.s_cash = self.spot_price #- self.pv_dividends) #* np.exp(-nacc_rate_value_to_cs * tau_value_to_cs)
 
         if self.settlement_type == "physical":
             self.underlying.setValue(self.s_physical)
@@ -132,7 +153,7 @@ class VanillaOptionPricerTest:
         self.process = ql.BlackScholesMertonProcess(
             ql.QuoteHandle(self.underlying),
             ql.YieldTermStructureHandle(self.dividend_curve),
-            ql.YieldTermStructureHandle(self.risk_free_curve),
+            self.yield_curve,
             ql.BlackVolTermStructureHandle(self.volatility_curve)
         )
 
@@ -143,6 +164,97 @@ class VanillaOptionPricerTest:
 
         # Construct QuantLib vanilla option
         self.option = ql.VanillaOption(self.payoff, self.exercise)
+
+    def get_nacc_rate(self, lookup_date: ql.Date) -> float:
+        lookup_date_str = lookup_date.ISO()
+        row = self.discount_curve[self.discount_curve["Date"] == lookup_date_str]
+
+        # Check if the row is empty
+        if row.empty:
+            print(f"Warning: NACC rate not found for date: {lookup_date_str}. Returning default value.")
+            return 0.0  # or some other default value
+
+        naca_rate = row["NACA"].values[0]
+        nacc_rate = np.log(1 + naca_rate)
+        return nacc_rate
+
+    def get_forward_nacc_rate(self, start_date: ql.Date, end_date: ql.Date) -> float:
+        DF_far = self.get_discount_factor(end_date)
+        DF_near = self.get_discount_factor(start_date)
+        forward_tau = self.day_counter.yearFraction(start_date, end_date)
+
+        forward_nacc_rate = -np.log(DF_far / DF_near) * (1 / forward_tau)
+        return forward_nacc_rate
+
+    def get_discount_factor(self, lookup_date: ql.Date) -> float:
+        lookup_date_str = lookup_date.ISO()
+        row = self.discount_curve[self.discount_curve["Date"] == lookup_date_str]
+
+        # Check
+        if row.empty:
+            raise ValueError(f"Discount factor not found for date: {lookup_date_str}")
+
+        naca_rate = row["NACA"].values[0]
+        tau = self.day_counter.yearFraction(self.valuation_date, lookup_date)
+        DF = (1 + naca_rate)**(-tau)
+        return DF
+
+    def _add_nacc_and_dfs(self, data: pd.DataFrame) -> pd.DataFrame:
+        # Convert the 'Date' column to datetime format
+        data['Date'] = pd.to_datetime(data['Date'], format='%Y-%m-%d')
+
+        # Create a QuantLib date from the 'Date' column
+        data['QuantLib_Date'] = data['Date'].apply(lambda date: ql.Date(date.day, date.month, date.year))
+
+        # Calculate NACC
+        data["NACC"] = data["QuantLib_Date"].apply(lambda date: self.get_nacc_rate(date))
+
+        # Calculate Discount Factor
+        data["Discount_Factor"] = data.apply(
+            lambda row: self.get_discount_factor(row["QuantLib_Date"]), axis=1)
+
+        return data
+
+    def pv_dividend(self) -> float:
+        """PV Dividends to carry_start date"""
+        # If no dividends are expected, return 0
+        if not self.dividend_schedule_ql:
+            return 0.0
+
+        pv = 0.0
+        for dividend in self.dividend_schedule_ql:
+            pay_date = dividend.date()
+            amount = dividend.amount()
+            tau = self.day_counter.yearFraction(self.discount_start, pay_date)
+            forward_nacc = self.get_forward_nacc_rate(self.discount_start, pay_date)
+            df = np.exp(-forward_nacc * tau)
+
+            pv += amount * df
+        return pv
+
+
+    def dividend_yield_nacc(self):
+        pv_divs = self.pv_dividend()
+        spot_price = self.spot_price
+        tau = self.time_to_carry
+
+        if spot_price <= pv_divs:
+            raise ValueError("Present value of dividends cannot be greater than or equal to the spot price.")
+
+        dividend_yield_nacc = -np.log((spot_price - pv_divs) / spot_price) * (1 / tau)
+        return dividend_yield_nacc
+
+    def build_quantlib_yield_curve_ts(self, data: pd.DataFrame) -> ql.YieldTermStructureHandle:
+        """
+        Build a QuantLib yield curve from the DataFrame.
+        """
+        # Use the attributes of the Timestamp object directly
+        dates = [ql.Date(int(d.day), int(d.month), int(d.year)) for d in data['Date']]
+        naccs = data['NACC'].tolist()
+
+        curve = ql.ZeroCurve(dates, naccs, self.day_counter, self.calendar)
+        curve.enableExtrapolation()
+        return ql.YieldTermStructureHandle(curve)
 
     def _scale(self, x: float) -> float:
         """Scale a per-contract PV/greek by contracts, multiplier, and side (+/-)."""
@@ -155,18 +267,18 @@ class VanillaOptionPricerTest:
         if self.exercise_type_str.lower() == "european":
             return ql.EuropeanExercise(self.discount_end)
         elif self.exercise_type_str.lower() == "american":
-            return ql.AmericanExercise(self.carry_start, self.carry_end)
+            return ql.AmericanExercise(self.discount_start, self.discount_end)
         else:
             raise ValueError(f"Unsupported exercise type: {self.exercise_type_str}")
 
     def _domain_width_L(self) -> float:
         # Width in log S used by QL’s mesher internally; pick ±K_DOMAIN σ √T on each side
-        T = max(1e-12, self.time_to_expiry)
+        T = max(1e-12, self.time_to_discount)
         return 2.0 * self._K_DOMAIN * self.volatility * sqrt(T)
 
     def _xgrid_for(self, t_steps: int) -> int:
         N = max(self._TGRID_MIN, int(t_steps))
-        T = max(1e-12, self.time_to_expiry)
+        T = max(1e-12, self.time_to_discount)
         L = self._domain_width_L()
         M = int(np.ceil((N * L) / (2.0 * self.volatility * (T**1.5))))
         return max(self._XGRID_MIN, M)
@@ -177,21 +289,21 @@ class VanillaOptionPricerTest:
         M = self._xgrid_for(N)
         # Rannacher: two implicit-Euler start steps; improves stability near kinks
         damping_steps = 2
-        return ql.FdBlackScholesVanillaEngine(self.process, N, M, damping_steps, scheme)
+        return ql.FdBlackScholesVanillaEngine(self.process, self.dividend_schedule_ql,N, M, damping_steps, scheme)
 
     def _price_once(self, t_steps: int, scheme=ql.FdmSchemeDesc.CrankNicolson()):
         engine = self._engine(t_steps, scheme)
         self.option.setPricingEngine(engine)
         pv_engine_at_optSpot = float(self.option.NPV())
 
-        # correction so discounting ends at discount_end, not carry_end.
-        # If carry_end > discount_end (cash case with U>0), undo the extra discount.
-        tau_discEnd_to_carryEnd = self.day_counter.yearFraction(self.discount_end, self.carry_end)
-        tau_discStart_to_carryStart = self.day_counter.yearFraction(self.discount_start, self.carry_start)
-        corr_physical = np.exp((self.risk_free_rate - self.dividend_yield) * tau_discEnd_to_carryEnd)
-        corr_cash = np.exp(-(self.risk_free_rate) * tau_discStart_to_carryStart)
+
+        tau_maturity_to_discEnd = self.day_counter.yearFraction(self.maturity_date, self.carry_end)
+        tau_value_to_discStart = self.day_counter.yearFraction(self.valuation_date, self.carry_start)
+        corr_physical = np.exp(self.discount_rate * tau_value_to_discStart + tau_maturity_to_discEnd)
+        corr_cash_nacc = self.get_forward_nacc_rate(self.maturity_date, self.carry_end)
+        corr_cash = np.exp(-corr_cash_nacc * tau_maturity_to_discEnd)
         if self.settlement_type == "physical":
-            adjusted_pv = pv_engine_at_optSpot *corr_physical
+            adjusted_pv = pv_engine_at_optSpot #*corr_physical
         else:
             adjusted_pv = pv_engine_at_optSpot * corr_cash
         return adjusted_pv
@@ -199,7 +311,6 @@ class VanillaOptionPricerTest:
     def price(self, time_steps: int, scheme=ql.FdmSchemeDesc.CrankNicolson()):
         """
         Price the option using finite difference method with:
-          • optimal Δt-Δx relation (μ ≈ μ*)
           • Richardson extrapolation on time grid (default on)
         """
         pN = self._price_once(time_steps, scheme)
@@ -214,7 +325,7 @@ class VanillaOptionPricerTest:
 
     def batch_price(self, time_steps_list):
         """
-        Price the option over a range of time steps (each with μ ≈ μ*; Richardson on).
+        Price the option over a range of time steps ( Richardson on).
         """
         return {int(steps): self.price(int(steps)) for steps in time_steps_list}
 
@@ -245,13 +356,14 @@ class VanillaOptionPricerTest:
                spot_price=None,
                volatility=None,
                valuation_date=None) -> "VanillaOptionPricerTest":
-        """Minimal internal cloner to reuse your constructor exactly as-is."""
+        """Minimal internal cloner for greeks"""
         return VanillaOptionPricerTest(
             spot_price=self.spot_price if spot_price is None else spot_price,
             strike_price=self.strike_price,
-            risk_free_rate=self.risk_free_rate,
+            discount_curve=self.discount_curve,
+            forward_curve=self.forward_curve,
             volatility=self.volatility if volatility is None else volatility,
-            dividend_yield=self.dividend_yield,
+            dividend_schedule=self.dividend_schedule,
             valuation_date=self.valuation_date if valuation_date is None else valuation_date,
             maturity_date=self.maturity_date,
             contracts=self.contracts,
@@ -276,17 +388,47 @@ class VanillaOptionPricerTest:
         N = int(time_steps[-1]) if isinstance(time_steps, (list, tuple)) else int(time_steps)
 
         # Base price
-        engine = self._engine(N)
-        self.option.setPricingEngine(engine)
+        #engine = self._engine(N)
+        #self.option.setPricingEngine(engine)
         p0 = self._price_once(N)
+        bump = 1e-4 * 100
 
-        # Delta & Gamma (spot bumps)
-        bump =1e-4 * 100
-        dS = bump * self.spot_price
-        p_up = self._clone(spot_price=self.spot_price + dS)._price_once(N)
-        p_dn = self._clone(spot_price=self.spot_price - dS)._price_once(N)
-        delta = self.option.delta() if hasattr(self.option, "delta") else (p_up - p_dn) / (2.0 * dS)
-        gamma = self.option.gamma() if hasattr(self.option, "gamma") else (p_up - 2.0 * p0 + p_dn) / (dS ** 2)
+        #if hasattr(self.option, "delta") and hasattr(self.option, "gamma"):
+         #   delta = self.option.delta()
+          #  gamma = self.option.gamma()
+
+        if self.settlement_type == "cash":
+            #bump up S prime
+            option_up = self._clone()
+            option_up.s_cash = (1 + bump) * self.s_cash
+            option_up.underlying.setValue(option_up.s_cash)
+            p_up = option_up._price_once(N)
+
+            #bump down S prime
+            option_down = self._clone()
+            option_down.s_cash = (1 - bump) * self.s_cash
+            option_down.underlying.setValue(option_down.s_cash)
+            p_dn = option_down._price_once(N)
+
+            d_s_prime = self.s_cash * bump
+            delta =  (p_up - p_dn) / (2.0 * d_s_prime)
+            gamma =  (p_up - 2.0 * p0 + p_dn) / (d_s_prime ** 2)
+        else:
+            # bump up S prime
+            option_up = self._clone()
+            option_up.s_physical = (1 + bump) * self.s_physical
+            option_up.underlying.setValue(option_up.s_physical)
+            p_up = option_up._price_once(N)
+
+            # bump down S prime
+            option_down = self._clone()
+            option_down.s_physical = (1 - bump) * self.s_physical
+            option_down.underlying.setValue(option_down.s_physical)
+            p_dn = option_down._price_once(N)
+
+            d_s_prime = self.s_physical * bump
+            delta = (p_up - p_dn) / (2.0 * d_s_prime)
+            gamma = (p_up - 2.0 * p0 + p_dn) / (d_s_prime ** 2)
 
         # Vega (vol bumps, absolute 0.10% by default)
         bump_v = 1e-4
@@ -333,7 +475,8 @@ class VanillaOptionPricerTest:
             f"Exercise Type   : {self.exercise_type_str}",
             f"Spot Price      : {self.spot_price}",
             f"Strike Price    : {self.strike_price}",
-            f"Risk-Free Rate  : {self.risk_free_rate}",
+            f"Carry_rate      : {self.carry_rate}",
+            f"Discount_rate   : {self.discount_rate}",
             f"Volatility      : {self.volatility}",
             f"Dividend Yield  : {self.dividend_yield}",
             f"Valuation Date  : {self.valuation_date.ISO()}",
@@ -382,8 +525,9 @@ class VanillaOptionPricerTest:
             f"Exercise Type            : {self.exercise_type_str}",
             f"Spot Price               : {self.spot_price}",
             f"Strike Price             : {self.strike_price}",
-            f"Domestic Risk-Free Rate  : {self.risk_free_rate}",
-            f"Foreign Risk-Free Rate   : {self.dividend_yield}",
+            f"Carry_rate               : {self.carry_rate}",
+            f"Discount_rate            : {self.discount_rate}",
+            f"Dividend_yield           : {self.dividend_yield}",
             f"Volatility               : {self.volatility}",
             f"Valuation Date           : {self.valuation_date.ISO()}",
             f"Maturity Date            : {self.maturity_date.ISO()}",
