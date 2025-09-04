@@ -21,13 +21,13 @@ def main_test():
     ]
 
     S0 = 229.74
-    K = 250.00
-    sigma = 0.243373477588
+    K = 190.00
+    sigma = 0.274159019046
 
-    opt_type = "Call"
+    opt_type = "call"
     ex_type = "American"
     settle_type = "cash"
-    trade_number = 201871033
+    trade_number = 201871035
 
     side = "buy"
     contracts = 1

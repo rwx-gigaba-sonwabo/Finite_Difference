@@ -12,7 +12,7 @@ class VanillaOptionPricerTest:
     A class to price vanilla European or American options using the finite difference method.
     """
 
-    _K_DOMAIN     = 1    # log-space half-width multiplier; domain ≈ ± K_DOMAIN * σ * √T
+    _K_DOMAIN     = 3    # log-space half-width multiplier; domain ≈ ± K_DOMAIN * σ * √T
     _XGRID_MIN    = 30     # minimum space nodes
     _TGRID_MIN    = 30     # minimum time steps
     _USE_RICHARDSON = True # enable Richardson (N vs N/2)
@@ -121,13 +121,13 @@ class VanillaOptionPricerTest:
             self.calendar,
             0,
             self.day_counter,
-            ql.Continuous,  # Compounding type
-            ql.Annual  # Frequency
+            ql.Continuous,
+            ql.Annual
         )
 
         self.carry_curve = ql.FlatForward(
             0, self.calendar,
-            self.discount_rate, self.day_counter,
+            self.carry_rate, self.day_counter,
             ql.Continuous, ql.Annual
         )
 
@@ -142,7 +142,14 @@ class VanillaOptionPricerTest:
         nacc_rate_value_to_cs = self.get_nacc_rate(self.carry_start)
         tau_carry_start_to_carry_end = self.day_counter.yearFraction(self.carry_start, self.carry_end)
         self.s_physical = self.spot_price * np.exp(- self.dividend_yield * tau_carry_start_to_carry_end) * np.exp(-self.discount_rate * tau_value_to_cs)
-        self.s_cash = self.spot_price #- self.pv_dividends) #* np.exp(-nacc_rate_value_to_cs * tau_value_to_cs)
+
+        if self.option_type_str == "call":
+            if self.spot_price <= self.strike_price:
+                self.s_cash = (self.spot_price - self.pv_dividends)
+            elif self.spot_price > self.strike_price:
+                self.s_cash = self.spot_price
+        else:
+            self.s_cash = (self.spot_price- self.pv_dividends)
 
         if self.settlement_type == "physical":
             self.underlying.setValue(self.s_physical)
@@ -153,7 +160,7 @@ class VanillaOptionPricerTest:
         self.process = ql.BlackScholesMertonProcess(
             ql.QuoteHandle(self.underlying),
             ql.YieldTermStructureHandle(self.dividend_curve),
-            self.yield_curve,
+            ql.YieldTermStructureHandle(self.carry_curve),
             ql.BlackVolTermStructureHandle(self.volatility_curve)
         )
 
@@ -225,8 +232,8 @@ class VanillaOptionPricerTest:
         for dividend in self.dividend_schedule_ql:
             pay_date = dividend.date()
             amount = dividend.amount()
-            tau = self.day_counter.yearFraction(self.discount_start, pay_date)
-            forward_nacc = self.get_forward_nacc_rate(self.discount_start, pay_date)
+            tau = self.day_counter.yearFraction(self.carry_start, pay_date)
+            forward_nacc = self.get_forward_nacc_rate(self.carry_start, pay_date)
             df = np.exp(-forward_nacc * tau)
 
             pv += amount * df
@@ -234,6 +241,7 @@ class VanillaOptionPricerTest:
 
 
     def dividend_yield_nacc(self):
+        """Back-out a flat q (NACC) that reproduces the PV of discrete dividends over [carry_start, carry_end]"""
         pv_divs = self.pv_dividend()
         spot_price = self.spot_price
         tau = self.time_to_carry
@@ -265,11 +273,32 @@ class VanillaOptionPricerTest:
         Return QuantLib exercise object based on user input.
         """
         if self.exercise_type_str.lower() == "european":
-            return ql.EuropeanExercise(self.discount_end)
+            return ql.EuropeanExercise(self.carry_end)
         elif self.exercise_type_str.lower() == "american":
             return ql.AmericanExercise(self.discount_start, self.discount_end)
         else:
             raise ValueError(f"Unsupported exercise type: {self.exercise_type_str}")
+
+    def _dividend_pay_times_from_value(self):
+        """Calculates Dividend year fractions"""
+        taus = []
+
+        for div in self.dividend_schedule_ql:
+            time = div.date()
+            taus.append(self.day_counter.yearFraction(self.carry_start, time))
+        return sorted(taus)
+
+    def _nearest_horizon_T(self) -> float:
+        """Use the smaller of:
+            - time to first dividend after valuation (early exercise for American Call
+            - time to discount_end
+        """
+        T_disc = max(1e-12, self.time_to_discount)
+        div_times = self._dividend_pay_times_from_value()
+        if not div_times:
+            return T_disc
+        first_dividend = div_times[0]
+        return max(1e-12, min(T_disc,first_dividend))
 
     def _domain_width_L(self) -> float:
         # Width in log S used by QL’s mesher internally; pick ±K_DOMAIN σ √T on each side
@@ -278,18 +307,55 @@ class VanillaOptionPricerTest:
 
     def _xgrid_for(self, t_steps: int) -> int:
         N = max(self._TGRID_MIN, int(t_steps))
-        T = max(1e-12, self.time_to_discount)
+        Tstar = self._nearest_horizon_T()
         L = self._domain_width_L()
-        M = int(np.ceil((N * L) / (2.0 * self.volatility * (T**1.5))))
+        M = int(np.ceil((N * L) / (2.0 * self.volatility * (Tstar**1.5))))
         return max(self._XGRID_MIN, M)
+
+    def _align_tgrid_to_dividends(self, N: int) -> int:
+        """Ensure dividend times fall on grid nodes:
+            - Increase N minimally so that
+            - tau(dividends)/tau(total) * N is near an integer for all dividend pay dates
+        """
+        tau_total = max(1e-12, self.time_to_discount)
+        div_taus = []
+
+        for div in self.dividend_schedule_ql:
+            time_div = div.date()
+            div_taus.append(self.day_counter.yearFraction(self.carry_start, time_div))
+
+        if not div_taus:
+            return N
+
+        for trial in range(N, N + 100):
+            ok = True
+            for tau in div_taus:
+                k = tau / tau_total * trial
+                if abs(k - round(k)) > 1e-6:
+                    ok = False
+                    break
+            if ok:
+                return trial
+
+        return N #Fallback
 
     def _engine(self, t_steps: int, scheme=ql.FdmSchemeDesc.CrankNicolson()):
         """Build engine with optimal x_grid for the given N and Rannacher start-up (dampingSteps=2)."""
-        N = max(self._TGRID_MIN, int(t_steps))
+        N_base = max(self._TGRID_MIN, int(t_steps))
+        N = self._align_tgrid_to_dividends(N_base)
         M = self._xgrid_for(N)
         # Rannacher: two implicit-Euler start steps; improves stability near kinks
         damping_steps = 2
-        return ql.FdBlackScholesVanillaEngine(self.process, self.dividend_schedule_ql,N, M, damping_steps, scheme)
+
+        if self.option_type_str == "call":
+            if self.spot_price <= self.strike_price:
+                engine = ql.FdBlackScholesVanillaEngine(self.process, N, M, damping_steps, scheme)
+            elif self.spot_price > self.strike_price:
+                engine = ql.FdBlackScholesVanillaEngine(self.process, self.dividend_schedule_ql,N, M, damping_steps, scheme)
+        else:
+            engine = ql.FdBlackScholesVanillaEngine(self.process, N, M, damping_steps, scheme)
+
+        return engine
 
     def _price_once(self, t_steps: int, scheme=ql.FdmSchemeDesc.CrankNicolson()):
         engine = self._engine(t_steps, scheme)
