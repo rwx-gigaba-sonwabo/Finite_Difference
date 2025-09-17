@@ -131,55 +131,29 @@ class DiscreteBarrierFDMPricer:
             a_b = t_b / n_mon, with t_b = time from first to last monitoring date.
             Use '+' for upper barriers (moves up), '−' for lower barriers (moves down).
         """
-        # no barrier monitoring => nothing to adjust
         if self.barrier_type in ("none",) or len(self.monitor_dates) == 0:
             return (False, self.lower_barrier, self.upper_barrier, None, None)
 
-        # ensure sorted monitoring dates
-        mons = sorted(self.monitor_dates)
-        first = mons[0]
-        last  = mons[-1]
+        first = min(self.monitor_dates)
+        last  = max(self.monitor_dates)
         if last <= first:
             return (False, self.lower_barrier, self.upper_barrier, None, None)
 
-        # --- Frequent-monitoring decision (uses time-to-expiry t_e) ---
-        t_e = self.T                             # time to expiry (valuation -> maturity)
-        n    = max(1, int(self.time_steps))      # target CN steps
-        dt_eq = t_e / n                          # equidistant step
-        n_min = 1
-        # sum n_m over *consecutive* monitoring intervals (inside [first,last])
-        total_nm = 0
-        for i in range(1, len(mons)):
-            t_mon = self._yf(mons[i-1], mons[i])
-            nm_i = max(n_min, math.ceil(t_mon / max(1e-12, dt_eq)))
-            total_nm += nm_i
+        n_mon = len(self.monitor_dates)
+        # Use the full time-to-expiry as the cadence scale (robust in practice)
+        dt_eff = self.T / max(1, n_mon)   # "effective" average gap
+        frequent = (n_mon >= self.CONT_MONITORING_LIMIT)
 
-        frequent = (total_nm > self.CONT_MONITORING_LIMIT * n)
+        adj = math.exp(self.BGK_BETA * self.sigma * math.sqrt(max(1e-16, dt_eff)))
+        lo_adj = self.lower_barrier / adj if self.lower_barrier is not None else None
+        up_adj = self.upper_barrier * adj if self.upper_barrier is not None else None
 
-        # --- Barrier adjustment (uses t = time to expiry) ---
-        if not frequent:
-            # no switch -> keep original barriers, no continuous window
-            return (False, self.lower_barrier, self.upper_barrier, None, None)
-
-        n_mon = len(mons)
-        t_b   = self._yf(first, last)            # time from first to last monitoring date
-        a_b   = t_b / max(1, n_mon)              # FIS definition
-        t     = t_e                              # time to expiry in φ(t)
-        phi   = 0.5826 * self.sigma * t * a_b
-
-        lo_adj = self.lower_barrier
-        up_adj = self.upper_barrier
-        if lo_adj is not None:
-            lo_adj = lo_adj * math.exp(-phi)     # lower barrier moves DOWN
-        if up_adj is not None:
-            up_adj = up_adj * math.exp(+phi)     # upper barrier moves UP
-
-        # map [first,last] to time-step indices (continuous-monitoring window)
+        # map the continuous window [first,last] to time-step indices
         k0 = int(round(self._yf(self.valuation_date, first) / (self.T / self.time_steps)))
         k1 = int(round(self._yf(self.valuation_date, last)  / (self.T / self.time_steps)))
         k0 = max(0, min(self.time_steps, k0))
         k1 = max(0, min(self.time_steps, k1))
-        return (True, lo_adj, up_adj, min(k0, k1), max(k0, k1))
+        return (frequent, lo_adj, up_adj, min(k0, k1), max(k0, k1))
 
     # ---------- space grid ----------
     def _build_space_grid(self) -> List[float]:
@@ -280,166 +254,131 @@ class DiscreteBarrierFDMPricer:
                 idx = j
         return idx
 
+    # --- build the map of "nearest-to-barrier" indices once (for speed/clarity) ---
+    def _nearest_barrier_index(self, barrier: float, is_up: bool) -> int | None:
+        """
+        For an up barrier, pick the interior node just below the barrier.
+        For a down barrier, pick the interior node just above the barrier.
+        """
+        if barrier is None:
+            return None
+        # find j with S_j < H < S_{j+1}
+        j = None
+        for k in range(1, len(self.S_nodes)):
+            if self.S_nodes[k-1] < barrier < self.S_nodes[k]:
+                j = k-1
+                break
+        if j is None:
+            return None
+        return j if is_up else (j+1)
+
+
     def _one_sided_coeffs(self, i_bar: int) -> tuple[float,float,float,float,float,float]:
         """
         Non-symmetric coefficients at the node nearest the barrier.
         Uses step sizes h_minus = S_i - S_{i-1}, h_plus = S_{i+1} - S_i,
         with the φ safeguard (φ=0.05) as suggested by the FIS doc.
         """
-        S = self.S_nodes
-        i = i_bar
-        h_minus = max(1e-14, S[i] - S[i-1])
-        h_plus  = max(1e-14, S[i+1] - S[i])
+        S_im1 = self.S_nodes[i-1]
+        S_i   = self.S_nodes[i]
+        # distances (positive):
+        h_minus = S_i - S_im1                      # grid step to the left
+        h_plus  = max(1e-14, barrier - S_i)        # distance from S_i to barrier (non-grid)
+        # First derivative:  a V_{i+1} + b V_i + c V_{i-1}, but at barrier there is no V_{i+1};
+        # we approximate using the two interior nodes (i and i-1) plus the virtual point at the barrier.
+        # The FIS doc gives the compact coefficients below (rearranged form):
+        a =  h_minus**2 / (h_plus * (h_plus + h_minus))
+        b = (h_plus**2 - h_minus**2) / (h_plus * h_minus)
+        c = -h_plus**2 / (h_minus * (h_plus + h_minus))
+        # Second derivative: d V_{i+1} + e V_i + f V_{i-1}
+        d =  2.0 / (h_plus * (h_plus + h_minus))
+        e = -2.0 / (h_plus * h_minus)
+        f =  2.0 / (h_minus * (h_plus + h_minus))
+        return (a, b, c), (d, e, f)
 
-        phi = 0.05
-        if h_plus  < phi*h_minus: h_plus  = phi*h_minus
-        if h_minus < phi*h_plus:  h_minus = phi*h_plus
+    def _backward_CN(self,
+                    effective_lower_barrier: float | None,
+                    effective_upper_barrier: float | None,
+                    monitor_steps: dict[int, bool]) -> list[float]:
 
-        # First derivative: V_S ≈ a_i V_{i+1} + b_i V_i + c_i V_{i-1}
-        a_i =  h_plus / (h_plus*(h_minus + h_plus))
-        b_i = (h_plus - h_minus) / (h_minus*h_plus)
-        c_i = -h_minus / (h_minus*(h_minus + h_plus))
-
-        # Second derivative: V_SS ≈ d_i V_{i+1} + e_i V_i + f_i V_{i-1}
-        d_i =  2.0 / (h_minus*(h_minus + h_plus))
-        e_i = -2.0 / (h_minus*h_plus)
-        f_i =  2.0 / (h_plus*(h_minus + h_plus))
-        return a_i, b_i, c_i, d_i, e_i, f_i
-
-    # ---------- PDE stepping ----------
-    def _backward_CN(self, effective_lo: Optional[float], effective_up: Optional[float],
-                     monitor_steps: Dict[int, bool]) -> List[float]:
-        N = len(self.S_nodes) - 1
-        M = self.time_steps
+        N  = len(self.S_nodes) - 1
+        M  = self.time_steps
         dt = self.T / M
-        r = self.flat_r_nacc
-        sigma = self.sigma
-        dS = self.dS
+        r  = float(self.flat_r_nacc)
+        q  = 0.0  # escrowed dividends => PDE with q=0
 
         V = self._terminal_array()
 
-        # node close to barrier (only used inside the “continuous” window)
-        i_barrier = None
-        if self.use_continuous_barrier:
-            i_barrier = self._closest_barrier_index(effective_lo, effective_up)
+        # Pre-compute which interior index needs a one-sided row (if any)
+        idx_lo = self._nearest_barrier_index(effective_lower_barrier, is_up=False) if effective_lower_barrier is not None else None
+        idx_up = self._nearest_barrier_index(effective_upper_barrier, is_up=True)  if effective_upper_barrier is not None else None
 
         for m in range(M, 0, -1):
             theta = 1.0 if (M - m) < self.rannacher_steps else 0.5
 
             sub = [0.0]*(N+1)
-            main = [0.0]*(N+1)
+            dia = [0.0]*(N+1)
             sup = [0.0]*(N+1)
-            rhs =  [0.0]*(N+1)
+            rhs = [0.0]*(N+1)
 
-            # boundary values
+            # Dirichlet boundaries (standard)
+            tau_next = self.T - (m-1)*dt
             if self.option_type == "call":
                 rhs[0] = 0.0
-                rhs[N] = self.S_nodes[-1] - self.strike * math.exp(-r*(self.T - (m-1)*dt))
+                rhs[N] = self.S_nodes[-1] - self.strike * math.exp(-r * tau_next)
             else:
-                rhs[0] = self.strike * math.exp(-r*(self.T - (m-1)*dt))
+                rhs[0] = self.strike * math.exp(-r * tau_next)
                 rhs[N] = 0.0
-            main[0] = 1.0
-            main[N] = 1.0
+            dia[0] = 1.0
+            dia[N] = 1.0
 
+            # interior rows
             for i in range(1, N):
-            S_i = self.S[i]
-            sig2S2 = (sig * S_i) ** 2
+                S = self.S_nodes[i]
+                sig2S2 = (self.sigma * self.sigma) * (S * S)
 
-            # Flags: are we at the closest interior node to an active barrier?
-            use_nonuniform = False
-            barrier_on_left = False  # True for down barrier; False for up barrier
-            h_minus = h_plus = None  # left/right distances for the non-uniform formulas
+                # choose stencil
+                use_one_sided = False
+                coeff_d1 = coeff_d2 = None
+                if self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
+                    if idx_lo is not None and i == idx_lo:
+                        coeff_d1, coeff_d2 = self._one_sided_coeffs(i, effective_lower_barrier)  # near down barrier
+                        use_one_sided = True
+                    if idx_up is not None and i == idx_up:
+                        coeff_d1, coeff_d2 = self._one_sided_coeffs(i, effective_upper_barrier)  # near up barrier
+                        use_one_sided = True
 
-            if self.use_bgk_correction:
-                if idx_lo is not None and i == idx_lo + 1:
-                    # Down-and-out style barrier on the LEFT of node i (between B and i)
-                    # left "point" is the barrier at B = self.S[idx_lo], right point is grid i+1
-                    barrier_on_left = True
-                    use_nonuniform = True
-                    B = self.S[idx_lo]
-                    # distances from node i
-                    h_minus = S_i - B                         # to the barrier (left)
-                    h_plus  = self.S[i+1] - S_i if i+1 <= N else self.S[i] - self.S[i-1]  # to right neighbor
-                if idx_up is not None and i == idx_up - 1:
-                    # Up-and-out style barrier on the RIGHT of node i (between i and B)
-                    # right "point" is the barrier at B, left point is grid i-1
-                    barrier_on_left = False
-                    use_nonuniform = True
-                    B = self.S[idx_up]
-                    h_minus = S_i - self.S[i-1] if i-1 >= 0 else self.S[i+1] - self.S[i]  # to left neighbor
-                    h_plus  = B - S_i                          # to the barrier (right)
+                if use_one_sided:
+                    a,b,c = coeff_d1
+                    d,e,f = coeff_d2
+                    a_minus = 0.5*sig2S2*f + (r-q)*S*c
+                    a_zero  = 0.5*sig2S2*e + (r-q)*S*b - r
+                    a_plus  = 0.5*sig2S2*d + (r-q)*S*a
+                else:
+                    # uniform central stencil (ΔS constant)
+                    dS = self.dS
+                    a_minus = 0.5*sig2S2/(dS*dS) - 0.5*(r-q)*S/dS
+                    a_zero  = -sig2S2/(dS*dS) - r
+                    a_plus  = 0.5*sig2S2/(dS*dS) + 0.5*(r-q)*S/dS
 
-            if use_nonuniform and h_minus > 0 and h_plus > 0:
-                # --- Non-uniform coefficients (FIS formulas)
-                a_i =  h_minus / (h_plus * (h_minus + h_plus))         # multiplies V_{i+1}
-                b_i = (h_plus - h_minus) / (h_minus * h_plus)          # multiplies V_i
-                c_i = -h_plus / (h_minus * (h_minus + h_plus))         # multiplies V_{i-1}
+                # assemble CN: (I - θΔt L) V^{m-1} = (I + (1-θ)Δt L) V^{m}
+                sub[i] = -theta*dt*a_minus
+                dia[i] = 1.0 - theta*dt*a_zero
+                sup[i] = -theta*dt*a_plus
 
-                d_i =  2.0 / (h_plus * (h_minus + h_plus))             # multiplies V_{i+1}
-                e_i = -2.0 / (h_minus * h_plus)                        # multiplies V_i
-                f_i =  2.0 / (h_minus * (h_minus + h_plus))            # multiplies V_{i-1}
+                rhs[i] = (1.0 + (1.0-theta)*dt*a_zero)*V[i] \
+                        + (1.0-theta)*dt*a_minus*V[i-1] \
+                        + (1.0-theta)*dt*a_plus *V[i+1]
 
-                # Build Black–Scholes operator L = 0.5*σ^2 S^2 * V_SS + r S * V_S - r V
-                L_left   = 0.5 * sig2S2 * f_i + r * S_i * c_i
-                L_mid    = 0.5 * sig2S2 * e_i + r * S_i * b_i - r
-                L_right  = 0.5 * sig2S2 * d_i + r * S_i * a_i
+            V = self._solve_tridiagonal(sub, dia, sup, rhs)
 
-                # If the barrier is on the LEFT, V_{i-1} is the barrier value (0 for KO) → drop sub[i]
-                # If the barrier is on the RIGHT, V_{i+1} is the barrier value (0 for KO) → drop sup[i]
-                sub[i]  = 0.0 if barrier_on_left else -theta * dt * L_left
-                sup[i]  = -theta * dt * L_right if barrier_on_left else 0.0
-                diag[i] = 1.0 - theta * dt * L_mid
-
-                # Explicit side (note: barrier value is zero → no extra RHS term)
-                rhs[i]  = (1.0 + (1.0 - theta) * dt * L_mid) * V[i]
-                if not barrier_on_left:
-                    rhs[i] += ((1.0 - theta) * dt * L_left)  * V[i-1]
-                if barrier_on_left:
-                    rhs[i] += ((1.0 - theta) * dt * L_right) * V[i+1]
-
-            else:
-                # --- Default (uniform) row with barrier-aware upwind drift in a band near the barrier
-                drift_left = -r * S_i / (2*dS)
-                drift_mid  =  0.0
-                drift_right=  r * S_i / (2*dS)
-
-                if idx_lo is not None and (i <= idx_lo + self.NEAR_BARRIER_BW):
-                    # Backward (down barrier on the left)
-                    drift_left = -r * S_i / dS
-                    drift_mid  =  r * S_i / dS
-                    drift_right=  0.0
-                if idx_up is not None and (i >= idx_up - self.NEAR_BARRIER_BW):
-                    # Forward (up barrier on the right)
-                    drift_left =  0.0
-                    drift_mid  = -r * S_i / dS
-                    drift_right=  r * S_i / dS
-
-                diff_left  =  0.5 * sig2S2 / (dS**2)
-                diff_mid   = -sig2S2 / (dS**2)
-                diff_right =  0.5 * sig2S2 / (dS**2)
-
-                L_left  = diff_left  + drift_left
-                L_mid   = diff_mid   + drift_mid  - r
-                L_right = diff_right + drift_right
-
-                sub[i]  = -theta * dt * L_left
-                diag[i] =  1.0 - theta * dt * L_mid
-                sup[i]  = -theta * dt * L_right
-
-                rhs[i]  = (1.0 + (1.0 - theta) * dt * L_mid) * V[i] \
-                        + ((1.0 - theta) * dt * L_left)  * V[i-1] \
-                        + ((1.0 - theta) * dt * L_right) * V[i+1]
-
-            V = self._solve_tridiagonal(sub, main, sup, rhs)
-
-            # barrier projection at monitoring instants
-            step_index_after = (m-1)
-            if step_index_after in monitor_steps:
-                self._apply_knockout(V, effective_lo, effective_up)
-                # IMPORTANT: no Rannacher restart on barrier events
+            # knock-out projection at monitoring times
+            k_after = (m-1)
+            if k_after in monitor_steps:
+                self._apply_knockout(V, effective_lower_barrier, effective_upper_barrier)
+                # per FIS: do NOT trigger a Rannacher restart because of the barrier projection
 
         return V
-
     # ---------- price ----------
     def price(self) -> float:
         # escrow dividends outside this class -> pass effective spot
