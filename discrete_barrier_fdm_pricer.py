@@ -273,6 +273,58 @@ class DiscreteBarrierFDMPricer:
         return j if is_up else (j+1)
 
 
+    def _one_sided_row_coeffs(self, i: int, barrier_level: float, rebate_value: float = 0.0):
+        """
+        Build the operator row L(V)_i at the interior node i that is closest to a barrier B,
+        using the unequal three-point stencil with points (S_{i-1}, S_i, B).
+
+        Returns:
+            a_im1, a_i, const_term
+        such that:
+            L(V)_i = a_im1 * V_{i-1} + a_i * V_i + const_term,
+        where const_term contains all pieces that multiply the known barrier value (rebate).
+        """
+        S_im1 = self.S_nodes[i-1]
+        S_i   = self.S_nodes[i]
+
+        # Distances (positive)
+        h_minus = max(1e-14, S_i - S_im1)               # grid step to the left
+        h_plus  = max(1e-14, barrier_level - S_i)       # distance from S_i to the barrier (not a grid node)
+
+        # FIS safeguard when barrier is *very* close: h_plus >= phi * h_minus
+        phi = 0.05
+        if h_plus < phi * h_minus:
+            # move the evaluation slightly towards the barrier by adding "alpha" to h_plus as per doc
+            h_plus = phi * h_minus
+
+        # Unequal three-point weights at x = S_i, for nodes (S_{i-1}, S_i, B)
+        # First derivative dV/dS ≈ w0 * V_{i-1} + w1 * V_i + w2 * V_B
+        w0  = -h_plus / (h_minus * (h_minus + h_plus))
+        w1  =  (h_plus - h_minus) / (h_minus * h_plus)
+        w2  =  h_minus / (h_plus * (h_minus + h_plus))
+
+        # Second derivative d2V/dS2 ≈ W0 * V_{i-1} + W1 * V_i + W2 * V_B
+        W0  =  2.0 / (h_minus * (h_minus + h_plus))
+        W1  = -2.0 / (h_minus * h_plus)
+        W2  =  2.0 / (h_plus  * (h_minus + h_plus))
+
+        # Black–Scholes operator pieces at S_i
+        S = S_i
+        sig2S2 = (self.sigma * self.sigma) * (S * S)
+        r  = float(self.flat_r_nacc)
+        q  = 0.0  # dividend PV escrowed ⇒ PDE with q=0
+
+        # L(V)_i = 0.5*σ^2 S^2 * (W0 V_{i-1} + W1 V_i + W2 V_B)
+        #        + (r-q) S     * (w0 V_{i-1} + w1 V_i + w2 V_B)
+        #        - r * V_i
+        a_im1 = 0.5 * sig2S2 * W0 + (r - q) * S * w0
+        a_i   = 0.5 * sig2S2 * W1 + (r - q) * S * w1 - r
+        # Constant term from the (known) barrier value V_B = rebate_value
+        const_term = (0.5 * sig2S2 * W2 + (r - q) * S * w2) * rebate_value
+
+        return a_im1, a_i, const_term
+
+
     def _one_sided_coeffs(self, i_bar: int) -> tuple[float,float,float,float,float,float]:
         """
         Non-symmetric coefficients at the node nearest the barrier.
@@ -312,70 +364,72 @@ class DiscreteBarrierFDMPricer:
         # Pre-compute which interior index needs a one-sided row (if any)
         idx_lo = self._nearest_barrier_index(effective_lower_barrier, is_up=False) if effective_lower_barrier is not None else None
         idx_up = self._nearest_barrier_index(effective_upper_barrier, is_up=True)  if effective_upper_barrier is not None else None
+        rebate = 0.0
 
         for m in range(M, 0, -1):
             theta = 1.0 if (M - m) < self.rannacher_steps else 0.5
 
-            sub = [0.0]*(N+1)
-            dia = [0.0]*(N+1)
-            sup = [0.0]*(N+1)
-            rhs = [0.0]*(N+1)
+            sub = [0.0]*(N+1); dia = [0.0]*(N+1); sup = [0.0]*(N+1); rhs = [0.0]*(N+1)
 
-            # Dirichlet boundaries (standard)
+            # boundaries (as you already had)
             tau_next = self.T - (m-1)*dt
             if self.option_type == "call":
                 rhs[0] = 0.0
-                rhs[N] = self.S_nodes[-1] - self.strike * math.exp(-r * tau_next)
+                rhs[N] = self.S_nodes[-1] - self.strike * math.exp(-self.flat_r_nacc * tau_next)
             else:
-                rhs[0] = self.strike * math.exp(-r * tau_next)
+                rhs[0] = self.strike * math.exp(-self.flat_r_nacc * tau_next)
                 rhs[N] = 0.0
-            dia[0] = 1.0
-            dia[N] = 1.0
+            dia[0] = 1.0; dia[N] = 1.0
 
-            # interior rows
             for i in range(1, N):
                 S = self.S_nodes[i]
                 sig2S2 = (self.sigma * self.sigma) * (S * S)
 
-                # choose stencil
-                use_one_sided = False
-                coeff_d1 = coeff_d2 = None
-                if self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
-                    if idx_lo is not None and i == idx_lo:
-                        coeff_d1, coeff_d2 = self._one_sided_coeffs(i, effective_lower_barrier)  # near down barrier
-                        use_one_sided = True
-                    if idx_up is not None and i == idx_up:
-                        coeff_d1, coeff_d2 = self._one_sided_coeffs(i, effective_upper_barrier)  # near up barrier
-                        use_one_sided = True
+                use_lo = (self.barrier_type in ("down-and-out","double-out")) and (idx_lo is not None and i == idx_lo)
+                use_up = (self.barrier_type in ("up-and-out","double-out"))   and (idx_up is not None and i == idx_up)
 
-                if use_one_sided:
-                    a,b,c = coeff_d1
-                    d,e,f = coeff_d2
-                    a_minus = 0.5*sig2S2*f + (r-q)*S*c
-                    a_zero  = 0.5*sig2S2*e + (r-q)*S*b - r
-                    a_plus  = 0.5*sig2S2*d + (r-q)*S*a
+                if use_lo:
+                    a_im1, a_i, const_term = self._one_sided_row_coeffs(i, effective_lower_barrier, rebate)
+                    # CN assembly with NO 'sup' (no V_{i+1} term) and constant goes to RHS with total +dt
+                    sub[i] = -theta * dt * a_im1
+                    dia[i] = 1.0 - theta * dt * a_i
+                    sup[i] = 0.0
+                    rhs[i] = (1.0 + (1.0 - theta) * dt * a_i) * V[i] \
+                        + (1.0 - theta) * dt * a_im1 * V[i-1] \
+                        + dt * const_term
+
+                elif use_up:
+                    a_im1, a_i, const_term = self._one_sided_row_coeffs(i, effective_upper_barrier, rebate)
+                    # For an up barrier, the nearest interior node is *below* the barrier,
+                    # still the same (i-1, i, B) stencil is used.
+                    sub[i] = -theta * dt * a_im1
+                    dia[i] = 1.0 - theta * dt * a_i
+                    sup[i] = 0.0
+                    rhs[i] = (1.0 + (1.0 - theta) * dt * a_i) * V[i] \
+                        + (1.0 - theta) * dt * a_im1 * V[i-1] \
+                        + dt * const_term
+
                 else:
-                    # uniform central stencil (ΔS constant)
+                    # standard central CN row
                     dS = self.dS
+                    r  = float(self.flat_r_nacc); q = 0.0
                     a_minus = 0.5*sig2S2/(dS*dS) - 0.5*(r-q)*S/dS
-                    a_zero  = -sig2S2/(dS*dS) - r
+                    a_zero  = -sig2S2/(dS*dS)    - r
                     a_plus  = 0.5*sig2S2/(dS*dS) + 0.5*(r-q)*S/dS
 
-                # assemble CN: (I - θΔt L) V^{m-1} = (I + (1-θ)Δt L) V^{m}
-                sub[i] = -theta*dt*a_minus
-                dia[i] = 1.0 - theta*dt*a_zero
-                sup[i] = -theta*dt*a_plus
+                    sub[i] = -theta * dt * a_minus
+                    dia[i] =  1.0   - theta * dt * a_zero
+                    sup[i] = -theta * dt * a_plus
+                    rhs[i] = (1.0 + (1.0 - theta) * dt * a_zero) * V[i] \
+                        + (1.0 - theta) * dt * a_minus * V[i-1] \
+                        + (1.0 - theta) * dt * a_plus  * V[i+1]
 
-                rhs[i] = (1.0 + (1.0-theta)*dt*a_zero)*V[i] \
-                        + (1.0-theta)*dt*a_minus*V[i-1] \
-                        + (1.0-theta)*dt*a_plus *V[i+1]
+                V = self._solve_tridiagonal(sub, dia, sup, rhs)
 
-            V = self._solve_tridiagonal(sub, dia, sup, rhs)
-
-            # knock-out projection at monitoring times
-            k_after = (m-1)
-            if k_after in monitor_steps:
-                self._apply_knockout(V, effective_lower_barrier, effective_upper_barrier)
+                # barrier projection at monitoring steps (unchanged)
+                k_after = m - 1
+                if k_after in monitor_steps:
+                    self._apply_knockout(V, effective_lower_barrier, effective_upper_barrier)
                 # per FIS: do NOT trigger a Rannacher restart because of the barrier projection
 
         return V
