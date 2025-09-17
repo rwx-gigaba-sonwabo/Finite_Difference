@@ -342,43 +342,93 @@ class DiscreteBarrierFDMPricer:
             main[N] = 1.0
 
             for i in range(1, N):
-                S = self.S_nodes[i]
-                sig2S2 = (sigma**2) * (S**2)
+            S_i = self.S[i]
+            sig2S2 = (sig * S_i) ** 2
 
-                use_asym = (i_barrier is not None) and (i == i_barrier) \
-                           and (self.continuous_k0 is not None) and (self.continuous_k1 is not None) \
-                           and (self.continuous_k0 <= (m-1) <= self.continuous_k1)
+            # Flags: are we at the closest interior node to an active barrier?
+            use_nonuniform = False
+            barrier_on_left = False  # True for down barrier; False for up barrier
+            h_minus = h_plus = None  # left/right distances for the non-uniform formulas
 
-                if not use_asym:
-                    # standard CN coefficients
-                    a_impl = 0.5*dt*theta*( sig2S2/(dS**2) - r*S/dS )
-                    b_impl = 1.0 + dt*theta*( sig2S2/(dS**2) + r )
-                    c_impl = 0.5*dt*theta*( sig2S2/(dS**2) + r*S/dS )
+            if self.use_bgk_correction:
+                if idx_lo is not None and i == idx_lo + 1:
+                    # Down-and-out style barrier on the LEFT of node i (between B and i)
+                    # left "point" is the barrier at B = self.S[idx_lo], right point is grid i+1
+                    barrier_on_left = True
+                    use_nonuniform = True
+                    B = self.S[idx_lo]
+                    # distances from node i
+                    h_minus = S_i - B                         # to the barrier (left)
+                    h_plus  = self.S[i+1] - S_i if i+1 <= N else self.S[i] - self.S[i-1]  # to right neighbor
+                if idx_up is not None and i == idx_up - 1:
+                    # Up-and-out style barrier on the RIGHT of node i (between i and B)
+                    # right "point" is the barrier at B, left point is grid i-1
+                    barrier_on_left = False
+                    use_nonuniform = True
+                    B = self.S[idx_up]
+                    h_minus = S_i - self.S[i-1] if i-1 >= 0 else self.S[i+1] - self.S[i]  # to left neighbor
+                    h_plus  = B - S_i                          # to the barrier (right)
 
-                    a_expl = -0.5*dt*(1-theta)*( sig2S2/(dS**2) - r*S/dS )
-                    b_expl = 1.0 - dt*(1-theta)*( sig2S2/(dS**2) + r )
-                    c_expl = -0.5*dt*(1-theta)*( sig2S2/(dS**2) + r*S/dS )
+            if use_nonuniform and h_minus > 0 and h_plus > 0:
+                # --- Non-uniform coefficients (FIS formulas)
+                a_i =  h_minus / (h_plus * (h_minus + h_plus))         # multiplies V_{i+1}
+                b_i = (h_plus - h_minus) / (h_minus * h_plus)          # multiplies V_i
+                c_i = -h_plus / (h_minus * (h_minus + h_plus))         # multiplies V_{i-1}
 
-                    sub[i]  = -a_impl
-                    main[i] =  b_impl
-                    sup[i]  = -c_impl
-                    rhs[i]  =  a_expl*V[i-1] + b_expl*V[i] + c_expl*V[i+1]
-                else:
-                    # non-symmetric row at nearest-barrier node
-                    a_i, b_i, c_i, d_i, e_i, f_i = self._one_sided_coeffs(i)
-                    # L V = 0.5 σ² S² V_SS + r S V_S − r V
-                    L_left   = 0.5*sig2S2*f_i + r*S*c_i
-                    L_center = 0.5*sig2S2*e_i + r*S*b_i - r
-                    L_right  = 0.5*sig2S2*d_i + r*S*a_i
+                d_i =  2.0 / (h_plus * (h_minus + h_plus))             # multiplies V_{i+1}
+                e_i = -2.0 / (h_minus * h_plus)                        # multiplies V_i
+                f_i =  2.0 / (h_minus * (h_minus + h_plus))            # multiplies V_{i-1}
 
-                    # (I - θΔt L) V^{m-1} = (I + (1-θ)Δt L) V^{m}
-                    sub[i]  =  +theta*dt*(-L_left)
-                    main[i] =   1.0 + theta*dt*(-L_center)
-                    sup[i]  =  +theta*dt*(-L_right)
+                # Build Black–Scholes operator L = 0.5*σ^2 S^2 * V_SS + r S * V_S - r V
+                L_left   = 0.5 * sig2S2 * f_i + r * S_i * c_i
+                L_mid    = 0.5 * sig2S2 * e_i + r * S_i * b_i - r
+                L_right  = 0.5 * sig2S2 * d_i + r * S_i * a_i
 
-                    rhs[i]  = (1.0 - (1.0-theta)*dt*(-L_center))*V[i] \
-                              + (1.0-theta)*dt*(-L_right )*V[i+1] \
-                              + (1.0-theta)*dt*(-L_left  )*V[i-1]
+                # If the barrier is on the LEFT, V_{i-1} is the barrier value (0 for KO) → drop sub[i]
+                # If the barrier is on the RIGHT, V_{i+1} is the barrier value (0 for KO) → drop sup[i]
+                sub[i]  = 0.0 if barrier_on_left else -theta * dt * L_left
+                sup[i]  = -theta * dt * L_right if barrier_on_left else 0.0
+                diag[i] = 1.0 - theta * dt * L_mid
+
+                # Explicit side (note: barrier value is zero → no extra RHS term)
+                rhs[i]  = (1.0 + (1.0 - theta) * dt * L_mid) * V[i]
+                if not barrier_on_left:
+                    rhs[i] += ((1.0 - theta) * dt * L_left)  * V[i-1]
+                if barrier_on_left:
+                    rhs[i] += ((1.0 - theta) * dt * L_right) * V[i+1]
+
+            else:
+                # --- Default (uniform) row with barrier-aware upwind drift in a band near the barrier
+                drift_left = -r * S_i / (2*dS)
+                drift_mid  =  0.0
+                drift_right=  r * S_i / (2*dS)
+
+                if idx_lo is not None and (i <= idx_lo + self.NEAR_BARRIER_BW):
+                    # Backward (down barrier on the left)
+                    drift_left = -r * S_i / dS
+                    drift_mid  =  r * S_i / dS
+                    drift_right=  0.0
+                if idx_up is not None and (i >= idx_up - self.NEAR_BARRIER_BW):
+                    # Forward (up barrier on the right)
+                    drift_left =  0.0
+                    drift_mid  = -r * S_i / dS
+                    drift_right=  r * S_i / dS
+
+                diff_left  =  0.5 * sig2S2 / (dS**2)
+                diff_mid   = -sig2S2 / (dS**2)
+                diff_right =  0.5 * sig2S2 / (dS**2)
+
+                L_left  = diff_left  + drift_left
+                L_mid   = diff_mid   + drift_mid  - r
+                L_right = diff_right + drift_right
+
+                sub[i]  = -theta * dt * L_left
+                diag[i] =  1.0 - theta * dt * L_mid
+                sup[i]  = -theta * dt * L_right
+
+                rhs[i]  = (1.0 + (1.0 - theta) * dt * L_mid) * V[i] \
+                        + ((1.0 - theta) * dt * L_left)  * V[i-1] \
+                        + ((1.0 - theta) * dt * L_right) * V[i+1]
 
             V = self._solve_tridiagonal(sub, main, sup, rhs)
 
