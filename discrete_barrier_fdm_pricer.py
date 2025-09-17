@@ -118,36 +118,68 @@ class DiscreteBarrierFDMPricer:
     # ---------- BGK decision & barrier adjustment ----------
     def _bgk_continuous_decision_and_adjustment(self):
         """
-        If monitoring is 'frequent enough', approximate discrete monitoring with a
-        continuously monitored barrier between the first and last monitoring dates,
-        using BGK’s shift: H_adj = H * exp(±β σ sqrt(Δt_eff)).
+        Decide if monitoring is 'frequent enough' per FIS and compute BGK-adjusted barriers.
+
+        Frequent-enough test (FIS):
+            Δt = t_e / n, where t_e is time to expiry and n is the chosen CN time-steps.
+        For each interval between consecutive monitoring dates:
+                n_m = max(n_min, ceil(t_mon / Δt))
+        If sum(n_m) > n_lim * n  ->  use continuous approximation on [first,last].
+
+        Barrier adjustment (FIS):
+            B_adj(t) = B * exp( ± φ(t) ),    φ(t) = 0.5826 * σ(x_B(t), t) * t * a_b,
+            a_b = t_b / n_mon, with t_b = time from first to last monitoring date.
+            Use '+' for upper barriers (moves up), '−' for lower barriers (moves down).
         """
+        # no barrier monitoring => nothing to adjust
         if self.barrier_type in ("none",) or len(self.monitor_dates) == 0:
             return (False, self.lower_barrier, self.upper_barrier, None, None)
 
-        first, last = min(self.monitor_dates), max(self.monitor_dates)
+        # ensure sorted monitoring dates
+        mons = sorted(self.monitor_dates)
+        first = mons[0]
+        last  = mons[-1]
         if last <= first:
             return (False, self.lower_barrier, self.upper_barrier, None, None)
 
-        n_mon = len(self.monitor_dates)
-        te = self._yf(first, last)                  # span covered by monitoring
-        dt_eff = te / max(1, n_mon - 1)            # effective spacing
+        # --- Frequent-monitoring decision (uses time-to-expiry t_e) ---
+        t_e = self.T                             # time to expiry (valuation -> maturity)
+        n    = max(1, int(self.time_steps))      # target CN steps
+        dt_eq = t_e / n                          # equidistant step
+        n_min = 1
+        # sum n_m over *consecutive* monitoring intervals (inside [first,last])
+        total_nm = 0
+        for i in range(1, len(mons)):
+            t_mon = self._yf(mons[i-1], mons[i])
+            nm_i = max(n_min, math.ceil(t_mon / max(1e-12, dt_eq)))
+            total_nm += nm_i
 
-        # Practical rule consistent with doc: “frequent” if ≥ n_lim instants
-        frequent = (n_mon >= self.CONT_MONITORING_LIMIT)
+        frequent = (total_nm > self.CONT_MONITORING_LIMIT * n)
 
-        # BGK adjusted barriers
-        adj = math.exp(self.BGK_BETA * self.sigma * math.sqrt(max(dt_eff, 1e-12)))
-        lo_adj = self.lower_barrier / adj if self.lower_barrier is not None else None
-        up_adj = self.upper_barrier * adj if self.upper_barrier is not None else None
+        # --- Barrier adjustment (uses t = time to expiry) ---
+        if not frequent:
+            # no switch -> keep original barriers, no continuous window
+            return (False, self.lower_barrier, self.upper_barrier, None, None)
 
-        # map the continuous monitoring window to time-step indices
+        n_mon = len(mons)
+        t_b   = self._yf(first, last)            # time from first to last monitoring date
+        a_b   = t_b / max(1, n_mon)              # FIS definition
+        t     = t_e                              # time to expiry in φ(t)
+        phi   = 0.5826 * self.sigma * t * a_b
+
+        lo_adj = self.lower_barrier
+        up_adj = self.upper_barrier
+        if lo_adj is not None:
+            lo_adj = lo_adj * math.exp(-phi)     # lower barrier moves DOWN
+        if up_adj is not None:
+            up_adj = up_adj * math.exp(+phi)     # upper barrier moves UP
+
+        # map [first,last] to time-step indices (continuous-monitoring window)
         k0 = int(round(self._yf(self.valuation_date, first) / (self.T / self.time_steps)))
         k1 = int(round(self._yf(self.valuation_date, last)  / (self.T / self.time_steps)))
         k0 = max(0, min(self.time_steps, k0))
         k1 = max(0, min(self.time_steps, k1))
-
-        return (frequent, lo_adj, up_adj, min(k0, k1), max(k0, k1))
+        return (True, lo_adj, up_adj, min(k0, k1), max(k0, k1))
 
     # ---------- space grid ----------
     def _build_space_grid(self) -> List[float]:
