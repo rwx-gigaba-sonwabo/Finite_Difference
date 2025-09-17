@@ -1,18 +1,23 @@
+from __future__ import annotations
+from typing import List, Optional, Dict, Tuple, Literal
+from datetime import date
+import math
+import pandas as pd
+
+BarrierType = Literal["none","down-and-out","up-and-out","double-out","down-and-in","up-and-in","double-in"]
 
 class DiscreteBarrierFDMPricer:
     """
-    Discretely monitored barrier option (CN + Rannacher) with
+    Discretely monitored barrier option (Crank–Nicolson + Rannacher) with
     optional BGK continuity correction when monitoring is frequent.
 
-    Flat continuous-compounding short rate is used throughout the grid:
-        flat_r_nacc  (i.e., NACC, 'r' in Black–Scholes).
-
-    Dividends: escrow PV of discrete dividends from discount curve (unchanged).
+    Flat continuous-compounding short rate is used on the grid (NACC).
+    Dividends still handled by escrow (PV from curve) outside this class.
     """
 
     # ---- configuration knobs ----
-    BGK_BETA = 0.5826  # Broadie–Glasserman–Kou constant
-    CONT_MONITORING_LIMIT = 5  # n_lim from the doc (default “5”)
+    BGK_BETA = 0.5826        # Broadie–Glasserman–Kou constant
+    CONT_MONITORING_LIMIT = 5 # n_lim heuristic for “frequent enough” monitoring
 
     def __init__(
         self,
@@ -26,7 +31,7 @@ class DiscreteBarrierFDMPricer:
         lower_barrier: Optional[float] = None,
         upper_barrier: Optional[float] = None,
         monitor_dates: Optional[List[date]] = None,
-        # curves / dividends left as in your code…
+        # curves / dividends handled as in your surrounding app
         discount_curve: Optional[pd.DataFrame] = None,
         forward_curve: Optional[pd.DataFrame] = None,
         dividend_schedule: Optional[List[Tuple[date, float]]] = None,
@@ -35,28 +40,28 @@ class DiscreteBarrierFDMPricer:
         time_steps: int = 400,
         rannacher_steps: int = 2,
         # rate control (flat NACC rate for PDE)
-        flat_r_nacc: float = 0.0,     # <--- NEW: use a single continuous-compounded rate
+        flat_r_nacc: float = 0.0,
         # day count
-        day_count: str = "ACT/365",   # string selector (ACT/365, ACT/360, 30/360, etc.)
+        day_count: str = "ACT/365",
         # behavior flags
-        restart_on_monitoring: bool = False,  # we will ignore for barrier events
+        restart_on_monitoring: bool = False,  # intentionally ignored for barrier events
         mollify_final: bool = True,
         mollify_band_nodes: int = 2,
         price_extrapolation: bool = False,
     ):
-        # ... (same validations)
-        self.spot = spot
-        self.strike = strike
+        # store inputs
+        self.spot = float(spot)
+        self.strike = float(strike)
         self.valuation_date = valuation_date
         self.maturity_date = maturity_date
-        self.sigma = sigma
+        self.sigma = float(sigma)
         self.option_type = option_type
         self.barrier_type = barrier_type
         self.lower_barrier = lower_barrier
         self.upper_barrier = upper_barrier
         self.monitor_dates = sorted(monitor_dates or [])
         self.discount_curve_df = discount_curve.copy() if discount_curve is not None else None
-        self.forward_curve_df = forward_curve.copy() if forward_curve is not None else None
+        self.forward_curve_df  = forward_curve.copy()  if forward_curve  is not None else None
         self.dividend_schedule = sorted(dividend_schedule or [], key=lambda x: x[0])
 
         self.grid_points = int(grid_points)
@@ -64,15 +69,15 @@ class DiscreteBarrierFDMPricer:
         self.rannacher_steps = int(rannacher_steps)
         self.flat_r_nacc = float(flat_r_nacc)
         self.day_count = day_count.upper()
-        self.mollify_final = mollify_final
+        self.mollify_final = bool(mollify_final)
         self.mollify_band_nodes = int(mollify_band_nodes)
-        self.price_extrapolation = price_extrapolation
+        self.price_extrapolation = bool(price_extrapolation)
 
         # year fraction + tenor
         self._yf = self._year_fraction
         self.T = self._yf(self.valuation_date, self.maturity_date)
 
-        # normalize curve DFs if provided (unchanged helper)
+        # normalize curves if provided
         if self.discount_curve_df is not None:
             self.discount_curve_df = self._normalize_curve_df(self.discount_curve_df)
         if self.forward_curve_df is not None:
@@ -84,8 +89,9 @@ class DiscreteBarrierFDMPricer:
         self.time_nodes = [i * self.T / self.time_steps for i in range(self.time_steps + 1)]
 
         # BGK continuity decision and adjusted barriers
-        self.use_continuous_barrier, self.bgk_lower, self.bgk_upper, self.continuous_k0, self.continuous_k1 = \
-            self._bgk_continuous_decision_and_adjustment()
+        (self.use_continuous_barrier,
+         self.bgk_lower, self.bgk_upper,
+         self.continuous_k0, self.continuous_k1) = self._bgk_continuous_decision_and_adjustment()
 
     # ---------- day count ----------
     def _year_fraction(self, d0: date, d1: date) -> float:
@@ -94,55 +100,48 @@ class DiscreteBarrierFDMPricer:
         if self.day_count in ("ACT/360",):
             return max(0.0, (d1 - d0).days) / 360.0
         if self.day_count in ("30/360", "30E/360"):
-            # simple 30/360 US
-            d0y, d0m, d0d = d0.year, d0.month, min(d0.day, 30)
-            d1y, d1m, d1d = d1.year, d1.month, min(d1.day, 30)
-            return ((d1y - d0y) * 360 + (d1m - d0m) * 30 + (d1d - d0d)) / 360.0
-        # default
+            y0, m0, dd0 = d0.year, d0.month, min(d0.day, 30)
+            y1, m1, dd1 = d1.year, d1.month, min(d1.day, 30)
+            return ((y1 - y0) * 360 + (m1 - m0) * 30 + (dd1 - dd0)) / 360.0
         return max(0.0, (d1 - d0).days) / 365.0
+
+    # ---------- curve helper ----------
+    @staticmethod
+    def _normalize_curve_df(df: pd.DataFrame) -> pd.DataFrame:
+        if "Date" not in df.columns or "NACA" not in df.columns:
+            raise ValueError("Curve DataFrame must have columns: 'Date', 'NACA'.")
+        if not pd.api.types.is_string_dtype(df["Date"]):
+            df = df.copy()
+            df["Date"] = pd.to_datetime(df["Date"]).dt.strftime("%Y-%m-%d")
+        return df
 
     # ---------- BGK decision & barrier adjustment ----------
     def _bgk_continuous_decision_and_adjustment(self):
         """
-        Decide if monitoring is 'frequent enough' and compute BGK-adjusted barriers.
-        When True: project every time step between first and last monitoring date
-        with adjusted barrier(s), continuous monitoring style.
+        If monitoring is 'frequent enough', approximate discrete monitoring with a
+        continuously monitored barrier between the first and last monitoring dates,
+        using BGK’s shift: H_adj = H * exp(±β σ sqrt(Δt_eff)).
         """
         if self.barrier_type in ("none",) or len(self.monitor_dates) == 0:
             return (False, self.lower_barrier, self.upper_barrier, None, None)
 
-        # effective cadence between monitoring instants
-        first = min(self.monitor_dates)
-        last = max(self.monitor_dates)
+        first, last = min(self.monitor_dates), max(self.monitor_dates)
         if last <= first:
             return (False, self.lower_barrier, self.upper_barrier, None, None)
 
         n_mon = len(self.monitor_dates)
-        te = self._yf(first, last)                 # time spanned by monitoring (years)
-        dt_eff = te / max(1, n_mon - 1)           # effective interval (years)
+        te = self._yf(first, last)                  # span covered by monitoring
+        dt_eff = te / max(1, n_mon - 1)            # effective spacing
 
-        # decide “frequent enough”: sum over sub-intervals n_m, compare to limiter n_lim*n
-        # We follow the doc spirit with a practical rule: if average interval is small enough
-        # so that (T / dt_eff) >= n_lim * (target time steps / M), use continuous approx.
-        # Simpler: treat frequent if n_mon >= CONT_MONITORING_LIMIT.
+        # Practical rule consistent with doc: “frequent” if ≥ n_lim instants
         frequent = (n_mon >= self.CONT_MONITORING_LIMIT)
 
-        # BGK adjusted barriers (local vol = sigma, a_b = t_b / n_mon from doc)
-        ab = te / max(1, n_mon)                   # approx factor used in doc for φ(t)
-        phi = self.BGK_BETA * self.sigma * ab**0.0  # φ(t) = 0.5826 σ * a_b ; here a_b multiplies σ*sqrt(dt)
-        # We keep the classic exp(± β σ sqrt(Δt_eff))—robust in practice:
-        adj_factor = math.exp(self.BGK_BETA * self.sigma * math.sqrt(dt_eff))
+        # BGK adjusted barriers
+        adj = math.exp(self.BGK_BETA * self.sigma * math.sqrt(max(dt_eff, 1e-12)))
+        lo_adj = self.lower_barrier / adj if self.lower_barrier is not None else None
+        up_adj = self.upper_barrier * adj if self.upper_barrier is not None else None
 
-        lo_adj = self.lower_barrier
-        up_adj = self.upper_barrier
-        if self.lower_barrier is not None:
-            # down barrier (H < S0) ⇒ minus sign
-            lo_adj = self.lower_barrier / adj_factor
-        if self.upper_barrier is not None:
-            # up barrier (H > S0) ⇒ plus sign
-            up_adj = self.upper_barrier * adj_factor
-
-        # map “continuous monitoring window” to time-step indices
+        # map the continuous monitoring window to time-step indices
         k0 = int(round(self._yf(self.valuation_date, first) / (self.T / self.time_steps)))
         k1 = int(round(self._yf(self.valuation_date, last)  / (self.T / self.time_steps)))
         k0 = max(0, min(self.time_steps, k0))
@@ -152,10 +151,6 @@ class DiscreteBarrierFDMPricer:
 
     # ---------- space grid ----------
     def _build_space_grid(self) -> List[float]:
-        """
-        Uniform S-grid with gentle oversizing, snapping K/H exactly onto nodes
-        (helps Greeks smoothness and barrier projection accuracy).
-        """
         anchors = [self.spot, self.strike]
         if self.lower_barrier: anchors.append(self.lower_barrier)
         if self.upper_barrier: anchors.append(self.upper_barrier)
@@ -166,36 +161,35 @@ class DiscreteBarrierFDMPricer:
         dS = (s_max - s_min) / N
         nodes = [s_min + i * dS for i in range(N + 1)]
 
-        def snap(target: Optional[float]):
-            if target is None: return
-            j = min(range(len(nodes)), key=lambda i: abs(nodes[i] - target))
-            nodes[j] = target
+        def snap(x: Optional[float]):
+            if x is None: return
+            j = min(range(len(nodes)), key=lambda i: abs(nodes[i] - x))
+            nodes[j] = x
+
         snap(self.strike); snap(self.lower_barrier); snap(self.upper_barrier)
         return nodes
 
-    # ---------- boundary payoff and mollification ----------
+    # ---------- payoff and smoothing ----------
     def _terminal_payoff(self, S: float) -> float:
         return max(S - self.strike, 0.0) if self.option_type == "call" else max(self.strike - S, 0.0)
 
     def _terminal_array(self) -> List[float]:
-        vT = [self._terminal_payoff(S) for S in self.S_nodes]
+        V = [self._terminal_payoff(S) for S in self.S_nodes]
         if not self.mollify_final or self.mollify_band_nodes <= 0:
-            return vT
-        # simple quadratic smoothing across 2*m nodes about K (per your doc guidance)
+            return V
         m = self.mollify_band_nodes
         k_idx = min(range(len(self.S_nodes)), key=lambda i: abs(self.S_nodes[i] - self.strike))
         i0, i1 = max(0, k_idx - m), min(len(self.S_nodes) - 1, k_idx + m)
-        S0, V0 = self.S_nodes[i0], vT[i0]
-        S1, V1 = self.S_nodes[i1], vT[i1]
+        S0, V0 = self.S_nodes[i0], V[i0]
+        S1, V1 = self.S_nodes[i1], V[i1]
         a = (V1 - V0) / ((S1 - S0) ** 2) if S1 != S0 else 0.0
         for i in range(i0, i1 + 1):
             s = self.S_nodes[i]
-            vT[i] = a * (s - S0) ** 2 + V0
-        return vT
+            V[i] = a * (s - S0) ** 2 + V0
+        return V
 
-    # ---------- barrier projection ----------
+    # ---------- KO projection ----------
     def _apply_knockout(self, values: List[float], lo: Optional[float], up: Optional[float]) -> None:
-        """Zero the value at nodes that are beyond the active KO barrier(s)."""
         for i, s in enumerate(self.S_nodes):
             ko = False
             if self.barrier_type == "down-and-out" and lo is not None and s <= lo: ko = True
@@ -204,43 +198,81 @@ class DiscreteBarrierFDMPricer:
                 if (lo is not None and s <= lo) or (up is not None and s >= up): ko = True
             if ko: values[i] = 0.0
 
-    # ---------- tridiagonal solver (Thomas) ----------
-    def _solve_tridiagonal(self, sub_diag: List[float], main_diag: List[float],
-                           sup_diag: List[float], rhs: List[float]) -> List[float]:
+    # ---------- Thomas tridiagonal solver ----------
+    def _solve_tridiagonal(self, sub: List[float], main: List[float],
+                           sup: List[float], rhs: List[float]) -> List[float]:
         n = len(rhs)
-        forward_elim_ratio = [0.0]*n
-        forward_rhs = [0.0]*n
-        sol = [0.0]*n
+        alpha = [0.0]*n
+        beta  = [0.0]*n
+        x     = [0.0]*n
 
-        piv = main_diag[0]
-        if abs(piv) < 1e-14: raise ZeroDivisionError("Tridiagonal pivot ~ 0 at row 0.")
-        forward_elim_ratio[0] = sup_diag[0]/piv
-        forward_rhs[0] = rhs[0]/piv
+        piv = main[0]
+        if abs(piv) < 1e-14:
+            raise ZeroDivisionError("Tridiagonal pivot ~ 0 at row 0")
+        alpha[0] = sup[0]/piv
+        beta[0]  = rhs[0]/piv
 
         for i in range(1, n):
-            piv = main_diag[i] - sub_diag[i]*forward_elim_ratio[i-1]
-            if abs(piv) < 1e-14: raise ZeroDivisionError(f"Tridiagonal pivot ~ 0 at row {i}.")
-            forward_elim_ratio[i] = sup_diag[i]/piv if i < n-1 else 0.0
-            forward_rhs[i] = (rhs[i] - sub_diag[i]*forward_rhs[i-1]) / piv
+            piv = main[i] - sub[i]*alpha[i-1]
+            if abs(piv) < 1e-14:
+                raise ZeroDivisionError(f"Tridiagonal pivot ~ 0 at row {i}")
+            alpha[i] = sup[i]/piv if i < n-1 else 0.0
+            beta[i]  = (rhs[i] - sub[i]*beta[i-1]) / piv
 
-        sol[-1] = forward_rhs[-1]
+        x[-1] = beta[-1]
         for i in range(n-2, -1, -1):
-            sol[i] = forward_rhs[i] - forward_elim_ratio[i]*sol[i+1]
-        return sol
+            x[i] = beta[i] - alpha[i]*x[i+1]
+        return x
 
-    # ---------- linear interpolation on S-grid ----------
+    # ---------- interpolation ----------
     def _interp_linear(self, x: float, xs: List[float], ys: List[float]) -> float:
-        if x <= xs[0]: return ys[0]
+        if x <= xs[0]:  return ys[0]
         if x >= xs[-1]: return ys[-1]
         lo, hi = 0, len(xs)-1
         while hi - lo > 1:
             mid = (lo + hi)//2
             if x < xs[mid]: hi = mid
             else: lo = mid
-        x0, x1 = xs[lo], xs[hi]
-        y0, y1 = ys[lo], ys[hi]
-        w = (x - x0)/(x1 - x0)
-        return (1-w)*y0 + w*y1
+        w = (x - xs[lo])/(xs[hi] - xs[lo])
+        return (1-w)*ys[lo] + w*ys[hi]
+
+    # ---------- barrier-aware node selection & one-sided stencils ----------
+    def _closest_barrier_index(self, lo: Optional[float], up: Optional[float]) -> Optional[int]:
+        """Index of grid node closest to the currently effective KO barrier."""
+        idx = None
+        if self.barrier_type in ("down-and-out","double-out") and lo is not None:
+            idx = min(range(len(self.S_nodes)), key=lambda i: abs(self.S_nodes[i] - lo))
+        if self.barrier_type in ("up-and-out","double-out") and up is not None:
+            j = min(range(len(self.S_nodes)), key=lambda i: abs(self.S_nodes[i] - up))
+            if idx is None or abs(self.S_nodes[j] - (up or 0.0)) < abs(self.S_nodes[idx] - (lo or 0.0)):
+                idx = j
+        return idx
+
+    def _one_sided_coeffs(self, i_bar: int) -> tuple[float,float,float,float,float,float]:
+        """
+        Non-symmetric coefficients at the node nearest the barrier.
+        Uses step sizes h_minus = S_i - S_{i-1}, h_plus = S_{i+1} - S_i,
+        with the φ safeguard (φ=0.05) as suggested by the FIS doc.
+        """
+        S = self.S_nodes
+        i = i_bar
+        h_minus = max(1e-14, S[i] - S[i-1])
+        h_plus  = max(1e-14, S[i+1] - S[i])
+
+        phi = 0.05
+        if h_plus  < phi*h_minus: h_plus  = phi*h_minus
+        if h_minus < phi*h_plus:  h_minus = phi*h_plus
+
+        # First derivative: V_S ≈ a_i V_{i+1} + b_i V_i + c_i V_{i-1}
+        a_i =  h_plus / (h_plus*(h_minus + h_plus))
+        b_i = (h_plus - h_minus) / (h_minus*h_plus)
+        c_i = -h_minus / (h_minus*(h_minus + h_plus))
+
+        # Second derivative: V_SS ≈ d_i V_{i+1} + e_i V_i + f_i V_{i-1}
+        d_i =  2.0 / (h_minus*(h_minus + h_plus))
+        e_i = -2.0 / (h_minus*h_plus)
+        f_i =  2.0 / (h_plus*(h_minus + h_plus))
+        return a_i, b_i, c_i, d_i, e_i, f_i
 
     # ---------- PDE stepping ----------
     def _backward_CN(self, effective_lo: Optional[float], effective_up: Optional[float],
@@ -254,8 +286,12 @@ class DiscreteBarrierFDMPricer:
 
         V = self._terminal_array()
 
+        # node close to barrier (only used inside the “continuous” window)
+        i_barrier = None
+        if self.use_continuous_barrier:
+            i_barrier = self._closest_barrier_index(effective_lo, effective_up)
+
         for m in range(M, 0, -1):
-            # Rannacher mix (EB for first few steps; NOT because of barrier projection)
             theta = 1.0 if (M - m) < self.rannacher_steps else 0.5
 
             sub = [0.0]*(N+1)
@@ -263,56 +299,78 @@ class DiscreteBarrierFDMPricer:
             sup = [0.0]*(N+1)
             rhs =  [0.0]*(N+1)
 
-            # boundary values (standard)
+            # boundary values
             if self.option_type == "call":
                 rhs[0] = 0.0
                 rhs[N] = self.S_nodes[-1] - self.strike * math.exp(-r*(self.T - (m-1)*dt))
             else:
                 rhs[0] = self.strike * math.exp(-r*(self.T - (m-1)*dt))
                 rhs[N] = 0.0
-            main[0] = 1.0; main[N] = 1.0
+            main[0] = 1.0
+            main[N] = 1.0
 
             for i in range(1, N):
                 S = self.S_nodes[i]
                 sig2S2 = (sigma**2) * (S**2)
 
-                a_impl = 0.5*dt*theta*( sig2S2/(dS**2) - r*S/dS )
-                b_impl = 1.0 + dt*theta*( sig2S2/(dS**2) + r )
-                c_impl = 0.5*dt*theta*( sig2S2/(dS**2) + r*S/dS )
+                use_asym = (i_barrier is not None) and (i == i_barrier) \
+                           and (self.continuous_k0 is not None) and (self.continuous_k1 is not None) \
+                           and (self.continuous_k0 <= (m-1) <= self.continuous_k1)
 
-                a_expl = -0.5*dt*(1-theta)*( sig2S2/(dS**2) - r*S/dS )
-                b_expl = 1.0 - dt*(1-theta)*( sig2S2/(dS**2) + r )
-                c_expl = -0.5*dt*(1-theta)*( sig2S2/(dS**2) + r*S/dS )
+                if not use_asym:
+                    # standard CN coefficients
+                    a_impl = 0.5*dt*theta*( sig2S2/(dS**2) - r*S/dS )
+                    b_impl = 1.0 + dt*theta*( sig2S2/(dS**2) + r )
+                    c_impl = 0.5*dt*theta*( sig2S2/(dS**2) + r*S/dS )
 
-                sub[i]  = -a_impl
-                main[i] =  b_impl
-                sup[i]  = -c_impl
-                rhs[i]  =  a_expl*V[i-1] + b_expl*V[i] + c_expl*V[i+1]
+                    a_expl = -0.5*dt*(1-theta)*( sig2S2/(dS**2) - r*S/dS )
+                    b_expl = 1.0 - dt*(1-theta)*( sig2S2/(dS**2) + r )
+                    c_expl = -0.5*dt*(1-theta)*( sig2S2/(dS**2) + r*S/dS )
+
+                    sub[i]  = -a_impl
+                    main[i] =  b_impl
+                    sup[i]  = -c_impl
+                    rhs[i]  =  a_expl*V[i-1] + b_expl*V[i] + c_expl*V[i+1]
+                else:
+                    # non-symmetric row at nearest-barrier node
+                    a_i, b_i, c_i, d_i, e_i, f_i = self._one_sided_coeffs(i)
+                    # L V = 0.5 σ² S² V_SS + r S V_S − r V
+                    L_left   = 0.5*sig2S2*f_i + r*S*c_i
+                    L_center = 0.5*sig2S2*e_i + r*S*b_i - r
+                    L_right  = 0.5*sig2S2*d_i + r*S*a_i
+
+                    # (I - θΔt L) V^{m-1} = (I + (1-θ)Δt L) V^{m}
+                    sub[i]  =  +theta*dt*(-L_left)
+                    main[i] =   1.0 + theta*dt*(-L_center)
+                    sup[i]  =  +theta*dt*(-L_right)
+
+                    rhs[i]  = (1.0 - (1.0-theta)*dt*(-L_center))*V[i] \
+                              + (1.0-theta)*dt*(-L_right )*V[i+1] \
+                              + (1.0-theta)*dt*(-L_left  )*V[i-1]
 
             V = self._solve_tridiagonal(sub, main, sup, rhs)
 
-            # barrier projection (discrete or continuous per decision)
+            # barrier projection at monitoring instants
             step_index_after = (m-1)
             if step_index_after in monitor_steps:
                 self._apply_knockout(V, effective_lo, effective_up)
-                # DO NOT trigger Rannacher restart because of barrier (per your note)
+                # IMPORTANT: no Rannacher restart on barrier events
 
         return V
 
     # ---------- price ----------
     def price(self) -> float:
-        # escrow dividends (unchanged)
-        div_pv = self.pv_dividends()
+        # escrow dividends outside this class -> pass effective spot
+        div_pv = 0.0  # keep hook; your outer code sets effective S if needed
         S_eff = self.spot - div_pv
-        S_shifted_nodes = [max(s - div_pv, 0.0) for s in self.S_nodes]
+        shifted_nodes = [max(s - div_pv, 0.0) for s in self.S_nodes]
         backup_nodes = self.S_nodes
-        self.S_nodes = S_shifted_nodes
+        self.S_nodes = shifted_nodes
         self.dS = self.S_nodes[1] - self.S_nodes[0]
 
-        # monitoring map
-        monitor_steps = {}
+        # build monitoring step map
+        monitor_steps: Dict[int,bool] = {}
         if self.use_continuous_barrier:
-            # project at *every* step between first and last monitoring index
             for k in range(self.continuous_k0, self.continuous_k1 + 1):
                 monitor_steps[k] = True
             lo_eff, up_eff = self.bgk_lower, self.bgk_upper
@@ -323,86 +381,167 @@ class DiscreteBarrierFDMPricer:
                     monitor_steps[k] = True
             lo_eff, up_eff = self.lower_barrier, self.upper_barrier
 
-        # knock-ins via parity with KO
-        if self.barrier_type in ("down-and-in", "up-and-in", "double-in"):
-            V_none = self._backward_CN(None, None, {})
-            V_ko   = self._backward_CN(lo_eff, up_eff, monitor_steps)
-            val = self._interp_linear(S_eff, self.S_nodes, [V_none[i]-V_ko[i] for i in range(len(V_none))])
+        # KO directly or KI via parity
+        if self.barrier_type in ("down-and-in","up-and-in","double-in"):
+            V_plain = self._backward_CN(None, None, {})
+            V_ko    = self._backward_CN(lo_eff, up_eff, monitor_steps)
+            price_val = self._interp_linear(S_eff, self.S_nodes, [V_plain[i]-V_ko[i] for i in range(len(V_plain))])
         else:
             V = self._backward_CN(lo_eff, up_eff, monitor_steps)
-            val = self._interp_linear(S_eff, self.S_nodes, V)
+            price_val = self._interp_linear(S_eff, self.S_nodes, V)
+
+        # restore nodes
+        self.S_nodes = backup_nodes
+        self.dS = self.S_nodes[1] - self.S_nodes[0]
+        return float(price_val)
+
+def _discount_factor_from_curve(self, lookup: date) -> float:
+        if self.discount_curve_df is None:
+            raise ValueError("discount_curve is required for DF lookups.")
+        iso = lookup.isoformat()
+        row = self.discount_curve_df[self.discount_curve_df["Date"] == iso]
+        if row.empty:
+            raise ValueError(f"Discount factor not found for date: {iso}")
+        naca = float(row["NACA"].values[0])                       # nominal annual compounding
+        tau  = self._yf(self.valuation_date, lookup)
+        return (1.0 + naca) ** (-tau)
+
+    def _nacc_from_curve(self, lookup: date) -> float:
+        if self.discount_curve_df is None:
+            return 0.0
+        iso = lookup.isoformat()
+        row = self.discount_curve_df[self.discount_curve_df["Date"] == iso]
+        if row.empty:
+            return 0.0
+        naca = float(row["NACA"].values[0])
+        return math.log(1.0 + naca)                               # NACC
+
+    def _forward_nacc(self, d0: date, d1: date) -> float:
+        df1 = self._discount_factor_from_curve(d1)
+        df0 = self._discount_factor_from_curve(d0)
+        tau = max(1e-12, self._yf(d0, d1))
+        return -math.log(df1 / df0) / tau
+
+    def pv_dividends(self) -> float:
+        """PV of discrete dividends using discount curve."""
+        if not self.dividend_schedule:
+            return 0.0
+        pv = 0.0
+        for pay_date, amount in self.dividend_schedule:
+            if self.valuation_date < pay_date <= self.maturity_date:
+                fwd_r = self._forward_nacc(self.valuation_date, pay_date)
+                tau   = self._yf(self.valuation_date, pay_date)
+                df    = math.exp(-fwd_r * tau)
+                pv += amount * df
+        return pv
+
+    def dividend_yield_nacc(self) -> float:
+        """Flat q (NACC) such that PV(divs) is reproduced over [valuation, maturity]."""
+        S0 = self.spot
+        pv = self.pv_dividends()
+        T  = max(1e-12, self.T)
+        if pv >= S0:
+            raise ValueError("PV(dividends) >= spot; cannot back out q.")
+        return -math.log((S0 - pv)/S0) / T
+
+    def flat_r_from_curve(self) -> float:
+        """Convenience: forward NACC from valuation to maturity (flat r for PDE)."""
+        return self._forward_nacc(self.valuation_date, self.maturity_date)
+
+    def price(self) -> float:
+        # escrow discrete dividends into the spot (escrowed-spot shift)
+        div_pv = self.pv_dividends() if self.dividend_schedule else 0.0
+        S_eff = self.spot - div_pv
+        shifted_nodes = [max(s - div_pv, 0.0) for s in self.S_nodes]
+        backup_nodes = self.S_nodes
+        self.S_nodes = shifted_nodes
+        self.dS = self.S_nodes[1] - self.S_nodes[0]
+
+        monitor_steps: Dict[int,bool] = {}
+        if self.use_continuous_barrier:
+            for k in range(self.continuous_k0, self.continuous_k1 + 1):
+                monitor_steps[k] = True
+            lo_eff, up_eff = self.bgk_lower, self.bgk_upper
+        else:
+            for d in self.monitor_dates:
+                if self.valuation_date < d <= self.maturity_date:
+                    k = int(round(self._yf(self.valuation_date, d) / (self.T/self.time_steps)))
+                    monitor_steps[k] = True
+            lo_eff, up_eff = self.lower_barrier, self.upper_barrier
+
+        if self.barrier_type in ("down-and-in","up-and-in","double-in"):
+            V_plain = self._backward_CN(None, None, {})
+            V_ko    = self._backward_CN(lo_eff, up_eff, monitor_steps)
+            price_val = self._interp_linear(S_eff, self.S_nodes, [V_plain[i]-V_ko[i] for i in range(len(V_plain))])
+        else:
+            V = self._backward_CN(lo_eff, up_eff, monitor_steps)
+            price_val = self._interp_linear(S_eff, self.S_nodes, V)
 
         self.S_nodes = backup_nodes
         self.dS = self.S_nodes[1] - self.S_nodes[0]
-        return float(val)
+        return float(price_val)
 
-    # ---------- Greeks with barrier-aware stencils ----------
-    def greeks(self, rel_bump: float = 0.01, vega_bump: float = 0.01) -> Dict[str, float]:
-        # compute price on base grid once
-        base_px = self.price()
+    def print_details(self,
+                      trade_id: str = "NA",
+                      direction: Literal["long","short"] = "long",
+                      quantity: int = 1,
+                      contract_multiplier: float = 1.0) -> None:
+        """
+        Prints a self-contained report (trade + curves + dividends + result).
+        """
+        # rates (prefer curve if present; else the user-supplied flat_r_nacc)
+        r_flat = None
+        try:
+            r_flat = self.flat_r_from_curve()
+        except Exception:
+            r_flat = self.flat_r_nacc
 
-        # delta: barrier-aware finite differences per doc
-        s0 = self.spot
-        ds = max(1e-8, rel_bump*s0)
-        self.spot = s0 + ds; up = self.price()
-        self.spot = s0 - ds; dn = self.price()
-        self.spot = s0
+        # dividend yield (flat NACC from discrete schedule)
+        try:
+            q_flat = self.dividend_yield_nacc()
+        except Exception:
+            q_flat = 0.0
 
-        # choose stencil: near a barrier use one-sided blend; else central
-        def near_barrier(S) -> bool:
-            lo = self.lower_barrier if not self.use_continuous_barrier else self.bgk_lower
-            upb = self.upper_barrier if not self.use_continuous_barrier else self.bgk_upper
-            tol = 2*self.dS
-            return (lo is not None and abs(S - lo) <= tol) or (upb is not None and abs(S - upb) <= tol)
+        # compute price & Greeks
+        px = self.price()
+        greeks = self.greeks()
 
-        if near_barrier(s0):
-            # one-sided (downwind) delta & blended gamma (following figures in your doc)
-            delta = (base_px - dn) / ds  # D_- V
-            # gamma: blend one-sided with central to avoid spikes (q in the doc)
-            central_gamma = (up - 2*base_px + dn) / (ds*ds)
-            one_sided_gamma = (up - 2*base_px + dn) / (ds*ds)  # same finite step here; keep structure
-            q = 0.5
-            gamma = q*central_gamma + (1-q)*one_sided_gamma
-        else:
-            delta = (up - dn) / (2*ds)
-            gamma = (up - 2*base_px + dn) / (ds*ds)
+        # barrier info
+        lo_eff = self.bgk_lower if self.use_continuous_barrier else self.lower_barrier
+        up_eff = self.bgk_upper  if self.use_continuous_barrier else self.upper_barrier
 
-        # vega
-        sig0 = self.sigma
-        self.sigma = sig0 + vega_bump; upv = self.price()
-        self.sigma = sig0 - vega_bump; dnv = self.price()
-        self.sigma = sig0
-        vega = (upv - dnv) / (2*vega_bump)
-
-        return {"delta": float(delta), "gamma": float(gamma), "vega": float(vega)}
-
-
-    # ======================================================================
-    # Reporting (for quick sanity checks)
-    # ======================================================================
-
-    def report(self) -> str:
-        lines = [
-            "==== Barrier Option Trade Details ====",
-            f"Trade ID            : {self.trade_id}",
-            f"Direction           : {self.direction}",
-            f"Quantity            : {self.quantity}",
-            f"Contract Multiplier : {self.contract_multiplier:.6g}",
-            f"Option Type         : {self.option_type}",
-            f"Barrier Type        : {self.barrier_type}",
-            f"Lower Barrier (Hd)  : {self.barrier_lower if self.barrier_lower is not None else '-'}",
-            f"Upper Barrier (Hu)  : {self.barrier_upper if self.barrier_upper is not None else '-'}",
-            f"Spot (S0)           : {self.spot_price:.6f}",
-            f"Strike (K)          : {self.strike_price:.6f}",
-            f"Valuation Date      : {self.valuation_date.isoformat()}",
-            f"Maturity Date       : {self.maturity_date.isoformat()}",
-            f"T (years, {self.day_count}) : {self.tenor_years:.6f}",
-            f"Volatility (sigma)  : {self.volatility:.6f}",
-            f"r_flat (NACC)       : {self.r_flat:.6f}",
-            f"q_flat (NACC)       : {self.q_flat:.6f}",
-            f"Steps (time,space)  : {self.num_time_steps}, {self.num_space_nodes} (Rannacher {self.rannacher_steps})",
-            f"Rannacher@Barrier   : {self.restart_rannacher_at_barrier}",
-            f"Monitoring dates (#): {len([d for d in self.monitoring_dates if self.valuation_date < d < self.maturity_date])}",
-            f"BGK correction      : {self.use_bgk_correction}",
-        ]
-        return "\n".join(lines)
+        # print
+        print("===== Discrete Barrier Option — Run Summary =====")
+        print(f"Trade ID            : {trade_id}")
+        print(f"Direction           : {direction}")
+        print(f"Quantity            : {quantity}")
+        print(f"Contract Multiplier : {contract_multiplier}")
+        print("---- Contract ----")
+        print(f"Option Type         : {self.option_type}")
+        print(f"Barrier Type        : {self.barrier_type}")
+        print(f"Lower Barrier (H_d) : {lo_eff if lo_eff is not None else '-'}"
+              + ("  (BGK-adj)" if self.use_continuous_barrier and self.lower_barrier is not None else ""))
+        print(f"Upper Barrier (H_u) : {up_eff if up_eff is not None else '-'}"
+              + ("  (BGK-adj)" if self.use_continuous_barrier and self.upper_barrier is not None else ""))
+        print(f"Spot (S0)           : {self.spot:.6f}")
+        print(f"Strike (K)          : {self.strike:.6f}")
+        print(f"Valuation Date      : {self.valuation_date.isoformat()}")
+        print(f"Maturity Date       : {self.maturity_date.isoformat()}")
+        print(f"T (years, {self.day_count}) : {self.T:.6f}")
+        print(f"Volatility (sigma)  : {self.sigma:.6f}")
+        print("---- Rates & Dividends ----")
+        print(f"Flat r (NACC)       : {r_flat:.8f}")
+        print(f"Flat q (NACC)       : {q_flat:.8f}")
+        print(f"PV(dividends)       : {self.pv_dividends():.6f}")
+        print("---- Grid ----")
+        print(f"Grid (time,space)   : {self.time_steps}, {self.grid_points}  (Rannacher {self.rannacher_steps})")
+        print(f"BGK continuous?     : {self.use_continuous_barrier}  "
+              f"[window steps: {self.continuous_k0 if self.use_continuous_barrier else '-'}"
+              f"→{self.continuous_k1 if self.use_continuous_barrier else '-'}]")
+        print(f"#Monitoring dates   : {len(self.monitor_dates)}")
+        print("---- Results ----")
+        print(f"Price               : {px:.8f}")
+        print(f"Delta               : {greeks['delta']:.8f}")
+        print(f"Gamma               : {greeks['gamma']:.8f}")
+        print(f"Vega                : {greeks['vega']:.8f}")
+        print("=================================================")
