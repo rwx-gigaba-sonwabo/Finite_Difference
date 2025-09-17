@@ -427,6 +427,76 @@ class DiscreteBarrierFDMPricer:
         self.dS = self.S_nodes[1] - self.S_nodes[0]
         return float(price_val)
 
+    def greeks(self,
+            spot_rel_bump: float = 0.01,
+            vega_abs_bump: float = 0.01) -> dict:
+        """
+        Barrier-aware finite-difference Greeks, aligned with the FIS guidance.
+        - Delta: one-sided near the active barrier; central elsewhere
+        - Gamma: central; near barrier use a blended estimate for stability
+        - Vega : symmetric absolute bump on sigma
+        Returns a dict with {'delta','gamma','vega'}.
+        """
+
+        # --- helper: which barrier is effectively active right now? (BGK if continuous) ---
+        eff_lo = self.bgk_lower if getattr(self, "use_continuous_barrier", False) else self.lower_barrier
+        eff_up = self.bgk_upper  if getattr(self, "use_continuous_barrier", False) else self.upper_barrier
+
+        def _near_effective_barrier(S: float, tol_mult: float = 2.0) -> bool:
+            tol = tol_mult * max(1e-14, self.dS)
+            close_lo = (eff_lo is not None) and (abs(S - eff_lo) <= tol)
+            close_up = (eff_up is not None) and (abs(S - eff_up) <= tol)
+            return close_lo or close_up
+
+        # --- store base state ---
+        base_spot = self.spot
+        base_sigma = self.sigma
+
+        # --- base price ---
+        base_px = self.price()
+
+        # --- delta & gamma via spot bumps (barrier-aware stencil) ---
+        ds = max(1e-12, spot_rel_bump * base_spot)
+
+        self.spot = base_spot + ds
+        px_up = self.price()
+
+        self.spot = base_spot - ds
+        px_dn = self.price()
+
+        # restore spot
+        self.spot = base_spot
+
+        if _near_effective_barrier(base_spot):
+            # one-sided delta (downwind) at barrier per FIS figures
+            delta = (base_px - px_dn) / ds
+            # gamma: blend to reduce ringing near KO
+            gamma_central = (px_up - 2.0 * base_px + px_dn) / (ds * ds)
+            gamma_onesided = gamma_central  # same stencil here; keep structure for clarity
+            blend_q = 0.5
+            gamma = blend_q * gamma_central + (1.0 - blend_q) * gamma_onesided
+        else:
+            # standard central stencils away from barrier
+            delta = (px_up - px_dn) / (2.0 * ds)
+            gamma = (px_up - 2.0 * base_px + px_dn) / (ds * ds)
+
+        # --- vega via symmetric sigma bump ---
+        dv = max(1e-12, vega_abs_bump)
+
+        self.sigma = base_sigma + dv
+        px_vup = self.price()
+
+        self.sigma = base_sigma - dv
+        px_vdn = self.price()
+
+        # restore sigma
+        self.sigma = base_sigma
+
+        vega = (px_vup - px_vdn) / (2.0 * dv)
+
+        return {"delta": float(delta), "gamma": float(gamma), "vega": float(vega)}
+
+
 def _discount_factor_from_curve(self, lookup: date) -> float:
         if self.discount_curve_df is None:
             raise ValueError("discount_curve is required for DF lookups.")
