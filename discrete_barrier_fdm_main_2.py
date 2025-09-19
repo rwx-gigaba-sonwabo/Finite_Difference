@@ -81,7 +81,111 @@ num_space_nodes = 600
 num_time_steps  = 600
 rannacher_steps = 2
 
+# ---------------------------------------------------------------------# -*- coding: utf-8 -*-
+import math
+import pandas as pd
+import datetime as dt
+
+from discrete_barrier_fdm_pricer_2 import DiscreteBarrierFDMPricer2
+
 # ---------------------------------------------------------------------
+# Load a curve CSV with columns: Date (YYYY-MM-DD) and NACA
+# (the same daily “NACA” format used in your environment).
+# ---------------------------------------------------------------------
+discount_curve = pd.read_csv(
+    r"C:\Finite Difference (Equity Americans)\Finite_Difference-main\ZAR-SWAP-28072025.csv"
+)
+discount_curve["Date"] = pd.to_datetime(discount_curve["Date"]).dt.strftime("%Y-%m-%d")
+
+def df_from_naca(valuation_date: dt.date, lookup_date: dt.date) -> float:
+    row = discount_curve[discount_curve["Date"] == lookup_date.isoformat()]
+    if row.empty:
+        raise ValueError(f"Curve date {lookup_date.isoformat()} not in CSV.")
+    naca = float(row["NACA"].values[0])
+    tau = (lookup_date - valuation_date).days / 365.0  # ACT/365
+    return (1.0 + naca) ** (-tau)
+
+# ---------------------------------------------------------------------
+# Dates
+# ---------------------------------------------------------------------
+valuation = dt.date(2025, 7, 28)
+maturity  = dt.date(2025, 8, 28)
+T_years   = (maturity - valuation).days / 365.0
+
+# Flat continuous short rate from DF(valuation→maturity)
+DF_T = df_from_naca(valuation, maturity)
+r_flat = -math.log(DF_T) / max(1e-12, T_years)
+
+# ---------------------------------------------------------------------
+# Dividends (optional): list of (pay_date, cash_amount)
+# ---------------------------------------------------------------------
+dividends = []  # e.g., [(dt.date(2025, 9, 12), 7.63)]
+
+# ---------------------------------------------------------------------
+# Monitoring dates (discrete). Example: weekly until maturity.
+# ---------------------------------------------------------------------
+monitoring_dates = [
+    dt.date(2025, 7, 28),
+    dt.date(2025, 8, 4),
+    dt.date(2025, 8, 7),
+    dt.date(2025, 8, 12),
+    dt.date(2025, 8, 18),
+    dt.date(2025, 8, 22),
+    dt.date(2025, 8, 27),
+]
+
+# ---------------------------------------------------------------------
+# Instrument economics
+# ---------------------------------------------------------------------
+S0       = 229.74
+K        = 220.00
+sigma    = 0.2613190156888
+opt_type = "call"            # "call" or "put"
+
+barrier_type  = "up-and-out" # "down-and-out", "up-and-out", "double-out", KI flavors, or "none"
+lower_barrier = None
+upper_barrier = 270.00
+
+# ---------------------------------------------------------------------
+# Numerics
+# ---------------------------------------------------------------------
+num_space_nodes = 600
+num_time_steps  = 600
+rannacher_steps = 2
+
+# ---------------------------------------------------------------------
+# Build and run
+# ---------------------------------------------------------------------
+pricer = DiscreteBarrierFDMPricer2(
+    spot=S0,
+    strike=K,
+    valuation_date=valuation,
+    maturity_date=maturity,
+    volatility=sigma,
+    option_type=opt_type,
+    barrier_type=barrier_type,
+    lower_barrier=lower_barrier,
+    upper_barrier=upper_barrier,
+    monitoring_dates=monitoring_dates,
+    flat_rate_nacc=r_flat,
+    dividends=dividends,
+    num_space_nodes=num_space_nodes,
+    num_time_steps=num_time_steps,
+    rannacher_steps=rannacher_steps,
+    day_count="ACT/365",
+    smooth_payoff_around_strike=True,
+    payoff_smoothing_half_width_nodes=2,
+)
+
+# Print all model, grid, BGK decision details plus price & Greeks
+pricer.print_details()
+
+# Also accessible individually:
+price  = pricer.price()
+greeks = pricer.greeks()
+print("\nPrice:", price)
+print("Greeks:", greeks)
+
 # 7) Build and run the pricer
 # ---------------------------------------------------------------------
 pricer = DiscreteBarrierFDMPricer2(
