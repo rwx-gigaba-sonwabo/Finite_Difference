@@ -176,10 +176,10 @@ class DiscreteBarrierFDM:
             x[i]=d[i]-c[i]*x[i+1]
         return x
 
-    # ------------- CN step over [t0,t1] with m steps -------------
     def _cn_subinterval(self, s_nodes: List[float], V: List[float],
                         t0: float, t1: float, theta: float,
                         rannacher_left_steps: int, m_steps: int) -> Tuple[List[float], float]:
+        """March from t1 to t0 (backwards) using exactly m_steps. Return new V and dt of last step (for theta)."""
         r, q, sig = self.r, self.q, self.sigma
         N = len(s_nodes)-1
         L = t1 - t0
@@ -192,18 +192,16 @@ class DiscreteBarrierFDM:
             if rannacher_left_steps > 0:
                 rannacher_left_steps -= 1
 
-            tau_left = t0 + (m-step-1)*dt  # time to maturity after this step
-
-            # Build tri-diagonal using non‑uniform coefficients (Tavella–Randall)
+            tau_left = t0 + (m-step-1)*dt  # time remaining after this step
             sub=[0.0]*(N+1); main=[0.0]*(N+1); sup=[0.0]*(N+1); rhs=[0.0]*(N+1)
 
-            # Dirichlet boundaries at after-step time
+            # Dirichlet BCs
             if self.option_type=="call":
-                rhs[0] = 0.0
-                rhs[N] = s_nodes[-1]*math.exp(-q*tau_left) - self.K*math.exp(-r*tau_left)
+                rhs[0]=0.0
+                rhs[N]=s_nodes[-1]*math.exp(-q*tau_left) - self.K*math.exp(-r*tau_left)
             else:
-                rhs[0] = self.K*math.exp(-r*tau_left)
-                rhs[N] = 0.0
+                rhs[0]=self.K*math.exp(-r*tau_left)
+                rhs[N]=0.0
             main[0]=1.0; main[N]=1.0
 
             for i in range(1,N):
@@ -213,19 +211,25 @@ class DiscreteBarrierFDM:
                 A = 0.5*sig*sig*Si*Si
                 mu = r - q
 
-                # Canonical non‑uniform coefficients:
-                aI = use_theta*dt*( A*(2.0/(h1*(h1+h2))) - mu*Si*(1.0/(2.0*h1)) )
-                bI = 1.0 + use_theta*dt*( A*(2.0/(h1*h2)) + r )
-                cI = use_theta*dt*( A*(2.0/(h2*(h1+h2))) + mu*Si*(1.0/(2.0*h2)) )
+                w_im1_x  = -h2/(h1*(h1+h2))
+                w_i_x    = (h2-h1)/(h1*h2)
+                w_ip1_x  =  h1/(h2*(h1+h2))
+                w_im1_xx =  2.0/(h1*(h1+h2))
+                w_i_xx   = -2.0/(h1*h2)
+                w_ip1_xx =  2.0/(h2*(h1+h2))
 
-                aE = (1.0-use_theta)*dt*( A*(2.0/(h1*(h1+h2))) - mu*Si*(1.0/(2.0*h1)) )
-                bE = 1.0 - (1.0-use_theta)*dt*( A*(2.0/(h1*h2)) + r )
-                cE = (1.0-use_theta)*dt*( A*(2.0/(h2*(h1+h2))) + mu*Si*(1.0/(2.0*h2)) )
+                a_impl = use_theta*dt*( A*w_im1_xx + mu*Si*w_im1_x )
+                b_impl = 1.0 + use_theta*dt*( A*w_i_xx   + mu*Si*w_i   + r )
+                c_impl = use_theta*dt*( A*w_ip1_xx + mu*Si*w_ip1_x )
 
-                sub[i]  = -aI
-                main[i] =  bI
-                sup[i]  = -cI
-                rhs[i]  =  aE*V[i-1] + bE*V[i] + cE*V[i+1]
+                a_expl = (1.0-use_theta)*dt*( A*w_im1_xx + mu*Si*w_im1_x )
+                b_expl = 1.0 + (1.0-use_theta)*dt*( A*w_i_xx   + mu*Si*w_i   + r )
+                c_expl = (1.0-use_theta)*dt*( A*w_ip1_xx + mu*Si*w_ip1_x )
+
+                sub[i]  = -a_impl
+                main[i] =  b_impl
+                sup[i]  = -c_impl
+                rhs[i]  =  a_expl*V[i-1] + b_expl*V[i] + c_expl*V[i+1]
 
             V = self._solve_tridiagonal(sub, main, sup, rhs)
 
