@@ -1,35 +1,23 @@
 import math
-import datetime as dt
-from typing import List, Optional, Tuple, Literal, Dict, Any
+import datetime as _dt
+from typing import List, Optional, Tuple, Literal, Dict
 
 import pandas as pd
 
 """
 Discrete Barrier Option pricer (BGK/Hörfelt) with flat NACC rate and dividend PV handling.
 
-This module implements the corrected heavy-traffic approximation for *discrete* barriers:
-- Single-barrier: Broadie-Glasserman-Kou continuity correction refined by Hörfelt:
-  Replace the *discrete* barrier monitoring with a *continuous* analogue but shift the barrier
-  by ± Beta * sigma * sqrt(T/m), with Beta ≈ 0.5826 (Riemann zeta constant), and evaluate the Hörfelt F±-based
-  closed-form probabilities. (See Finance & Stochastics 2003, Hörfelt.)
+Update (paper-faithful BGK + Black-76 presentation):
+- Monitoring m includes maturity; BGK shift uses m monitors over [0,T].
+- F⁺/F⁻ blocks use correct domains with clamping of the terminal cut to the barrier.
+- Single-barrier OUT formulas implemented directly for all 4 cases (UO-call, UO-put, DO-put, DO-call).
+- Knock-IN built via same-type parity: IN = Vanilla - OUT (same option type).
 
-- Double-barrier: uses Siegmund's prescription to move lower/upper barriers by ∓/± B/sqrt(m) (in φ-space);
-  we implement the continuous analogue G(..) via its rapidly convergent series and then apply the shift.
-
-Greeks:
-- Computed by robust finite differences (barrier-aware via same monitor count m).
-
-Author: Sonwabo Gigaba
+Reference intuition:
+- Discrete monitoring ≈ continuous monitoring with φ-space barrier shift b = d ± β/√m
+  (β ≈ 0.5826; '+' for up, '−' for down). Black-76 is a presentation: prefactors S0 e^{-qT} and K e^{-rT};
+  θ0, θ1 and the BGK shift depend on (r − q, σ, T) only.
 """
-from __future__ import annotations
-
-import math
-import datetime as _dt
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Literal, Dict, Any
-
-import pandas as pd
-
 
 OptionType = Literal["call", "put"]
 BarrierKind = Literal[
@@ -39,24 +27,12 @@ BarrierKind = Literal[
 ]
 
 BETA_BGK = 0.5826  # Broadie–Glasserman–Kou continuity-correction constant
+EPS = 1e-12
 
 
 class DiscreteBarrierBGKPricer:
     """
-    Discrete barrier option pricer using BGK/Hörfelt approximation.
-
-    Key ideas & intuition:
-    - For a discrete barrier monitored m times over [0,T], the random walk (in log-space) tends to *overshoot*
-      the boundary when it crosses. Siegmund shows the mean overshoot ~ β / √m (in standardized units).
-    - BGK & Hörfelt map the *discrete* monitoring problem to a *continuous* one by shifting the boundary:
-        Up   barrier H: use H * exp(+Beta *sigma sqrt(T/m))
-        Down barrier H: use H * exp(-Beta * sigma * sqrt(T/m))
-      and then evaluate closed-form Brownian crossing probabilities in the *continuous* world.
-    - Hörfelt gives single-barrier formulas in terms of F_±(a,b;θ); double barriers use G(..) with an
-      exponentially-convergent series.
-
-    Rates & dividends:
-    - r (NACC) is flat across the horizon; q (NACC) is inferred from PV of discrete dividends (escrowed view).
+    Discrete barrier option pricer using BGK/Hörfelt approximation (Black-76 presentation).
     """
 
     def __init__(
@@ -75,7 +51,7 @@ class DiscreteBarrierBGKPricer:
         forward_curve:  Optional[pd.DataFrame] = None,
         dividend_schedule: Optional[List[Tuple[_dt.date, float]]] = None,
         # model parameters
-        volatility: float = 0.2, 
+        volatility: float = 0.2,
         day_count: str = "ACT/365",
         # trade details
         trade_id: str = "T-0001",
@@ -97,7 +73,13 @@ class DiscreteBarrierBGKPricer:
         self.barrier_type = barrier_type
         self.Hd = lower_barrier
         self.Hu = upper_barrier
-        self.monitor_dates = sorted(monitor_dates or [])
+
+        # Monitoring dates: ensure maturity included for BGK scaling
+        md = sorted(monitor_dates or [])
+        if md and md[-1] < self.mat_date:
+            md.append(self.mat_date)
+        self.monitor_dates = md
+
         self.discount_curve_df = discount_curve.copy() if discount_curve is not None else None
         self.forward_curve_df  = forward_curve.copy() if forward_curve is not None else None
         self.dividends = sorted(dividend_schedule or [], key=lambda x: x[0])
@@ -112,36 +94,39 @@ class DiscreteBarrierBGKPricer:
 
         # tenor & flat rates
         self.T = self._year_fraction(self.val_date, self.mat_date)
-        self.r_nacc = self._flat_r_nacc_from_curve()  # continuous-compounded short rate
-        self.q_nacc = self._flat_q_nacc_from_dividends()  # effective continuous dividend yield
+        self.r_nacc = self._flat_r_nacc_from_curve()      # r (NACC)
+        self.q_nacc = self._flat_q_nacc_from_dividends()  # q (NACC)
 
-        # effective number of monitoring times m
+        # effective number of monitoring times m (count in (val, T], include T)
         self.m = self._effective_monitor_count()
 
+    # ---------------- public API ----------------
     def price(self) -> float:
         """
         Price of the discrete barrier option (BGK/Hörfelt).
-
-        - Single-barrier: use Hörfelt Theorem 2 (F± with barrier shift b -> b ± β/√m in φ-space,
-          equivalent to H -> H * exp(± Beta * sigma * sqrt(T/m)) in S-space).
-        - Double-barrier: approximate G^(m) by G with Siegmund correction (lower down by Beta/sqrt(m), upper up by Beta/sqrt(m)).
-        - Knock-in via parity: in + out = vanilla (Black-Scholes with r,q).
+        - Single-barrier: continuous Hörfelt blocks with BGK φ-shift.
+        - Double-barrier: Siegmund-corrected continuous series.
+        - Knock-in via same-type parity: IN = Vanilla - OUT.
         """
         if self.barrier_type == "none":
             return self._signed_scale(self._vanilla_bs_price())
 
         if self.barrier_type in ("up-and-out", "down-and-out"):
             px = self._single_barrier_out_price()
+
         elif self.barrier_type in ("up-and-in", "down-and-in"):
             vanilla = self._vanilla_bs_price()
-            out_equiv = self._single_barrier_out_price()  # same parameters, out-type
+            out_equiv = self._single_barrier_out_price()  # OUT of same type
             px = vanilla - out_equiv
+
         elif self.barrier_type in ("double-out",):
             px = self._double_barrier_out_price()
+
         elif self.barrier_type in ("double-in",):
             vanilla = self._vanilla_bs_price()
             out_equiv = self._double_barrier_out_price()
             px = vanilla - out_equiv
+
         else:
             raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
 
@@ -155,7 +140,7 @@ class DiscreteBarrierBGKPricer:
         base_dir = self.direction
         self.direction = "long"
 
-        # Delta & Gamma (bump spot)
+        # Delta & Gamma (spot bumps; log-space size via relative)
         s0 = self.S0
         ds = max(1e-8, ds_rel * s0)
         self.S0 = s0 + ds; up = self.price()
@@ -166,7 +151,7 @@ class DiscreteBarrierBGKPricer:
         delta = (up - dn) / (2 * ds)
         gamma = (up - 2 * base + dn) / (ds * ds)
 
-        # Vega (bump vol)
+        # Vega (vol bump)
         sig0 = self.sigma
         self.sigma = sig0 + dvol_abs; upv = self.price()
         self.sigma = sig0 - dvol_abs; dnv = self.price()
@@ -180,7 +165,7 @@ class DiscreteBarrierBGKPricer:
     def report(self) -> str:
         """Human-friendly trade and model summary."""
         lines = []
-        lines.append("==== Discrete Barrier (BGK/Hörfelt) ====")
+        lines.append("==== Discrete Barrier (BGK/Hörfelt) — Black-76 presentation ====")
         lines.append(f"Trade ID           : {self.trade_id}")
         lines.append(f"Direction          : {self.direction}")
         lines.append(f"Quantity           : {self.quantity}")
@@ -209,6 +194,7 @@ class DiscreteBarrierBGKPricer:
         lines.append(f"Vega               : {greeks['vega']:.8f}")
         return "\n".join(lines)
 
+    # ---------------- curves / time utils ----------------
     def _normalize_curve_df(self, df: pd.DataFrame) -> pd.DataFrame:
         if "Date" not in df.columns or "NACA" not in df.columns:
             raise ValueError("Curve DataFrame must have columns: 'Date', 'NACA'.")
@@ -256,8 +242,7 @@ class DiscreteBarrierBGKPricer:
         if pvD <= 0.0:
             return 0.0
         if pvD >= self.S0:
-            # defensive: clamp to very high q to avoid negative inside log
-            return 50.0
+            return 50.0  # defensive clamp
         return -math.log((self.S0 - pvD) / self.S0) / max(self.T, 1e-12)
 
     def _year_fraction(self, d0: _dt.date, d1: _dt.date) -> float:
@@ -273,15 +258,17 @@ class DiscreteBarrierBGKPricer:
 
     def _effective_monitor_count(self) -> int:
         """
-        Effective m for BGK shift. Hörfelt assumes equally spaced dates.
-        If user passes dates: m = number of monitoring instants.
-        If none provided, we treat as m=0 (no barrier or continuous?); here default to daily business days can be added externally.
+        Effective m for BGK shift. Assume dates ~equally spaced; count those strictly after val and ≤ T.
         """
-        return max(0, len(self.monitor_dates))
+        if not self.monitor_dates:
+            return 0
+        return sum(1 for d in self.monitor_dates if self.val_date < d <= self.mat_date)
 
+    # ---------------- vanilla (Black-76 presentation) ----------------
     def _vanilla_bs_price(self) -> float:
         """
-        Standard Black-Scholes (with continuous r and q).
+        Vanilla Black–Scholes/Black-76 (with continuous r, q).
+        Price = S e^{-qT} N(d1) - K e^{-rT} N(d2)  for call; put analogously.
         """
         S, K, T, r, q, sig = self.S0, self.K, self.T, self.r_nacc, self.q_nacc, self.sigma
         if T <= 0 or sig <= 0:
@@ -295,117 +282,109 @@ class DiscreteBarrierBGKPricer:
         if self.opt_type == "call":
             return S * math.exp(-q * T) * Nd1 - K * math.exp(-r * T) * Nd2
         else:
-            Nmd1 = 1.0 - Nd1; Nmd2 = 1.0 - Nd2
+            Nmd1 = 1.0 - Nd1
+            Nmd2 = 1.0 - Nd2
             return K * math.exp(-r * T) * Nmd2 - S * math.exp(-q * T) * Nmd1
 
-    # ---------- Hörfelt single-barrier pricing (Theorem 2) ----------
+    # ---------------- Hörfelt single-barrier blocks ----------------
     def _phi(self, x: float) -> float:
-        """φ(x) = ln(x/S0) / (sigma sqrt(T))."""
-        return math.log(x / self.S0) / (self.sigma * math.sqrt(max(self.T, 1e-12)))
+        """φ(x) = ln(x/S0) / (σ√T)."""
+        return math.log(max(x, EPS) / self.S0) / (self.sigma * math.sqrt(max(self.T, EPS)))
 
     def _N(self, x: float) -> float:
         return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-    def _F_plus(self, a: float, b: float, theta: float) -> float:
-        """
-        F+(a,b;θ) = N(a-theta) - exp(2 * b * theta) N(a - 2b - theta),   for a ≤ b, b > 0
-        """
-        return self._N(a - theta) - math.exp(2.0 * b * theta) * self._N(a - 2.0 * b - theta)
-
-    def _F_minus(self, a: float, b: float, theta: float) -> float:
-        """F-(a,b;θ) = F+(-a, -b; −θ)."""
-        return self._F_plus(-a, -b, -theta)
-
     def _theta0_theta1(self) -> Tuple[float, float]:
         """
-        θ0 = (r - q - sigma^2/2) sqrt(T) / sigma
-        θ1 = θ0 + sigma sqrt(T)
+        θ0 = (r - q - σ²/2) √T / σ ;  θ1 = θ0 + σ √T
         """
-        sqrtT = math.sqrt(max(self.T, 1e-12))
+        sqrtT = math.sqrt(max(self.T, EPS))
         theta0 = (self.r_nacc - self.q_nacc - 0.5 * self.sigma * self.sigma) * sqrtT / self.sigma
         theta1 = theta0 + self.sigma * sqrtT
         return theta0, theta1
 
+    # ---- Correct F⁺ / F⁻ with domain & clamping ----
+    def _F_plus(self, a: float, b: float, theta: float) -> float:
+        """
+        Up-barrier block: F⁺(a,b;θ) = N(a-θ) - e^{2 b θ} N(a - 2 b - θ)
+        Domain: b > 0. We clamp a to min(a,b) (joint event {X_T ≤ a, max ≤ b}).
+        """
+        if b <= 0.0:
+            return 0.0
+        a_eff = a if a <= b + 0.0 else b
+        return self._N(a_eff - theta) - math.exp(2.0 * b * theta) * self._N(a_eff - 2.0 * b - theta)
+
+    def _F_minus(self, a: float, b: float, theta: float) -> float:
+        """
+        Down-barrier block: F⁻(a,b;θ) = F⁺(-a, -b; -θ)
+        Domain: b < 0. We clamp a to max(a,b) (joint event {X_T ≥ a, min ≥ b}).
+        """
+        if b >= 0.0:
+            return 0.0
+        a_eff = a if a >= b - 0.0 else b
+        # compute via symmetry on clamped values
+        return self._F_plus(-a_eff, -b, -theta)
+
+    # ---------------- Single-barrier OUT (paper-faithful, all 4 cases) ----------------
     def _single_barrier_out_price(self) -> float:
         """
-        Hörfelt Theorem 2:
-          - Up-and-out call/put when S0 < H (χ = ±1)  -> use F+ with barrier shifted b -> b + β/√m (in φ-space)
-          - Down-and-out call/put when S0 > H        -> use F- with b -> b - β/√m
-        Payoff parity gives knock-ins.
+        Hörfelt single-barrier OUT with BGK φ-shift:
+          up:   b = d + β/√m  (d=φ(Hu)>0)
+          down: b = d - β/√m  (d=φ(Hd)<0)
+        Direct formulas (no cross-type parity detours):
+          UO call:  S e^{-qT}[F⁺(d,b;θ1)-F⁺(c,b;θ1)] − K e^{-rT}[F⁺(d,b;θ0)-F⁺(c,b;θ0)]
+          UO put:   K e^{-rT} F⁺(c,b;θ0) − S e^{-qT} F⁺(c,b;θ1)
+          DO put:   K e^{-rT}[F⁻(d,b;θ0)-F⁻(c,b;θ0)] − S e^{-qT}[F⁻(d,b;θ1)-F⁻(c,b;θ1)]
+          DO call:  S e^{-qT} F⁻(c,b;θ1) − K e^{-rT} F⁻(c,b;θ0)
         """
         if self.m <= 0:
-            # no monitoring -> behave like vanilla (no barrier effect)
+            # no monitoring -> vanilla (no barrier effect)
             return self._vanilla_bs_price()
 
-        theta0, theta1 = self._theta0_theta1()
+        # Immediate KO checks
+        if self.barrier_type == "up-and-out" and (self.Hu is None or self.S0 >= self.Hu):
+            return 0.0
+        if self.barrier_type == "down-and-out" and (self.Hd is None or self.S0 <= self.Hd):
+            return 0.0
 
-        # φ-space levels
+        theta0, theta1 = self._theta0_theta1()
         c = self._phi(self.K)
+        DF_S = math.exp(-self.q_nacc * self.T) * self.S0
+        DF_K = math.exp(-self.r_nacc * self.T) * self.K
 
         if self.barrier_type == "up-and-out":
-            if self.Hu is None or self.S0 >= self.Hu:
+            # economic zero only for UO-call if K >= Hu
+            if self.opt_type == "call" and self.Hu is not None and self.K >= self.Hu:
                 return 0.0
             d = self._phi(self.Hu)
-            b_shift = d + BETA_BGK / math.sqrt(self.m)  # upward shift in φ
-            # Option sign χ handled by payoff composition below
+            b = d + BETA_BGK / math.sqrt(self.m)
             if self.opt_type == "call":
-                # vuoc (Eq. 2)
-                term1 = self.S0 * math.exp(-self.q_nacc * self.T) * (self._F_plus(d, b_shift, theta1) - self._F_plus(c, b_shift, theta1))
-                term2 = self.K  * math.exp(-self.r_nacc * self.T) * (self._F_plus(d, b_shift, theta0) - self._F_plus(c, b_shift, theta0))
-                return term1 - term2
+                return DF_S * ( self._F_plus(d, b, theta1) - self._F_plus(c, b, theta1) ) \
+                     - DF_K * ( self._F_plus(d, b, theta0) - self._F_plus(c, b, theta0) )
             else:
-                # up-and-out put via call-put parity on F terms (χ=-1). Using same structure with θ0/θ1 swapped signs
-                # A straightforward route: vanilla put - up-and-in put; but Hörfelt gives uo-put by sign change.
-                # We obtain put-out by vanilla - (up-and-in put); compute up-and-in by vanilla - up-and-out put of put-call parity pair:
-                vanilla_put = self._vanilla_bs_price()
-                # up-and-in put = vanilla put - up-and-out put; but we need up-and-out put itself.
-                # For stability, price up-and-out CALL via formula and then use parity:
-                uo_call = self.S0 * math.exp(-self.q_nacc * self.T) * (self._F_plus(d, b_shift, theta1) - self._F_plus(c, b_shift, theta1)) \
-                          - self.K  * math.exp(-self.r_nacc * self.T) * (self._F_plus(d, b_shift, theta0) - self._F_plus(c, b_shift, theta0))
-                vanilla_call = self._vanilla_bs_price_forced("call")
-                uo_put = vanilla_put - (vanilla_call - uo_call)  # out put = vanilla put - in put; in put = vanilla call - out call (symmetry)
-                return uo_put
+                # DIRECT UO put
+                return DF_K * self._F_plus(c, b, theta0) - DF_S * self._F_plus(c, b, theta1)
 
         elif self.barrier_type == "down-and-out":
-            if self.Hd is None or self.S0 <= self.Hd:
+            # economic zero only for DO-put if K <= Hd
+            if self.opt_type == "put" and self.Hd is not None and self.K <= self.Hd:
                 return 0.0
             d = self._phi(self.Hd)
-            b_shift = d - BETA_BGK / math.sqrt(self.m)  # downward shift in φ
+            b = d - BETA_BGK / math.sqrt(self.m)
             if self.opt_type == "put":
-                # vdop (Eq. 3)
-                term1 = self.K  * math.exp(-self.r_nacc * self.T) * (self._F_minus(d, b_shift, theta0) - self._F_minus(c, b_shift, theta0))
-                term2 = self.S0 * math.exp(-self.q_nacc * self.T) * (self._F_minus(d, b_shift, theta1) - self._F_minus(c, b_shift, theta1))
-                return term1 - term2
+                return DF_K * ( self._F_minus(d, b, theta0) - self._F_minus(c, b, theta0) ) \
+                     - DF_S * ( self._F_minus(d, b, theta1) - self._F_minus(c, b, theta1) )
             else:
-                # down-and-out call via parity (mirror logic to the up-case)
-                vanilla_call = self._vanilla_bs_price_forced("call")
-                # down-and-in call = vanilla call - down-and-out call; but we need down-and-out call directly.
-                # Use Hörfelt symmetry: compute down-and-out put using formula and then infer down-and-out call via parity with vanilla.
-                dop_put = self.K  * math.exp(-self.r_nacc * self.T) * (self._F_minus(d, b_shift, theta0) - self._F_minus(c, b_shift, theta0)) \
-                          - self.S0 * math.exp(-self.q_nacc * self.T) * (self._F_minus(d, b_shift, theta1) - self._F_minus(c, b_shift, theta1))
-                vanilla_put = self._vanilla_bs_price_forced("put")
-                do_call = vanilla_call - (vanilla_put - dop_put)  # out call = vanilla call - in call; in call = vanilla put - out put
-                return do_call
+                # DIRECT DO call
+                return DF_S * self._F_minus(c, b, theta1) - DF_K * self._F_minus(c, b, theta0)
 
         else:
             raise ValueError("single-barrier out price called with non-single barrier type.")
 
-    def _vanilla_bs_price_forced(self, which: Literal["call", "put"]) -> float:
-        save = self.opt_type
-        self.opt_type = which
-        px = self._vanilla_bs_price()
-        self.opt_type = save
-        return px
-
+    # ---------------- Double-barrier OUT (unchanged, with Siegmund correction) ----------------
     def _G_continuous(self, a1: float, a2: float, b1: float, b2: float, theta: float, series_terms: int = 50) -> float:
         """
-        Continuous analogue probability (Hörfelt Eq. (8)):
-          G(a1,a2,b1,b2;θ) = N(a2-θ) - N(a1-θ) - G_+(a2;.) + G_+(a1;.) - G_-(a2;.) + G_-(a1;.)
-        with
-          G_+(a;.) = Σ_{i=1..∞} [ e^{2 α1^{(i)} θ} N(a - 2 α1^{(i)} - θ) - e^{2 α2^{(i)} θ} N(a - 2 α2^{(i)} - θ) ]
-          α1^{(i)} = i(b2 - b1) + b1
-          α2^{(i)} = i(b2 - b1)
-        Rapid exponential convergence; truncate after 'series_terms'.
+        Continuous analogue probability (Hörfelt Eq. (8)), series form (rapid convergence).
         """
         def N(x): return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -420,11 +399,9 @@ class DiscreteBarrierBGKPricer:
             return total
 
         def Gminus(a: float) -> float:
-            # G-(a,b1,b2;θ) = G+( -a, -b1, -b2; -θ )
             a_m = -a; b1_m = -b1; b2_m = -b2; th_m = -theta
             width = (b2_m - b1_m)
             total = 0.0
-            def N(x): return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
             for i in range(1, series_terms + 1):
                 alpha1 = i * width + b1_m
                 alpha2 = i * width
@@ -438,12 +415,12 @@ class DiscreteBarrierBGKPricer:
         """
         Siegmund’s suggestion for discrete double barriers:
           G^(m)(...) ≈ G(... with b1 -> b1 - β/√m, b2 -> b2 + β/√m)
-        Then use change-of-numeraire lemma to form the price.
+        Then form the OUT price by change-of-numeraire lemma.
         """
         if self.m <= 0 or (self.Hd is None and self.Hu is None):
             return self._vanilla_bs_price()
 
-        # Ensure both barriers exist for double-out
+        # Require both barriers for double-out
         if self.Hd is None or self.Hu is None:
             raise ValueError("Double barrier requires both lower_barrier and upper_barrier.")
 
@@ -463,24 +440,23 @@ class DiscreteBarrierBGKPricer:
             return self._G_continuous(a1, a2, b1_adj, b2_adj, th, series_terms=series_terms)
 
         # Payoff assembly (knock-OUT call/put)
+        DF_S = math.exp(-self.q_nacc * self.T) * self.S0
+        DF_K = math.exp(-self.r_nacc * self.T) * self.K
+
         if self.opt_type == "call":
             if self.K >= self.Hu:
                 return 0.0
             a1 = max(c, d1)
             a2 = d2
-            term_S = self.S0 * math.exp(-self.q_nacc * self.T) * Gm(a1, a2, theta1)
-            term_K = self.K  * math.exp(-self.r_nacc * self.T) * Gm(a1, a2, theta0)
-            return term_S - term_K
+            return DF_S * Gm(a1, a2, theta1) - DF_K * Gm(a1, a2, theta0)
         else:
             if self.K <= self.Hd:
                 return 0.0
             a1 = d1
             a2 = min(c, d2)
-            term_K = self.K  * math.exp(-self.r_nacc * self.T) * Gm(a1, a2, theta0)
-            term_S = self.S0 * math.exp(-self.q_nacc * self.T) * Gm(a1, a2, theta1)
-            return term_K - term_S
+            return DF_K * Gm(a1, a2, theta0) - DF_S * Gm(a1, a2, theta1)
 
-    # ---------- utilities ----------
+    # ---------------- scaling ----------------
     def _signed_scale(self, px: float) -> float:
         sign = 1.0 if self.direction == "long" else -1.0
         return sign * self.quantity * self.contract_multiplier * float(px)
