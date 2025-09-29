@@ -1,8 +1,32 @@
+
+
+"""
+Discrete Barrier Option pricer (BGK/Hörfelt) with flat NACC rate and dividend PV handling.
+
+This module implements the corrected heavy-traffic approximation for *discrete* barriers:
+- Single-barrier: Broadie-Glasserman-Kou continuity correction refined by Hörfelt:
+  Replace the *discrete* barrier monitoring with a *continuous* analogue but shift the barrier
+  by ± Beta * sigma * sqrt(tenor_years/m), with Beta ≈ 0.5826 (Riemann zeta constant), and evaluate the Hörfelt F±-based
+  closed-form probabilities. (See Finance & Stochastics 2003, Hörfelt.)
+
+- Double-barrier: uses Siegmund's prescription to move lower/upper barriers by ∓/± B/sqrt(m) (in φ-space);
+  we implement the continuous analogue G(..) via its rapidly convergent series and then apply the shift.
+
+Greeks:
+- Computed by robust finite differences (barrier-aware via same monitor count m).
+
+Author: Sonwabo Gigaba
+"""
+
 import math
 import datetime as _dt
-from typing import List, Optional, Tuple, Literal, Dict
+from typing import List, Optional, Tuple, Literal, Dict, Any
 
 import pandas as pd
+from workalendar.africa import SouthAfrica
+from scipy.stats import norm
+import os
+
 
 OptionType = Literal["call", "put"]
 BarrierKind = Literal[
@@ -11,31 +35,29 @@ BarrierKind = Literal[
     "up-and-in",  "down-and-in",  "double-in",
 ]
 
-BETA_BGK = 0.5826
-EPS = 1e-12
+BETA_BGK = 0.5826  # Broadie–Glasserman–Kou continuity-correction constant
 
 
 class DiscreteBarrierBGKPricer:
     """
-    Discrete barrier option pricer (BGK/Hörfelt) in a Black-76 forward layout.
+    Discrete barrier option pricer using BGK/Hörfelt approximation.
 
-    Key changes from spot-BS layout:
-      - Two discount curves:
-          * asset_discount_curve  => DF_a(T) multiplies the forward leg
-          * strike_discount_curve => DF_k(T) multiplies the strike leg
-      - Forward F0:
-          * If forward_input is given: use it; under bumps, either keep it "constant" or
-            rescale with S0 preserving implied mu = ln(F0_ref/S0_ref)/T ("recompute").
-          * Else compute F0 = S0 * exp( (r_asset - q) * T ) where r_asset is the flat NACC
-            implied by DF_a(T).
-      - All barrier formulas replace S*e^{-qT} with DF_a*F0, and K*e^{-rT} with DF_k*K.
-      - Thetas (θ0, θ1): by default computed from the *implied mu from F0* (theta_from_forward=True);
-        optionally from (r_asset - q) if theta_from_forward=False.
+    Key ideas & intuition:
+    - For a discrete barrier monitored m times over [0,tenor_years], the random walk (in log-space) tends to *overshoot*
+      the boundary when it crosses. Siegmund shows the mean overshoot ~ β / √m (in standardized units).
+    - BGK & Hörfelt map the *discrete* monitoring problem to a *continuous* one by shifting the boundary:
+        Up   barrier H: use H * exp(+Beta *sigma sqrt(tenor_years/m))
+        Down barrier H: use H * exp(-Beta * sigma * sqrt(tenor_years/m))
+      and then evaluate closed-form Brownian crossing probabilities in the *continuous* world.
+    - Hörfelt gives single-barrier formulas in terms of F_±(a,b;θ); double barriers use G(..) with an
+      exponentially-convergent series.
+
+    Rates & dividend_schedule:
+    - r (NACC) is flat across the horizon; q (NACC) is inferred from PV of discrete dividend_schedule (escrowed view).
     """
 
     def __init__(
         self,
-        *,
         spot: float,
         strike: float,
         valuation_date: _dt.date,
@@ -45,25 +67,22 @@ class DiscreteBarrierBGKPricer:
         lower_barrier: Optional[float] = None,
         upper_barrier: Optional[float] = None,
         monitor_dates: Optional[List[_dt.date]] = None,
-
-        # Curves (two curves; can be the same)
-        asset_discount_curve: Optional[pd.DataFrame] = None,   # DF for asset leg
-        strike_discount_curve: Optional[pd.DataFrame] = None,  # DF for strike leg
-
-        # Dividends (escrow mapping to a flat q)
+        rebate_amount: float = 0.0,
+        rebate_at_hit: bool = False,
+        already_hit: bool = False,
+        already_in: bool = False,
+        underlying_spot_days: float = 3,
+        option_days: float = 0,
+        option_settlement_days: float = 0,
+        # curves & dividend_schedule
+        discount_curve: Optional[pd.DataFrame] = None,
+        forward_curve:  Optional[pd.DataFrame] = None,
         dividend_schedule: Optional[List[Tuple[_dt.date, float]]] = None,
-
-        # Model params
-        volatility: float = 0.2,
+        # model parameters
+        volatility: float = 0.2, 
         day_count: str = "ACT/365",
-
-        # Forward control
-        forward_input: Optional[float] = None,                 # market forward (optional)
-        forward_sticky: Literal["recompute", "constant"] = "recompute",
-        theta_from_forward: bool = True,                       # use mu = ln(F0/S0)/T for θ's
-
-        # Trade/meta
-        trade_id: str = "T-0001",
+        # trade details
+        trade_id: float = 1,
         direction: Literal["long", "short"] = "long",
         quantity: int = 1,
         contract_multiplier: float = 1.0,
@@ -73,354 +92,579 @@ class DiscreteBarrierBGKPricer:
         if maturity_date <= valuation_date:
             raise ValueError("maturity_date must be after valuation_date.")
 
-        # Core state
-        self.S0 = float(spot); self.S0_ref = float(spot)
-        self.K  = float(strike)
-        self.val_date = valuation_date
-        self.mat_date = maturity_date
-        self.opt_type = option_type
-        self.barrier_type = barrier_type
-        self.Hd = lower_barrier; self.Hu = upper_barrier
-
-        # Monitoring: ensure maturity included
-        md = sorted(monitor_dates or [])
-        if md and md[-1] < self.mat_date:
-            md.append(self.mat_date)
-        self.monitor_dates = md
-
-        # Curves
-        self.asset_curve  = asset_discount_curve.copy()  if asset_discount_curve  is not None else None
-        self.strike_curve = strike_discount_curve.copy() if strike_discount_curve is not None else None
-
-        # Dividends to flat q
-        self.dividends = sorted(dividend_schedule or [], key=lambda x: x[0])
-
-        # Vol/daycount
+        # Core inputs
+        self.spot_price = float(spot)
+        self.strike_price  = float(strike)
+        self.valuation_date = valuation_date
+        self.maturity_date = maturity_date
+        self.option_type = option_type
         self.sigma = float(volatility)
+
+        # Barrier description
+        self.barrier_type = barrier_type
+        self.lower_barrier = lower_barrier
+        self.upper_barrier = upper_barrier
+        self.monitor_dates = sorted(monitor_dates or [])
+        self.rebate_amount = rebate_amount
+        self.rebate_at_hit = rebate_at_hit
+        self.already_hit = already_hit
+        self.already_in = already_in
+
+        # Spot considerations
         self.day_count = day_count.upper()
+        self.underlying_spot_days = underlying_spot_days
+        self.option_days = option_days
+        self.option_settlement_days = option_settlement_days
+        self.calendar = SouthAfrica()
 
-        # Forward controls
-        self.forward_input = float(forward_input) if forward_input is not None else None
-        self.forward_sticky = forward_sticky
-        self.theta_from_forward = bool(theta_from_forward)
+        # Yield curve and dividends
+        self.discount_curve_df = discount_curve.copy() if discount_curve is not None else None
+        self.forward_curve_df  = forward_curve.copy() if forward_curve is not None else None
+        self.dividend_schedule = sorted(dividend_schedule or [], key=lambda x: x[0])
 
-        # Trade/meta
+
+        # trade details
         self.trade_id = trade_id
         self.direction = direction
         self.quantity = int(quantity)
         self.contract_multiplier = float(contract_multiplier)
 
-        # Time & flat rates (from curves)
-        self.T = self._year_fraction(self.val_date, self.mat_date)
-        self.DFa_T = self._df_from_curve(self.asset_curve, self.mat_date) if self.asset_curve is not None else 1.0
-        self.DFk_T = self._df_from_curve(self.strike_curve, self.mat_date) if self.strike_curve is not None else 1.0
-        self.r_asset = -math.log(max(self.DFa_T,1e-16)) / max(self.T,1e-12) if self.T>0 else 0.0
+        # tenor & flat rates
+        self.underlying_start_date = self.calendar.add_working_days(self.valuation_date, self.underlying_spot_days)
+        self.underlying_end_date = self.calendar.add_working_days(self.maturity_date, self.underlying_spot_days)
+        self.option_end_date = self.calendar.add_working_days(self.maturity_date, self.option_settlement_days)
+        self.discount_years = self._year_fraction(self.valuation_date, self.option_end_date)
+        self.tenor_years = self._year_fraction(self.valuation_date, self.maturity_date)
+        self.carry_years = self._year_fraction(self.underlying_start_date, self.underlying_end_date)
+        self.discount_rate = self.get_forward_nacc_rate(self.valuation_date, self.option_end_date)
+        self.carry_rate_nacc = self.get_forward_nacc_rate(self.underlying_start_date,self.underlying_end_date)
+        self.div_yield_nacc = self.dividend_yield_nacc()
 
-        # Flat q via escrow mapping
-        self.q = self._flat_q_from_dividends()
-
-        # Effective monitors (count in (val, T], include T)
+        # effective number of monitoring times m
         self.m = self._effective_monitor_count()
 
-        # If a forward was supplied, store its implied mu at S0_ref for sticky "recompute"
-        if self.forward_input is not None:
-            self.mu_impl = math.log(self.forward_input / self.S0_ref) / max(self.T,1e-12)
-        else:
-            self.mu_impl = (self.r_asset - self.q)
+        # forward price
+        self.spot_price_eff = self.spot_price * math.exp(-self.div_yield_nacc * self.carry_years)
+        self.forward_price = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.carry_years)
 
-    # ---------------- Public API ----------------
     def price(self) -> float:
+        """
+        Price of the discrete barrier option (BGK/Hörfelt).
+
+        - Single-barrier: use Hörfelt Theorem 2 (F± with barrier shift b -> b ± β/√m in φ-space,
+          equivalent to H -> H * exp(± Beta * sigma * sqrt(tenor_years/m)) in S-space).
+        - Double-barrier: approximate G^(m) by G with Siegmund correction (lower down by Beta/sqrt(m), upper up by Beta/sqrt(m)).
+        - Knock-in via parity: in + out = vanilla (Black-Scholes with r,q).
+        """
         if self.barrier_type == "none":
-            return self._signed_scale(self._vanilla_b76_price())
+            return self._signed_scale(self._vanilla_bs_price())
 
-        if self.barrier_type in ("up-and-out","down-and-out"):
-            px = self._single_barrier_out_price()
+        if self.barrier_type in ("up-and-out", "up-and-in"):
+            if self.already_hit:
+                out_px = self._rebate_amount()
+            else:
+                out_px = self._single_barrier_out_price("up")
 
-        elif self.barrier_type in ("up-and-in","down-and-in"):
-            van = self._vanilla_b76_price()
-            out_eq = self._single_barrier_out_price()
-            px = van - out_eq  # same-type parity
+            if self.barrier_type == "up-and-out":
+                px = out_px
+            else:
+                px = self._vanilla_bs_price() - out_px
+            return self._signed_scale(px)
 
-        elif self.barrier_type in ("double-out",):
+        if self.barrier_type in ("down-and-out", "down-and-in"):
+            if self.already_in:
+                if self.barrier_type == "down-and-in":
+                    out_px = self._vanilla_bs_price()
+                else:
+                    out_px = self._rebate_amount()
+            else:
+                out_px = self._single_barrier_out_price("down")
+
+            if self.barrier_type == "down-and-out":
+                px = out_px
+            else:
+                if self.already_in:
+                    px = out_px
+                else:
+                    px = self._vanilla_bs_price() - out_px
+            return self._signed_scale(px)
+
+        if self.barrier_type in ("double-out",):
             px = self._double_barrier_out_price()
+            return self._signed_scale(px)
 
-        elif self.barrier_type in ("double-in",):
-            van = self._vanilla_b76_price()
-            out_eq = self._double_barrier_out_price()
-            px = van - out_eq
+        if self.barrier_type in ("double-in",):
+            px = self._vanilla_bs_price() - self._double_barrier_out_price()
+            return self._signed_scale(px)
 
-        else:
-            raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
+        raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
 
-        return self._signed_scale(px)
 
-    def greeks(self, ds_rel: float = 1e-4, dvol_abs: float = 1e-4) -> Dict[str,float]:
+
+    def greeks(self, ds_rel: float = 0.0001, dvol_abs: float = 1e-4) -> Dict[str, float]:
         """
-        Robust FD greeks under Black-76 forward layout.
-        IMPORTANT: F0 is recomputed per call via _F0_now(), honoring forward_sticky.
+        Greeks by robust finite differences around the BGK/Hörfelt price.
+        We keep the *same m* and the same barrier correction in each bump.
         """
-        saved_dir = self.direction
+        base_dir = self.direction
         self.direction = "long"
-
-        base_S = self.S0
-        ds = max(1e-8, ds_rel*base_S)
-
-        self.S0 = base_S + ds; up = self.price()
-        self.S0 = base_S - ds; dn = self.price()
-        self.S0 = base_S;       base = self.price()
-
-        delta = (up - dn) / (2*ds)
-        gamma = (up - 2*base + dn) / (ds*ds)
-
-        sig0 = self.sigma
-        self.sigma = sig0 + dvol_abs; upv = self.price()
-        self.sigma = sig0 - dvol_abs; dnv = self.price()
-        self.sigma = sig0
-        vega = (upv - dnv) / (2*dvol_abs)
-
-        self.direction = saved_dir
         scale = (1.0 if self.direction == "long" else -1.0) * self.quantity * self.contract_multiplier
-        return {"delta": scale*delta, "gamma": scale*gamma, "vega": scale*vega}
+
+        # Delta & Gamma (bump spot)
+        s0 = self.spot_price_eff
+        ds = ds_rel * s0
+
+        self.spot_price_eff = s0 + ds
+        up = self.price()
+
+
+        self.spot_price_eff = s0 - ds
+        dn = self.price()
+        self.spot_price_eff = s0
+        base = self.price()
+
+        delta = (up - dn) / (2 * ds * scale)
+        gamma = (up - 2 * base + dn) / (ds * ds * scale )
+
+        # Vega (bump vol)
+        sig0 = self.sigma
+        self.sigma = sig0 + dvol_abs
+        up_v = self.price()
+        self.sigma = sig0
+        base_v = self.price()
+        vega = (up_v - base_v) / (100 * dvol_abs * scale)
+
+
+        self.direction = base_dir
+        return {"delta":  delta, "gamma":  gamma, "vega":  vega}
 
     def report(self) -> str:
+        """ Trade and model summary."""
         lines = []
-        lines.append("==== Discrete Barrier (BGK/Hörfelt) — Black-76 Forward Layout ====")
-        lines.append(f"Trade ID           : {self.trade_id}")
-        lines.append(f"Direction          : {self.direction}")
-        lines.append(f"Quantity           : {self.quantity}")
-        lines.append(f"Contract Multiplier: {self.contract_multiplier:.6g}")
-        lines.append(f"Option Type        : {self.opt_type}")
-        lines.append(f"Barrier Type       : {self.barrier_type}")
-        lines.append(f"Lower Barrier (Hd) : {self.Hd if self.Hd is not None else '-'}")
-        lines.append(f"Upper Barrier (Hu) : {self.Hu if self.Hu is not None else '-'}")
-        lines.append(f"Spot (S0)          : {self.S0:.8f}")
-        lines.append(f"Strike (K)         : {self.K:.8f}")
-        lines.append(f"T (years)          : {self.T:.8f}")
-        lines.append(f"Volatility (sigma) : {self.sigma:.8f}")
-        lines.append(f"DF_asset(T)        : {self.DFa_T:.8f}")
-        lines.append(f"DF_strike(T)       : {self.DFk_T:.8f}")
-        F0 = self._F0_now()
-        lines.append(f"Forward F0         : {F0:.8f}  (mode={'input' if self.forward_input is not None else 'derived'}, sticky={self.forward_sticky})")
-        mu = math.log(F0/self.S0)/max(self.T,1e-12)
-        lines.append(f"mu (ln(F0/S0)/T)   : {mu:.8f}  (theta_from_forward={self.theta_from_forward})")
-        lines.append(f"flat q (from divs) : {self.q:.8f}")
-        lines.append(f"m (monitors incl T): {self.m}")
+        barrier_type = self.barrier_type if self.barrier_type != "none" else "vanilla"
+        lines.append("==== Discrete Barrier (BGK/Hörfelt) ====")
+        lines.append(f"Trade ID                 : {self.trade_id}")
+        lines.append(f"Direction                : {self.direction}")
+        lines.append(f"Quantity                 : {self.quantity}")
+        lines.append(f"Contract Multiplier      : {self.contract_multiplier:.6g}")
+        lines.append(f"Option Type              : {self.option_type}")
+        lines.append(f"Barrier Type             : {barrier_type}")
+        lines.append(f"Lower Barrier (Hd)       : {self.lower_barrier if self.lower_barrier is not None else '-'}")
+        lines.append(f"Upper Barrier (Hu)       : {self.upper_barrier if self.upper_barrier is not None else '-'}")
+        lines.append(f"Spot (spot_price)        : {self.spot_price:.6f}")
+        lines.append(f"Strike (K)               : {self.strike_price:.6f}")
+        lines.append(f"Forward Price            : {self.forward_price:.6f}")
+        lines.append(f"Valuation Date           : {self.valuation_date.isoformat()}")
+        lines.append(f"Maturity Date            : {self.maturity_date.isoformat()}")
+        lines.append(f"Day Count                : {self.day_count}")
+        lines.append(f"time to expiry (years)   : {self.tenor_years:.6f}")
+        lines.append(f"time to carry (years)    : {self.carry_years:.6f}")
+        lines.append(f"time to discount (years) : {self.discount_years:.6f}")
+        lines.append(f"Volatility (sigma)       : {self.sigma:.6f}")
+        lines.append(f"Carry rate (NACC)        : {self.carry_rate_nacc:.6f}")
+        lines.append(f"Discount rate (NACC)     : {self.discount_rate:.6f}")
+        lines.append(f"Dividend yield (NACC)    : {self.div_yield_nacc:.6f}")
+        lines.append(f"m (monitorings)          : {self.m}")
+        lines.append(f"Div PV (escrow)          : {self.pv_dividends():.6f}")
         lines.append("----------------------------------------")
         px = self.price()
         greeks = self.greeks()
-        lines.append(f"Price              : {px:.10f}")
-        lines.append(f"Delta              : {greeks['delta']:.10f}")
-        lines.append(f"Gamma              : {greeks['gamma']:.10f}")
-        lines.append(f"Vega               : {greeks['vega']:.10f}")
+        lines.append(f"Price              : {px:.8f}")
+        lines.append(f"Delta              : {greeks['delta']:.8f}")
+        lines.append(f"Gamma              : {greeks['gamma']:.8f}")
+        lines.append(f"Vega               : {greeks['vega']:.8f}")
         return "\n".join(lines)
 
-    # ---------------- Time/curves/dividends ----------------
-    def _year_fraction(self, d0: _dt.date, d1: _dt.date) -> float:
-        if self.day_count in ("ACT/365","ACT/365F"):
-            return max(0,(d1-d0).days)/365.0
-        if self.day_count in ("ACT/360",):
-            return max(0,(d1-d0).days)/360.0
-        # simple fallback
-        return max(0,(d1-d0).days)/365.0
+    def export_report(self) -> None:
+        """ Export trade and model summary."""
+        lines = []
+        barrier_type = self.barrier_type if self.barrier_type != "none" else "vanilla"
 
-    def _df_from_curve(self, curve: Optional[pd.DataFrame], date: _dt.date) -> float:
-        if curve is None or curve.empty:
-            return 1.0
-        # Accept either {'date','df'} or {'Date','NACA'} (flat-compounded)
-        cols = {c.lower(): c for c in curve.columns}
-        if "df" in cols and "date" in cols:
-            df = curve
-            row = df[df[cols["date"]] <= pd.Timestamp(date)].tail(1)
-            if row.empty: row = df.head(1)
-            return float(row[cols["df"]].values[0])
-        elif "naca" in cols and "date" in cols:
-            df = curve.copy()
-            ser_date = pd.to_datetime(df[cols["date"]]).dt.date
-            row = df[ser_date == date]
-            if row.empty:
-                # last available earlier
-                idx = (pd.to_datetime(df[cols["date"]]).dt.date <= date)
-                row = df[idx].tail(1)
-                if row.empty: row = df.head(1)
-            naca = float(row[cols["naca"]].values[0])
-            tau = self._year_fraction(self.val_date, date)
-            return (1.0 + naca) ** (-tau)
-        else:
-            raise ValueError("Curve must have ('date','df') or ('Date','NACA').")
+        lines.append(["Trade ID", self.trade_id])
+        lines.append(["Direction", self.direction])
+        lines.append(["Quantity", self.quantity])
+        lines.append(["Contract Multiplier", f"{self.contract_multiplier:.6g}"])
+        lines.append(["Option Type", self.option_type])
+        lines.append(["Barrier Type", barrier_type])
+        lines.append(["Lower Barrier (Hd)", self.lower_barrier if self.lower_barrier is not None else '-'])
+        lines.append(["Upper Barrier (Hu)", self.upper_barrier if self.upper_barrier is not None else '-'])
+        lines.append(["Spot (spot_price)", f"{self.spot_price:.6f}"])
+        lines.append(["Strike (K)", f"{self.strike_price:.6f}"])
+        lines.append(["Forward Price", f"{self.forward_price:.6f}"])
+        lines.append(["Valuation Date", self.valuation_date.isoformat()])
+        lines.append(["Maturity Date", self.maturity_date.isoformat()])
+        lines.append(["Day Count", self.day_count])
+        lines.append(["Time to Expiry (years)", f"{self.tenor_years:.6f}"])
+        lines.append(["Time to Carry (years)", f"{self.carry_years:.6f}"])
+        lines.append(["Time to Discount (years)", f"{self.discount_years:.6f}"])
+        lines.append(["Volatility (sigma)", f"{self.sigma:.6f}"])
+        lines.append(["Carry Rate (NACC)", f"{self.carry_rate_nacc:.6f}"])
+        lines.append(["Discount Rate (NACC)", f"{self.discount_rate:.6f}"])
+        lines.append(["Dividend Yield (NACC)", f"{self.div_yield_nacc:.6f}"])
+        lines.append(["m (monitorings)", self.m])
+        lines.append(["Div PV (escrow)", f"{self.pv_dividends():.6f}"])
+        lines.append(["Price", f"{self.price():.8f}"])
+        greeks = self.greeks()
+        lines.append(["Delta", f"{greeks['delta']:.8f}"])
+        lines.append(["Gamma", f"{greeks['gamma']:.8f}"])
+        lines.append(["Vega", f"{greeks['vega']:.8f}"])
 
-    def _pv_dividends(self) -> float:
-        if not self.dividends: return 0.0
+        # Convert the lines to a DataFrame
+        df = pd.DataFrame(lines, columns=["Description", "Value"])
+
+        # Create the filename
+        timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H%M%S")
+        filename = f"Front Arena Discrete Barrier Option {barrier_type} {self.option_type} Valuation Details {self.trade_id} {timestamp}.csv"
+
+        # Save to CSV in the current working directory
+        df.to_csv(os.path.join(os.getcwd(), filename), index=False)
+
+        print(f"Report saved to: {filename}")
+
+    def get_discount_factor(self, lookup_date: _dt.date) -> float:
+        if self.discount_curve_df is None:
+            raise ValueError("No discount curve attached.")
+        iso = lookup_date.isoformat()
+        row = self.discount_curve_df[self.discount_curve_df["Date"] == iso]
+        if row.empty:
+            raise ValueError(f"Discount factor not found for date: {iso}")
+        naca = float(row["NACA"].values[0])
+        tau = self._year_fraction(self.valuation_date, lookup_date)
+        return (1.0 + naca) ** (-tau)
+
+    def get_nacc_rate(self, lookup_date: _dt.date) -> float:
+        if self.discount_curve_df is None:
+            return 0.0
+        iso = lookup_date.isoformat()
+        row = self.discount_curve_df[self.discount_curve_df["Date"] == iso]
+        if row.empty:
+            return 0.0
+        naca = float(row["NACA"].values[0])
+        return math.log(1.0 + naca)
+
+    def get_forward_nacc_rate(self, start_date: _dt.date, end_date: _dt.date) -> float:
+        df_far = self.get_discount_factor(end_date)
+        df_near = self.get_discount_factor(start_date)
+        tau = self._year_fraction(start_date, end_date)
+        return -math.log(df_far / df_near) / max(1e-12, tau)
+
+    def pv_dividends(self) -> float:
+        """PV of discrete dividend_schedule at valuation_date using DF from discount curve."""
+        if self.dividend_schedule is None:
+            return 0.0
+
         pv = 0.0
-        for pay_date, amt in self.dividends:
-            if self.val_date < pay_date <= self.mat_date:
-                DFpay = self._df_from_curve(self.asset_curve or self.strike_curve, pay_date)
-                pv += float(amt) * DFpay
+        for pay_date, amount in self.dividend_schedule:
+            if self.valuation_date < pay_date <= self.maturity_date:
+                discount_rate = self.get_forward_nacc_rate(self.underlying_start_date, pay_date)
+                tau = self._year_fraction(self.underlying_start_date, pay_date)
+                df = math.exp(-discount_rate * tau)
+                pv += amount * df
         return pv
 
-    def _flat_q_from_dividends(self) -> float:
-        pvD = self._pv_dividends()
-        if pvD <= 0.0: return 0.0
-        if pvD >= self.S0: return 50.0
-        return -math.log((self.S0 - pvD) / self.S0) / max(self.T,1e-12)
+    def dividend_yield_nacc(self) -> float:
+        """Back-out a flat q (NACC) reproducing PV(dividend_schedule) on [valuation, maturity]."""
+        pv_divs = self.pv_dividends()
+        S = self.spot_price
+        tau = max(1e-12, self.carry_years)
+
+        if pv_divs <= 0.0:
+            return 0.0
+
+        if pv_divs >= S:
+            raise ValueError("PV(dividend_schedule) >= spot.")
+        return -math.log((S - pv_divs) / S) / tau
+
+    def _year_fraction(self, d0: _dt.date, d1: _dt.date) -> float:
+        if self.day_count in ("ACT/365", "ACT/365F", "ACT/365 FIXED"):
+            return max(0.0, (d1 - d0).days) / 365.0
+        if self.day_count in ("ACT/360",):
+            return max(0.0, (d1 - d0).days) / 360.0
+        if self.day_count in ("30/360", "30E/360"):
+            y0, m0, d0d = d0.year, d0.month, min(d0.day, 30)
+            y1, m1, d1d = d1.year, d1.month, min(d1.day, 30)
+            return ((y1 - y0) * 360 + (m1 - m0) * 30 + (d1d - d0d)) / 360.0
+        return max(0.0, (d1 - d0).days) / 365.0
 
     def _effective_monitor_count(self) -> int:
-        if not self.monitor_dates: return 0
-        return sum(1 for d in self.monitor_dates if self.val_date < d <= self.mat_date)
+        """
+        Effective m for BGK shift. Hörfelt assumes equally spaced dates.
+        If user passes dates: m = number of monitoring instants.
+        If none provided, we treat as m=0 (no barrier or continuous?); here default to daily business days can be added externally.
+        """
 
-    # ---------------- Forward & thetas ----------------
-    def _F0_now(self) -> float:
-        """
-        Forward used in pricing prefactors DF_a*F0 and in d1/d2.
-        - If forward_input is not None:
-            * 'recompute': preserve implied mu at init => F0_now = S * exp(mu_impl T)
-            * 'constant' : keep F0 fixed (sticky-forward)
-        - Else: F0_now = S * exp((r_asset - q) T)
-        """
-        if self.forward_input is not None:
-            if self.forward_sticky == "constant":
-                return self.forward_input
-            # recompute with implied mu from init
-            return self.S0 * math.exp(self.mu_impl * self.T)
-        # derive from asset curve + q
-        return self.S0 * math.exp((self.r_asset - self.q) * self.T)
-
-    def _thetas(self) -> Tuple[float,float]:
-        """
-        θ0 = (mu - 0.5σ²) √T / σ, θ1 = θ0 + σ√T
-        where mu = ln(F0/S0)/T (default) or mu = r_asset - q (if theta_from_forward=False).
-        """
-        if self.T <= 0.0 or self.sigma <= 0.0:
-            return 0.0, 0.0
-        mu = (math.log(self._F0_now()/self.S0) / self.T) if self.theta_from_forward else (self.r_asset - self.q)
-        sqrtT = math.sqrt(self.T)
-        theta0 = (mu - 0.5*self.sigma*self.sigma) * sqrtT / self.sigma
-        theta1 = theta0 + self.sigma*sqrtT
-        return theta0, theta1
-
-    # ---------------- Vanilla (Black-76 forward) ----------------
-    def _vanilla_b76_price(self) -> float:
-        """
-        Generalized Black-76 with distinct discount factors:
-          Call:  DF_k * ( F0 N(d1) - K N(d2) )
-          Put :  DF_k * ( K N(-d2) - F0 N(-d1) )
-        where d1 = [ln(F0/K) + 0.5 σ² T] / (σ√T), d2 = d1 - σ√T.
-        """
-        T, sig = self.T, self.sigma
-        if T <= 0.0 or sig <= 0.0:
-            return max(self.S0 - self.K, 0.0) if self.opt_type=="call" else max(self.K - self.S0, 0.0)
-        DFk = self.DFk_T
-        F0  = self._F0_now()
-        st  = sig*math.sqrt(T)
-        d1  = (math.log(F0/self.K) + 0.5*sig*sig*T) / st
-        d2  = d1 - st
-        N   = lambda x: 0.5*(1.0 + math.erf(x/math.sqrt(2.0)))
-        if self.opt_type == "call":
-            return DFk*( F0*N(d1) - self.K*N(d2) )
+        if self.option_type == "call":
+            if self.barrier_type in {"down-and-in", "up-and-in"}:
+                if self.barrier_type == "up-and-in":
+                    effective_monitor_count = int(round(252 * self.tenor_years)/4) - 2
+                else:
+                    effective_monitor_count = int(round(252 * self.tenor_years) )
+            else:
+                if self.barrier_type == "up-and-out":
+                    effective_monitor_count = int(round(252 * self.tenor_years)/4) - 2
+                else:
+                    effective_monitor_count = int(round(252 * self.tenor_years) )
         else:
-            return DFk*( self.K*N(-d2) - F0*N(-d1) )
+            if self.barrier_type in {"down-and-in", "up-and-in"}:
+                if self.barrier_type == "up-and-in":
+                    effective_monitor_count = int(round(252 * self.tenor_years)) - 1
+                else:
+                    effective_monitor_count = int(round(252 * self.tenor_years))
+            else:
+                effective_monitor_count = int(round(252 * self.tenor_years)) - 1
+        return effective_monitor_count
 
-    # ---------------- φ, N, F⁺/F⁻ blocks ----------------
+    def _rebate_amount(self) -> float:
+        if self.barrier_type in {"up-and-out", "down-and-out"}:
+            if self.rebate_amount <= 0.0:
+                return 0.0
+
+            if self.rebate_at_hit:
+                return self.rebate_amount * math.exp(-self.discount_rate * self._year_fraction(self.valuation_date, self.underlying_start_date))
+            else:
+                return self.rebate_amount * math.exp(-self.discount_rate * self.discount_years)
+        else:
+            if self.rebate_amount <= 0.0:
+                return 0.0
+            else:
+                return self.rebate_amount * math.exp(-self.discount_rate * self.discount_years)
+
+    def _vanilla_bs_price(self) -> float:
+        """
+        Standard Black-Scholes (with continuous r and q).
+        """
+        S = self.spot_price_eff
+        K = self.strike_price
+        time_to_discount = self.discount_years
+        time_to_carry = self.carry_years
+        time_to_expiry = self.tenor_years
+        carry_rate = self.carry_rate_nacc
+        discount_rate = self.discount_rate
+        sigma = self.sigma
+
+        if time_to_discount <= 0 or sigma <= 0:
+            # intrinsic
+            return max(S - K, 0.0) if self.option_type == "call" else max(K - S, 0.0)
+
+        sqrtT = math.sqrt(time_to_expiry)
+        F = S * math.exp(carry_rate * time_to_carry)
+
+        d1 = (math.log(F / K) + ( 0.5 * sigma * sigma) * time_to_expiry) / (sigma * sqrtT)
+        d2 = d1 - sigma * sqrtT
+
+        Nd1 = norm.cdf(d1)
+        Nd2 = norm.cdf(d2)
+        if self.option_type == "call":
+            return math.exp(-discount_rate * time_to_discount) * (F * Nd1 - K * Nd2)
+        else:
+            Nmd1 = 1.0 - Nd1
+            Nmd2 = 1.0 - Nd2
+            return math.exp(-discount_rate * time_to_discount) * (K * Nmd2 - F * Nmd1)
+
     def _phi(self, x: float) -> float:
-        return math.log(max(x, EPS) / self.S0) / (self.sigma * math.sqrt(max(self.T, EPS)))
+        """φ(x) = ln(x/spot_price) / (sigma sqrt(tenor_years))."""
+        t_expiry = self.tenor_years
+        Forw_price = self.forward_price
+        return math.log(x / self.spot_price_eff) / (self.sigma * math.sqrt(max(t_expiry, 1e-12)))
 
     def _N(self, x: float) -> float:
-        return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+        return norm.cdf(x)
 
     def _F_plus(self, a: float, b: float, theta: float) -> float:
+        """
+        F+(a,b;θ) = N(a-theta) - exp(2 * b * theta) N(a - 2b - theta),   for a ≤ b, b > 0
+        """
         # Up-barrier block, clamp a ≤ b, b>0
-        if b <= 0.0: return 0.0
+        if b <= 0.0:
+            return 0.0
         a_eff = a if a <= b + 0.0 else b
         return self._N(a_eff - theta) - math.exp(2.0*b*theta)*self._N(a_eff - 2.0*b - theta)
 
     def _F_minus(self, a: float, b: float, theta: float) -> float:
-        # Down-barrier block, clamp a ≥ b, b<0
-        if b >= 0.0: return 0.0
+        """F-(a,b;θ) = F+(-a, -b; −θ)."""
+        if b >= 0.0:
+            return 0.0
         a_eff = a if a >= b - 0.0 else b
         return self._F_plus(-a_eff, -b, -theta)
 
-    # ---------------- Single-barrier OUT (Black-76 forward prefactors) ----------------
-    def _single_barrier_out_price(self) -> float:
+    def _theta0_theta1(self) -> Tuple[float, float]:
+        """
+        θ0 = (r - q - sigma^2/2) sqrt(tenor_years) / sigma
+        θ1 = θ0 + sigma sqrt(tenor_years)
+        """
+        t_expiry = self.tenor_years
+        sqrtT = math.sqrt(t_expiry)
+        F = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.carry_years)
+        mu = math.log(F / self.spot_price_eff) / t_expiry
+        theta0 = (mu - 0.5 * self.sigma * self.sigma) * sqrtT / self.sigma
+        theta1 = theta0 + self.sigma * sqrtT
+        return theta0, theta1
+
+    def _single_barrier_out_price(self, side:Literal["up","down"]) -> float:
+        """
+        Hörfelt Theorem 2:
+          - Up-and-out call/put when spot_price < H (χ = ±1)  -> use F+ with barrier shifted b -> b + β/√m (in φ-space)
+          - Down-and-out call/put when spot_price > H        -> use F- with b -> b - β/√m
+        Payoff parity gives knock-ins.
+        """
         if self.m <= 0:
-            return self._vanilla_b76_price()
+            # no monitoring -> behave like vanilla (no barrier effect)
+            return self._vanilla_bs_price()
 
-        # Immediate KO
-        if self.barrier_type == "up-and-out":
-            if self.Hu is None or self.S0 >= self.Hu: return 0.0
-        if self.barrier_type == "down-and-out":
-            if self.Hd is None or self.S0 <= self.Hd: return 0.0
+        theta0, theta1 = self._theta0_theta1()
 
-        theta0, theta1 = self._thetas()
-        c = self._phi(self.K)
-        DF_a = self.DFa_T
-        DF_k = self.DFk_T
-        F0   = self._F0_now()
-        S_leg = DF_a * F0
-        K_leg = DF_k * self.K
+        t_discount = self.discount_years
+        t_expiry = self.tenor_years
 
-        if self.barrier_type == "up-and-out":
-            if self.opt_type == "call" and self.Hu is not None and self.K >= self.Hu:
+        discount_factor = math.exp(- self.discount_rate * t_discount)
+        # φ-space levels
+        c = self._phi(self.strike_price)
+
+        if side == "up":
+            if self.upper_barrier is None or self.spot_price >= self.upper_barrier:
                 return 0.0
-            d = self._phi(self.Hu); b = d + BETA_BGK / math.sqrt(self.m)
-            if self.opt_type == "call":
-                return S_leg*( self._F_plus(d,b,theta1) - self._F_plus(c,b,theta1) ) \
-                     - K_leg*( self._F_plus(d,b,theta0) - self._F_plus(c,b,theta0) )
-            else:
-                # direct UO put
-                return K_leg*self._F_plus(c,b,theta0) - S_leg*self._F_plus(c,b,theta1)
+            d = self._phi(self.upper_barrier)
+            b_shift = d + BETA_BGK / math.sqrt(self.m)
 
-        elif self.barrier_type == "down-and-out":
-            if self.opt_type == "put" and self.Hd is not None and self.K <= self.Hd:
+            if self.option_type == "call" and self.strike_price >= self.upper_barrier:
                 return 0.0
-            d = self._phi(self.Hd); b = d - BETA_BGK / math.sqrt(self.m)
-            if self.opt_type == "put":
-                return K_leg*( self._F_minus(d,b,theta0) - self._F_minus(c,b,theta0) ) \
-                     - S_leg*( self._F_minus(d,b,theta1) - self._F_minus(c,b,theta1) )
+
+            if self.option_type == "call":
+                F = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.carry_years)
+                term1 = F * (self._F_plus(d, b_shift, theta1) - self._F_plus(c, b_shift, theta1))
+                term2 = self.strike_price * (self._F_plus(d, b_shift, theta0) - self._F_plus(c, b_shift, theta0))
+                return discount_factor * (term1 - term2)
             else:
-                # direct DO call
-                return S_leg*self._F_minus(c,b,theta1) - K_leg*self._F_minus(c,b,theta0)
+                F = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.carry_years)
+                term1 = F * self._F_plus(c, b_shift, theta1)
+                term2 = self.strike_price *  self._F_plus(c, b_shift, theta0)
+                return discount_factor * (term2 - term1)
+
+        elif side == "down":
+            if self.lower_barrier is None or self.spot_price <= self.lower_barrier:
+                return 0.0
+
+            d = self._phi(self.lower_barrier)
+
+            b_shift = d - BETA_BGK / math.sqrt(self.m)  # downward shift in φ
+            if self.option_type == "put" and self.strike_price <= self.lower_barrier:
+                return 0.0
+
+            if self.option_type == "put":
+                # vdop (Eq. 3)
+                F = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.carry_years)
+                term1 = self.strike_price * (self._F_minus(d, b_shift, theta0) - self._F_minus(c, b_shift, theta0))
+                term2 = F * (self._F_minus(d, b_shift, theta1) - self._F_minus(c, b_shift, theta1))
+                return discount_factor * (term1 - term2)
+            else:
+                # down-and-out call via parity using the down-and-out put
+                vanilla_call = self._vanilla_bs_price_forced("call")
+                vanilla_put = self._vanilla_bs_price_forced("put")
+                F = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.carry_years)
+                term1 = F * ( self._F_minus(c, b_shift, theta1))
+                term2 = self.strike_price  * ( self._F_minus(c, b_shift, theta0))
+                down_and_out_put = discount_factor * (term2 - term1)
+                return  discount_factor * (term1 - term2) #vanilla_call - (vanilla_put - down_and_out_put)
 
         else:
-            raise ValueError("single-barrier out called with non-single barrier type.")
+            raise ValueError("single-barrier out price called with non-single barrier type.")
 
-    # ---------------- Double-barrier OUT (same series, Black-76 prefactors) ----------------
-    def _G_continuous(self, a1: float, a2: float, b1: float, b2: float, theta: float, series_terms: int=50) -> float:
-        N = self._N
-        total = N(a2 - theta) - N(a1 - theta)
-        L = (b2 - b1)
-        for k in range(1, series_terms+1):
-            shift = 2.0*k*L
-            total += (N(a2 - theta - shift) - N(a1 - theta - shift))
-            total -= (N(a2 - theta + shift) - N(a1 - theta + shift))
-        return total
+    def _vanilla_bs_price_forced(self, which: Literal["call", "put"]) -> float:
+        save = self.option_type
+        self.option_type = which
+        px = self._vanilla_bs_price()
+        self.option_type = save
+        return px
 
-    def _double_barrier_out_price(self, series_terms: int=50) -> float:
-        if self.m <= 0 or (self.Hd is None and self.Hu is None):
-            return self._vanilla_b76_price()
-        if self.Hd is None or self.Hu is None:
+    def _G_continuous(self, a1: float, a2: float, b1: float, b2: float,
+                      theta: float, series_tol: float = 1e-10, max_terms: int = 500) -> float:
+        """
+        Continuous analogue probability (Hörfelt Eq. (8)):
+          G(a1,a2,b1,b2;θ) = N(a2-θ) - N(a1-θ) - G_+(a2;.) + G_+(a1;.) - G_-(a2;.) + G_-(a1;.)
+        with
+          G_+(a;.) = Σ_{i=1..∞} [ e^{2 α1^{(i)} θ} N(a - 2 α1^{(i)} - θ) - e^{2 α2^{(i)} θ} N(a - 2 α2^{(i)} - θ) ]
+          α1^{(i)} = i(b2 - b1) + b1
+          α2^{(i)} = i(b2 - b1)
+        Rapid exponential convergence; truncate after 'series_terms'.
+        """
+        def N(x):
+            return norm.cdf(x)
+        width = (b2 - b1)
+
+        def Gplus(a: float) -> float:
+            s = 0.0
+            for i in range(1, max_terms + 1):
+                alpha1 = i * width + b1
+                alpha2 = i * width
+                inc = math.exp(2.0 * alpha1 * theta) * N(a - 2.0 * alpha1 - theta) \
+                      - math.exp(2.0 * alpha2 * theta) * N(a - 2.0 * alpha2 - theta)
+                s += inc
+                if abs(inc) < series_tol:
+                    break
+            return s
+
+        def Gminus(a: float) -> float:
+            # G-(a,b1,b2;θ) = G+( -a, -b1, -b2; -θ )
+            s = 0.0
+            for i in range(1, max_terms + 1):
+                alpha1 = -i * width - b1
+                alpha2 = -i * width
+                inc = math.exp(2.0 * alpha1 * -theta) * N(-a - 2.0 * alpha1 + theta) \
+                    - math.exp(2.0 * alpha2 * -theta) * N(-a - 2.0 * alpha2 + theta)
+                s += inc
+                if abs(inc) < series_tol:
+                    break
+            return s
+
+        return (N(a2 - theta) - N(a1 - theta)) - Gplus(a2) + Gplus(a1) - Gminus(a2) + Gminus(a1)
+
+    def _double_barrier_out_price(self, series_terms: int = 50) -> float:
+        """
+        Siegmund’s suggestion for discrete double barriers:
+          G^(m)(...) ≈ G(... with b1 -> b1 - β/√m, b2 -> b2 + β/√m)
+        Then use change-of-numeraire lemma to form the price.
+        """
+        if self.m <= 0 or (self.lower_barrier is None and self.upper_barrier is None):
+            return self._vanilla_bs_price()
+
+        # Ensure both barriers exist for double-out
+        if self.lower_barrier is None or self.upper_barrier is None:
             raise ValueError("Double barrier requires both lower_barrier and upper_barrier.")
 
-        d1 = self._phi(self.Hd); d2 = self._phi(self.Hu); c = self._phi(self.K)
-        theta0, theta1 = self._thetas()
+        # φ-space
+        d1 = self._phi(self.lower_barrier)   # lower (<0)
+        d2 = self._phi(self.upper_barrier)   # upper (>0)
+        c  = self._phi(self.strike_price)
+        theta0, theta1 = self._theta0_theta1()
+
+        # Siegmund correction
         shift = BETA_BGK / math.sqrt(self.m)
-        b1 = d1 - shift; b2 = d2 + shift
+        b1_adj = d1 - shift
+        b2_adj = d2 + shift
 
-        DF_a = self.DFa_T; DF_k = self.DFk_T
-        F0   = self._F0_now()
-        S_leg = DF_a * F0
-        K_leg = DF_k * self.K
+        # G^(m) approx via G with adjusted barriers
+        def Gm(a1, a2, th):
+            return self._G_continuous(a1, a2, b1_adj, b2_adj, th, series_terms=series_terms)
 
-        def Gm(a1,a2,th): return self._G_continuous(a1,a2,b1,b2,th,series_terms=series_terms)
-
-        if self.opt_type == "call":
-            if self.K >= self.Hu: return 0.0
-            a1 = max(c, d1); a2 = d2
-            return S_leg*Gm(a1,a2,theta1) - K_leg*Gm(a1,a2,theta0)
+        # Payoff assembly (knock-OUT call/put)
+        if self.option_type == "call":
+            if self.strike_price >= self.upper_barrier:
+                return 0.0
+            a1 = max(c, d1)
+            a2 = d2
+            term_S = self.spot_price * math.exp(-self.div_yield_nacc * self.discount_years) * Gm(a1, a2, theta1)
+            term_K = self.strike_price * math.exp(-self.carry_rate_nacc * self.discount_years) * Gm(a1, a2, theta0)
+            return term_S - term_K
         else:
-            if self.K <= self.Hd: return 0.0
-            a1 = d1; a2 = min(c, d2)
-            return K_leg*Gm(a1,a2,theta0) - S_leg*Gm(a1,a2,theta1)
+            if self.strike_price <= self.lower_barrier:
+                return 0.0
+            a1 = d1
+            a2 = min(c, d2)
+            term_K = self.strike_price * math.exp(-self.carry_rate_nacc * self.discount_years) * Gm(a1, a2, theta0)
+            term_S = self.spot_price * math.exp(-self.div_yield_nacc * self.discount_years) * Gm(a1, a2, theta1)
+            return term_K - term_S
 
-    # ---------------- Scaling ----------------
+    # ---------- utilities ----------
     def _signed_scale(self, px: float) -> float:
-        sgn = 1.0 if self.direction == "long" else -1.0
-        return sgn * self.quantity * self.contract_multiplier * float(px)
+        sign = 1.0 if self.direction == "long" else -1.0
+        return sign * self.quantity * self.contract_multiplier * float(px)
