@@ -1,0 +1,93 @@
+Option Explicit
+
+'==============================
+' Helpers: dates & lookup
+'==============================
+Private Function FirstOfMonth(ByVal d As Date) As Date
+    FirstOfMonth = DateSerial(Year(d), Month(d), 1)
+End Function
+
+Private Function ShiftMonths(ByVal d As Date, ByVal months As Long) As Date
+    ' DateSerial handles month overflow (e.g., Month=13 => next January)
+    ShiftMonths = DateSerial(Year(d), Month(d) + months, 1)
+End Function
+
+Private Function DaysInMonth(ByVal d As Date) As Long
+    ' Day of the 0th day of next month = last day of current month
+    DaysInMonth = Day(DateSerial(Year(d), Month(d) + 1, 0))
+End Function
+
+Private Function LookupCPI(ByVal firstOfMonthDate As Date) As Variant
+    ' Returns CPI (Double) for the exact first-of-month date in the CPI_Index table,
+    ' or a CVErr(xlErrNA) Variant if not found / setup issue.
+    On Error GoTo ErrHandler
+
+    Dim lo As ListObject
+    Dim rngDates As Range, rngVals As Range
+    Dim idx As Variant
+
+    With ThisWorkbook.Worksheets("Historical_CPI_Values")
+        Set lo = .ListObjects("CPI_Index")
+        Set rngDates = lo.ListColumns(1).DataBodyRange
+        Set rngVals = lo.ListColumns(2).DataBodyRange
+    End With
+
+    ' Match on Excel's serial number for the date (ensures exact match on true Date values)
+    idx = Application.Match(CDbl(firstOfMonthDate), rngDates, 0)
+    If IsError(idx) Then
+        LookupCPI = CVErr(xlErrNA)
+    Else
+        LookupCPI = rngVals.Cells(CLng(idx), 1).Value
+    End If
+    Exit Function
+
+ErrHandler:
+    LookupCPI = CVErr(xlErrNA)
+End Function
+
+'==============================
+' Public UDF: BESA 4/3-month rule with daily interpolation
+'==============================
+Public Function PublishedCPI(ByVal d As Date) As Variant
+    ' Mirrors Python:
+    ' j = first-of-month(d) shifted -4 months
+    ' if day=1 => published CPI = CPI[j]
+    ' else linear interpolate between CPI[j] and CPI[j+1 month]
+    '
+    ' Interpolation fraction = (day-1) / D, where D = days in the input month.
+
+    Dim j As Date, j1 As Date
+    Dim cpi_j As Variant, cpi_j1 As Variant
+    Dim D As Long
+    Dim frac As Double
+
+    ' 4-month lag from the first day of the input month
+    j = ShiftMonths(FirstOfMonth(d), -4)
+
+    ' If exactly on first day: use the 4-month lag month CPI
+    If Day(d) = 1 Then
+        cpi_j = LookupCPI(j)
+        PublishedCPI = cpi_j
+        Exit Function
+    End If
+
+    ' Otherwise interpolate to the 3-month lag month (i.e., j + 1 month)
+    j1 = ShiftMonths(j, 1)
+
+    cpi_j = LookupCPI(j)
+    If IsError(cpi_j) Then
+        PublishedCPI = cpi_j
+        Exit Function
+    End If
+
+    cpi_j1 = LookupCPI(j1)
+    If IsError(cpi_j1) Then
+        PublishedCPI = cpi_j1
+        Exit Function
+    End If
+
+    D = DaysInMonth(d)
+    frac = (Day(d) - 1) / D
+
+    PublishedCPI = cpi_j + frac * (CDbl(cpi_j1) - CDbl(cpi_j))
+End Function
