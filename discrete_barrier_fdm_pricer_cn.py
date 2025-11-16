@@ -172,6 +172,34 @@ class DiscreteBarrierFDMPricer:
         snap(self.upper_barrier)
         return nodes
 
+    def _build_log_grid(self) -> List[float]:
+    # choose S_min/S_max symmetrically around S0, but respecting barriers/strike
+        s_ref_low = min(self.S0, self.K,
+                        self.lower_barrier or self.S0,
+                        self.upper_barrier or self.S0)
+        s_ref_high = max(self.S0, self.K,
+                            self.lower_barrier or self.S0,
+                            self.upper_barrier or self.S0)
+
+        S_min = max(1e-6, 0.1 * s_ref_low)        # avoid log(0)
+        S_max = 5.0 * s_ref_high
+
+        x_min = math.log(S_min)
+        x_max = math.log(S_max)
+
+        n = self.N_space
+        dx = (x_max - x_min) / n
+        x_nodes = [x_min + i * dx for i in range(n + 1)]
+
+        # precompute S-grid for convenience
+        self.s_nodes = [math.exp(x) for x in x_nodes]
+
+        # store log-barriers (for comparisons) if needed
+        self.lower_barrier_log = math.log(self.lower_barrier) if self.lower_barrier else None
+        self.upper_barrier_log = math.log(self.upper_barrier) if self.upper_barrier else None
+
+        return x_nodes
+
     # ---------------- payoff / KO projection ----------------
     def _terminal_payoff(self, s_nodes: List[float]) -> List[float]:
         if self.option_type == "call":
@@ -199,6 +227,30 @@ class DiscreteBarrierFDMPricer:
                     out = True
             if out:
                 V[i] = rebate
+                
+    def _apply_KO_projection(self, V: List[float], x_nodes: List[float], tau_left: float) -> None:
+        if self.barrier_type in ("none", "down-and-in", "up-and-in", "double-in"):
+            return
+
+        r = self.r_disc
+        if self.rebate_amount == 0.0:
+            rebate_val = 0.0
+        else:
+            rebate_val = self.rebate_amount if self.rebate_at_hit \
+                else self.rebate_amount * math.exp(-r * tau_left)
+
+        lo = self.lower_barrier
+        up = self.upper_barrier
+
+        for i, x in enumerate(x_nodes):
+            s = self.s_nodes[i]
+            out = False
+            if self.barrier_type in ("down-and-out", "double-out") and lo is not None and s <= lo:
+                out = True
+            if self.barrier_type in ("up-and-out", "double-out") and up is not None and s >= up:
+                out = True
+            if out:
+                V[i] = rebate_val
 
     # ---------------- tridiagonal solver ----------------
     @staticmethod
@@ -374,6 +426,83 @@ class DiscreteBarrierFDMPricer:
                     rhs[i] = aE * V[i - 1] + bE * V[i] + cE * V[i + 1]
 
             V = self._solve_tridiagonal(sub, main, sup, rhs)
+            if abs(t0) < 1e-14 and step == m - 1:
+                last_dt_at_zero = dt
+
+        return V, (last_dt_at_zero if last_dt_at_zero is not None else dt)
+
+    def _cn_subinterval_log(
+        self,
+        x_nodes: List[float],
+        V: List[float],
+        t0: float,
+        t1: float,
+        theta: float,
+        rannacher_left_steps: int,
+        m_steps: int,
+    ) -> Tuple[List[float], float]:
+
+        r = self.r_disc
+        b = self.b_carry
+        sig = self.sigma
+
+        N = len(x_nodes) - 1
+        L = t1 - t0
+        m = max(1, int(m_steps))
+        dt = L / m
+        last_dt_at_zero = None
+
+        dx = x_nodes[1] - x_nodes[0]
+
+        # log-PDE coefficients
+        mu_x = b - 0.5 * sig * sig
+        alpha = 0.5 * sig * sig / (dx * dx)           # diffusion term
+        beta  = mu_x / (2.0 * dx)                     # drift term
+
+        for step in range(m):
+            use_theta = 1.0 if (rannacher_left_steps > 0) else theta
+            if rannacher_left_steps > 0:
+                rannacher_left_steps -= 1
+
+            t_after = t0 + (m - step - 1) * dt
+            tau_left = t_after
+
+            a = [0.0] * (N + 1)
+            b_diag = [0.0] * (N + 1)
+            c = [0.0] * (N + 1)
+            rhs = [0.0] * (N + 1)
+
+            # interior nodes
+            for i in range(1, N):
+                A  = dt * use_theta       * (alpha - beta)
+                B  = 1.0 + dt * use_theta * (r + 2.0 * alpha)
+                C  = dt * use_theta       * (alpha + beta)
+
+                A_ = dt * (1.0 - use_theta) * (alpha - beta)
+                B_ = 1.0 - dt * (1.0 - use_theta) * (r + 2.0 * alpha)
+                C_ = dt * (1.0 - use_theta) * (alpha + beta)
+
+                a[i]      = -A
+                b_diag[i] =  B
+                c[i]      = -C
+                rhs[i]    =  A_ * V[i - 1] + B_ * V[i] + C_ * V[i + 1]
+
+            # boundaries still expressed in S-space
+            S_min = self.s_nodes[0]
+            S_max = self.s_nodes[-1]
+
+            if self.option_type == "call":
+                V_0 = 0.0
+            else:
+                V_0 = self.K * math.exp(-r * tau_left)
+
+            V_M = self._boundary_Smax(S_max, tau_left)
+
+            b_diag[0] = 1.0; c[0] = 0.0; a[0] = 0.0; rhs[0] = V_0
+            b_diag[N] = 1.0; a[N] = 0.0; c[N] = 0.0; rhs[N] = V_M
+
+            V = self._solve_tridiagonal(a, b_diag, c, rhs)
+
             if abs(t0) < 1e-14 and step == m - 1:
                 last_dt_at_zero = dt
 
