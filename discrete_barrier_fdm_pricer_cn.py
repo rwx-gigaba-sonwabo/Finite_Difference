@@ -130,6 +130,135 @@ class DiscreteBarrierFDMPricer:
             times.append(self.T)
         return sorted(set(times))
 
+    def choose_grid_parameters(
+        S0: float,
+        K: float,
+        lower_barrier: Optional[float],
+        upper_barrier: Optional[float],
+        T: float,
+        sigma: float,
+        monitor_times: Optional[List[float]] = None,
+        # tuning knobs
+        L_low: float = 4.0,          # how far down from min(ref) → S_min
+        L_high: float = 4.0,         # how far up from max(ref) → S_max
+        min_space: int = 300,        # minimum N_space for barrier work
+        points_per_sigma: int = 12,  # grid points per 1σ√T in log-space
+        lambda_target: float = 0.4,  # target diffusion number in log-space
+        steps_per_interval: int = 10 # min CN steps per (monitor) time interval
+    ) -> Tuple[int, int, float, float]:
+        """
+        Return (N_space, N_time, S_min, S_max) for a log-space CN scheme,
+        given the main trade parameters and barrier/monitor structure.
+        """
+
+        if T <= 0.0:
+            raise ValueError("Maturity T must be positive.")
+        if sigma <= 0.0:
+            raise ValueError("Volatility sigma must be positive.")
+        if S0 <= 0.0:
+            raise ValueError("Spot S0 must be positive.")
+
+        # ---- 0) Choose S_min, S_max (price domain) ----------------------
+        candidates = [S0, K]
+        if lower_barrier is not None and lower_barrier > 0.0:
+            candidates.append(lower_barrier)
+        if upper_barrier is not None and upper_barrier > 0.0:
+            candidates.append(upper_barrier)
+
+        s_low = min(candidates)
+        s_high = max(candidates)
+
+        # spread domain around the "interesting" region
+        S_min = max(1e-8, s_low / L_low)
+        S_max = s_high * L_high
+
+        if S_min >= S_max:
+            # fall back to something simple but safe
+            S_min = S0 / 5.0
+            S_max = S0 * 5.0
+
+        x_min = math.log(S_min)
+        x_max = math.log(S_max)
+        x_range = x_max - x_min
+
+        # ---- 1) Choose N_space from target Δx per σ√T -------------------
+        dx_target = (sigma * math.sqrt(T)) / float(points_per_sigma)  # 1σ move / N points
+        if dx_target <= 0.0:
+            dx_target = x_range / 300.0  # fallback
+
+        N_space = max(min_space, int(math.ceil(x_range / dx_target)))
+
+        # ---- 2) Choose N_time from λ-condition and monitor structure ----
+        dx = x_range / N_space
+        # λ = 0.5 σ^2 Δt / dx^2  ≤ λ_target → N_time ≥ 0.5 σ^2 T / (λ_target dx^2)
+        Ntime_opt = int(math.ceil(0.5 * sigma * sigma * T / (lambda_target * dx * dx)))
+
+        # at least as many time steps as space steps
+        N_time = max(Ntime_opt, N_space)
+
+        # ensure enough steps between monitoring dates
+        if monitor_times:
+            # count intervals between 0, each monitor, and T
+            valid_monitors = [t for t in monitor_times if 0.0 < t < T]
+            M_intervals = len(valid_monitors) + 1
+        else:
+            M_intervals = 1
+
+        N_time = max(N_time, steps_per_interval * M_intervals)
+
+        return N_space, N_time, S_min, S_max
+    
+    def configure_grid(self) -> None:
+        """
+        Choose N_space, N_time, and price domain [S_min, S_max]
+        in a principled way based on the current trade parameters.
+        Call this once before pricing/greeks.
+        """
+        N_space, N_time, S_min, S_max = self.choose_grid_parameters(
+            S0=self.S0,
+            K=self.K,
+            lower_barrier=self.lower_barrier,
+            upper_barrier=self.upper_barrier,
+            T=self.T,
+            sigma=self.sigma,
+            monitor_times=self.monitor_times,
+            # you can override these knobs per product if you like:
+            L_low=4.0,
+            L_high=4.0,
+            min_space=300,
+            points_per_sigma=12,
+            lambda_target=0.4,
+            steps_per_interval=10,
+        )
+
+        self.N_space = N_space
+        self.N_time = N_time
+        self._S_min = S_min   # store if you want deterministic domain
+        self._S_max = S_max
+
+    def _build_log_grid(self) -> List[float]:
+        """
+        Build a uniform log-S grid on [S_min, S_max].
+        Assumes configure_grid() has been called to set N_space and S_min/S_max.
+        """
+        # If not configured, do it now with defaults
+        if not hasattr(self, "_S_min") or not hasattr(self, "_S_max"):
+            self.configure_grid()
+
+        S_min = self._S_min
+        S_max = self._S_max
+
+        x_min = math.log(S_min)
+        x_max = math.log(S_max)
+
+        n = self.N_space
+        dx = (x_max - x_min) / n
+        x_nodes = [x_min + i * dx for i in range(n + 1)]
+
+        # keep S-nodes for payoff/barrier checks
+        self.s_nodes = [math.exp(x) for x in x_nodes]
+        return x_nodes
+
     def _build_space_grid(self) -> List[float]:
         anchors = [self.S0, self.K]
         if self.lower_barrier is not None:
