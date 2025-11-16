@@ -525,6 +525,39 @@ class DiscreteBarrierFDMPricer:
         w = (S0 - s[lo]) / (s[hi] - s[lo])
         return float((1.0 - w) * V[lo] + w * V[hi])
     
+    def price(self) -> float:
+        x_nodes = self._build_log_grid()
+
+        # Vanilla
+        if self.barrier_type == "none":
+            V, _ = self._run_backward(x_nodes, apply_barrier=False)
+            return self._interp_price(V)
+
+        # Pure KO
+        if self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
+            V, _ = self._run_backward(x_nodes, apply_barrier=True)
+            return self._interp_price(V)
+
+        # KI via parity: V_in = V_van - V_KO
+        ko_type = self._map_KI_to_KO()
+        if ko_type is None:
+            raise ValueError(f"Unknown KI barrier_type {self.barrier_type}")
+
+        original_type = self.barrier_type
+
+        # vanilla
+        self.barrier_type = "none"
+        V_van, _ = self._run_backward(x_nodes, apply_barrier=False)
+
+        # KO with mapped type
+        self.barrier_type = ko_type
+        V_ko, _ = self._run_backward(x_nodes, apply_barrier=True)
+
+        self.barrier_type = original_type
+
+        V_in = [v - vko for v, vko in zip(V_van, V_ko)]
+        return self._interp_price(V_in)
+    
     def greeks(self, vega_bump: float = 0.01) -> Dict[str, float]:
         x_nodes = self._build_log_grid()
 
