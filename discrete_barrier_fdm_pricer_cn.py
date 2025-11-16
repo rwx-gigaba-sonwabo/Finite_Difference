@@ -507,6 +507,87 @@ class DiscreteBarrierFDMPricer:
                 last_dt_at_zero = dt
 
         return V, (last_dt_at_zero if last_dt_at_zero is not None else dt)
+    
+    def _interp_price(self, V: List[float]) -> float:
+        s = self.s_nodes
+        S0 = self.S0
+        if S0 <= s[0]:
+            return float(V[0])
+        if S0 >= s[-1]:
+            return float(V[-1])
+        lo, hi = 0, len(s) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if S0 < s[mid]:
+                hi = mid
+            else:
+                lo = mid
+        w = (S0 - s[lo]) / (s[hi] - s[lo])
+        return float((1.0 - w) * V[lo] + w * V[hi])
+    
+    def greeks(self, vega_bump: float = 0.01) -> Dict[str, float]:
+        x_nodes = self._build_log_grid()
+
+        # Get grid for current barrier_type
+        if self.barrier_type == "none":
+            V, _ = self._run_backward(x_nodes, apply_barrier=False)
+        elif self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
+            V, _ = self._run_backward(x_nodes, apply_barrier=True)
+        else:
+            ko_type = self._map_KI_to_KO()
+            original_type = self.barrier_type
+
+            self.barrier_type = "none"
+            V_van, _ = self._run_backward(x_nodes, apply_barrier=False)
+
+            self.barrier_type = ko_type
+            V_ko, _ = self._run_backward(x_nodes, apply_barrier=True)
+
+            self.barrier_type = original_type
+            V = [vv - vk for vv, vk in zip(V_van, V_ko)]
+
+        P = self._interp_price(V)
+
+        # central-diff delta/gamma on S-grid
+        s = self.s_nodes
+        i = min(range(len(s)), key=lambda k: abs(s[k] - self.S0))
+        i = max(1, min(len(s) - 2, i))
+
+        h1 = s[i] - s[i - 1]
+        h2 = s[i + 1] - s[i]
+
+        delta = (
+            -(h2 / (h1 * (h1 + h2))) * V[i - 1]
+            + ((h2 - h1) / (h1 * h2)) * V[i]
+            + (h1 / (h2 * (h1 + h2))) * V[i + 1]
+        )
+
+        gamma = 2.0 * (
+            V[i - 1] / (h1 * (h1 + h2))
+            - V[i] / (h1 * h2)
+            + V[i + 1] / (h2 * (h1 + h2))
+        )
+
+        # vega via bump-and-revalue
+        sig0 = self.sigma
+        self.sigma = sig0 + vega_bump
+        P_up = self.price()
+        self.sigma = sig0 - vega_bump
+        P_dn = self.price()
+        self.sigma = sig0
+        vega = (P_up - P_dn) / (2.0 * vega_bump)
+
+        # theta from PDE operator in S-space
+        r = self.r_disc
+        b = self.b_carry
+        theta = -(b * self.S0 * delta + 0.5 * self.sigma * self.sigma * self.S0 * self.S0 * gamma - r * P)
+
+        return {
+            "delta": float(delta),
+            "gamma": float(gamma),
+            "vega": float(vega),
+            "theta": float(theta),
+        }
 
     # ---------------- time partition (with diffusion guard) ----------------
     def _time_subgrid_counts(self) -> List[int]:
