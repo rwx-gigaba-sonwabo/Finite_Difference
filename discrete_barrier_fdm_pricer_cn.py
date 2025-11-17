@@ -535,3 +535,103 @@ class DiscreteBarrierCrankNicolsonLog:
             return {k: g_van[k] - g_ko[k] for k in g_van}
 
         raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
+
+    def _vanilla_black76_greeks_fd(self,
+                                   dS: float = 1e-4,
+                                   dSigma: float = 1e-3,
+                                   dT: float = 1e-4) -> Dict[str, float]:
+        """
+        Greeks (price, delta, gamma, theta, vega) for the vanilla option
+        computed by finite differences on the Black-76 price.
+
+        - dS is an absolute spot bump.
+        - dSigma is an absolute vol bump (e.g. 0.001 = 0.1 vol point).
+        - dT is an absolute time bump in YEARS.
+        """
+
+        S0 = self.S0
+        sigma0 = self.sigma
+        T0 = self.T
+
+        # Base price
+        p0 = self._vanilla_black76_price(S=S0, sigma=sigma0, T=T0)
+
+        # ---- Delta & Gamma (bump spot) ----
+        p_up_S = self._vanilla_black76_price(S=S0 + dS, sigma=sigma0, T=T0)
+        p_dn_S = self._vanilla_black76_price(S=S0 - dS, sigma=sigma0, T=T0)
+
+        delta = (p_up_S - p_dn_S) / (2.0 * dS)
+        gamma = (p_up_S - 2.0 * p0 + p_dn_S) / (dS * dS)
+
+        # ---- Vega (bump vol) ----
+        p_up_v = self._vanilla_black76_price(S=S0, sigma=sigma0 + dSigma, T=T0)
+        p_dn_v = self._vanilla_black76_price(S=S0, sigma=sigma0 - dSigma, T=T0)
+
+        vega = (p_up_v - p_dn_v) / (2.0 * dSigma)
+
+        # ---- Theta (bump time) ----
+        # By convention, theta is dV/dt (calendar), so we want how price
+        # changes as T decreases. Using central difference around T0:
+        if T0 > 2.0 * dT:
+            p_up_T = self._vanilla_black76_price(S=S0, sigma=sigma0, T=T0 + dT)
+            p_dn_T = self._vanilla_black76_price(S=S0, sigma=sigma0, T=T0 - dT)
+            # dV/dT with T as "time-to-expiry"; theta = -dV/dT
+            dV_dT = (p_up_T - p_dn_T) / (2.0 * dT)
+            theta = -dV_dT
+        else:
+            # One-sided near expiry
+            p_dn_T = self._vanilla_black76_price(S=S0, sigma=sigma0, T=max(T0 - dT, 1e-8))
+            dV_dT = (p0 - p_dn_T) / dT
+            theta = -dV_dT
+
+        return {
+            "price": p0,
+            "delta": delta,
+            "gamma": gamma,
+            "theta": theta,
+            "vega": vega,
+        }
+        
+    def greeks(self, dv_sigma: float = 1e-3) -> Dict[str, float]:
+        """
+        Greeks consistent with:
+        - vanilla (no barrier): Black-76 price with FD Greeks,
+        - KO: CN PDE engine,
+        - KI: parity (Greek_KI = Greek_vanilla - Greek_KO).
+        """
+        bt = self.barrier_type.lower()
+
+        # 1) Vanilla: Black-76 + FD Greeks
+        if bt == "none":
+            return self._vanilla_black76_greeks_fd(
+                dS=max(1e-4, 1e-4 * self.S0),
+                dSigma=dv_sigma,
+                dT=min(1e-4, 0.5 * self.T),
+            )
+
+        # 2) Knock-out: PDE CN engine (same as before)
+        if bt in ("down-and-out", "up-and-out"):
+            return self._pde_price_and_greeks(apply_KO=True, dv_sigma=dv_sigma)
+
+        # 3) Knock-in: parity Greek_KI = Greek_vanilla - Greek_KO
+        if bt in ("down-and-in", "up-and-in"):
+            original_bt = bt
+
+            # Vanilla Greeks (Black-76 FD)
+            self.barrier_type = "none"
+            g_van = self._vanilla_black76_greeks_fd(
+                dS=max(1e-4, 1e-4 * self.S0),
+                dSigma=dv_sigma,
+                dT=min(1e-4, 0.5 * self.T),
+            )
+
+            # Matching KO Greeks (PDE)
+            self.barrier_type = "down-and-out" if bt == "down-and-in" else "up-and-out"
+            g_ko = self._pde_price_and_greeks(apply_KO=True, dv_sigma=dv_sigma)
+
+            # Restore original barrier type
+            self.barrier_type = original_bt
+
+            return {k: g_van[k] - g_ko[k] for k in g_van}
+
+        raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
