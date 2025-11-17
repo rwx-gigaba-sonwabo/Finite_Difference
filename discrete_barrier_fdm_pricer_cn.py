@@ -1,649 +1,320 @@
-# discrete_barrier_fdm_pricer_cn.py
-# -*- coding: utf-8 -*-
-"""
-CN finite-difference pricer for European discrete-barrier options in S-space.
-
-Key features
-------------
-- Price-space Black–Scholes PDE:
-    V_t + 0.5 σ² S² V_SS + (r-q) S V_S - r V = 0
-- Crank–Nicolson with Rannacher start (θ=1 for first steps), and **Rannacher restarts**
-  after each discrete KO projection.
-- **Discrete monitoring**: KO projection at monitor times only. KI via parity.
-- **Barrier-aware PDE row** at the interior node adjacent to the KO barrier:
-  Uses a non-symmetric second/first derivative with distances
-  h_- = |S_i - B| and h_+ = S_{i+1} - S_i (mirror for up-and-out).
-  The barrier “ghost” value is taken from the previous time level, so
-  the tri-diagonal remains intact (ghost term goes to RHS).
-- Greeks (Δ, Γ) at t=0 use the same barrier-aware stencil near KO barriers.
-- Time–space coupling guard: increases sub-steps in any monitor interval whose
-  local diffusion number exceeds a target (keeps accuracy stable).
-"""
-
-from typing import List, Tuple, Dict, Optional, Literal
-from datetime import date
 import math
+from dataclasses import dataclass, field
+from typing import List, Optional, Dict
 
-OptionType = Literal["call", "put"]
-BarrierType = Literal[
-    "none",
-    "down-and-out", "up-and-out", "double-out",
-    "down-and-in",  "up-and-in",  "double-in",
-]
+# -------------------------------------------------------------------
+# Normal PDF / CDF helpers
+# -------------------------------------------------------------------
+
+SQRT_2PI = math.sqrt(2.0 * math.pi)
 
 
-class DiscreteBarrierFDMPricer:
-    # --------------------------- init ---------------------------
-    def __init__(
-        self,
-        # instrument
-        spot: float,
-        strike: float,
-        valuation_date: date,
-        maturity_date: date,
-        volatility: float,
-        flat_rate_nacc: float,
-        dividend_yield: float,
-        option_type: OptionType,
-        # barriers
-        barrier_type: BarrierType = "none",
-        lower_barrier: Optional[float] = None,
-        upper_barrier: Optional[float] = None,
-        monitoring_dates: Optional[List[date]] = None,
-        rebate_amount: float = 0.0,
-        rebate_at_hit: bool = True,
-        # status flags
-        already_hit: bool = False,
-        already_in: bool = False,
-        # numerics
-        num_space_nodes: int = 600,
-        num_time_steps: int = 800,
-        rannacher_steps: int = 2,
-        min_substeps_between_monitors: int = 1,
-        grid_type: Literal["uniform", "sinh"] = "uniform",
-        sinh_alpha: float = 1.75,
-        # time-space coupling guard
-        lambda_diff_target: float = 0.5,
-        # misc
-        day_count: str = "ACT/365",
-        # greeks near barrier
-        use_one_sided_greeks_near_barrier: bool = True,
-        barrier_safety_cells: int = 2,
-        compute_numerical_theta: bool = False,
-    ):
-        self.S0 = float(spot)
-        self.K = float(strike)
-        self.valuation_date = valuation_date
-        self.maturity_date = maturity_date
-        self.sigma = float(volatility)
-        self.r = float(flat_rate_nacc)
-        self.q = float(dividend_yield)
-        self.option_type = option_type
+def norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / SQRT_2PI
 
-        self.barrier_type = barrier_type
-        self.lower_barrier = lower_barrier
-        self.upper_barrier = upper_barrier
-        self.monitoring_dates = sorted(monitoring_dates or [])
-        self.rebate_amount = float(rebate_amount)
-        self.rebate_at_hit = bool(rebate_at_hit)
 
-        self.already_hit = bool(already_hit)
-        self.already_in = bool(already_in)
+def norm_cdf(x: float) -> float:
+    # Good enough for risk-engine use
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-        self.N = max(200, int(num_space_nodes))
-        self.M = max(1, int(num_time_steps))
-        self.rannacher = int(rannacher_steps)
-        self.min_substeps = max(1, int(min_substeps_between_monitors))
-        self.grid_type = grid_type
-        self.sinh_alpha = float(sinh_alpha)
 
-        self.lambda_diff_target = float(lambda_diff_target)
-        self.day_count = day_count.upper()
+# -------------------------------------------------------------------
+# Discrete barrier Crank–Nicolson engine in log-spot
+# -------------------------------------------------------------------
 
-        self.use_one_sided = bool(use_one_sided_greeks_near_barrier)
-        self.barrier_safety_cells = int(barrier_safety_cells)
-        self.compute_numerical_theta = bool(compute_numerical_theta)
+@dataclass
+class DiscreteBarrierCrankNicolsonLog:
+    # Core inputs
+    S0: float                   # spot
+    K: float                    # strike
+    T: float                    # time to maturity (years)
+    sigma: float                # volatility
+    r_disc: float               # discount rate r
+    b_carry: float              # carry (e.g. r - q_eff)
+    option_type: str            # "call" or "put"
+    barrier_type: str           # "none", "down-and-out", "up-and-out",
+                                # "down-and-in", "up-and-in"
 
-        self.T = self._year_fraction(self.valuation_date, self.maturity_date)
-        self.S_nodes = self._build_space_grid()
-        self.monitor_times = self._build_monitor_times_exact()
+    # Barrier & rebate
+    lower_barrier: Optional[float] = None
+    upper_barrier: Optional[float] = None
+    rebate: float = 0.0         # paid at hit / expiry (depending on KO logic)
 
-    # --------------------------- utilities ---------------------------
-    def _year_fraction(self, d0: date, d1: date) -> float:
-        days = max(0, (d1 - d0).days)
-        if self.day_count in ("ACT/360",):
-            return days / 360.0
-        if self.day_count in ("30/360", "30E/360"):
-            y0, m0, d0_ = d0.year, d0.month, min(d0.day, 30)
-            y1, m1, d1_ = d1.year, d1.month, min(d1.day, 30)
-            return ((y1 - y0) * 360 + (m1 - m0) * 30 + (d1_ - d0_)) / 360.0
-        return days / 365.0
+    # Monitoring times in **calendar** years from valuation (discrete barrier)
+    monitor_times: Optional[List[float]] = None
 
-    def _build_monitor_times_exact(self) -> List[float]:
-        times = [0.0]
-        for d in self.monitoring_dates:
-            if self.valuation_date <= d <= self.maturity_date:
-                t = self._year_fraction(self.valuation_date, d)
-                if 0.0 <= t <= self.T:
-                    times.append(t)
-        if times[-1] < self.T - 1e-14:
-            times.append(self.T)
-        return sorted(set(times))
+    # Grid controls (can be left as None to auto-configure)
+    N_space: Optional[int] = None
+    N_time: Optional[int] = None
 
-    def choose_grid_parameters(
-        S0: float,
-        K: float,
-        lower_barrier: Optional[float],
-        upper_barrier: Optional[float],
-        T: float,
-        sigma: float,
-        monitor_times: Optional[List[float]] = None,
-        # tuning knobs
-        L_low: float = 4.0,          # how far down from min(ref) → S_min
-        L_high: float = 4.0,         # how far up from max(ref) → S_max
-        min_space: int = 300,        # minimum N_space for barrier work
-        points_per_sigma: int = 12,  # grid points per 1σ√T in log-space
-        lambda_target: float = 0.4,  # target diffusion number in log-space
-        steps_per_interval: int = 10 # min CN steps per (monitor) time interval
-    ) -> Tuple[int, int, float, float]:
-        """
-        Return (N_space, N_time, S_min, S_max) for a log-space CN scheme,
-        given the main trade parameters and barrier/monitor structure.
-        """
+    # Internal state (filled by configure_grid / _build_log_grid)
+    _S_min: float = field(init=False, default=0.0)
+    _S_max: float = field(init=False, default=0.0)
+    s_nodes: List[float] = field(init=False, default_factory=list)
 
-        if T <= 0.0:
-            raise ValueError("Maturity T must be positive.")
-        if sigma <= 0.0:
-            raise ValueError("Volatility sigma must be positive.")
-        if S0 <= 0.0:
-            raise ValueError("Spot S0 must be positive.")
+    # ------------------------------------------------------------------
+    # Grid configuration
+    # ------------------------------------------------------------------
 
-        # ---- 0) Choose S_min, S_max (price domain) ----------------------
-        candidates = [S0, K]
-        if lower_barrier is not None and lower_barrier > 0.0:
-            candidates.append(lower_barrier)
-        if upper_barrier is not None and upper_barrier > 0.0:
-            candidates.append(upper_barrier)
+    def configure_grid(self) -> None:
+        """Choose sensible space / time steps given T, sigma, monitoring."""
+        if self.T <= 0.0:
+            raise ValueError("T must be positive")
+        if self.sigma <= 0.0:
+            raise ValueError("sigma must be positive")
+        if self.S0 <= 0.0:
+            raise ValueError("S0 must be positive")
+
+        # --- Space domain: cover spot, strike, barriers, with extra margin ---
+        candidates = [self.S0, self.K]
+        if self.lower_barrier is not None and self.lower_barrier > 0:
+            candidates.append(self.lower_barrier)
+        if self.upper_barrier is not None and self.upper_barrier > 0:
+            candidates.append(self.upper_barrier)
 
         s_low = min(candidates)
         s_high = max(candidates)
 
-        # spread domain around the "interesting" region
+        # A few sigmas out in price space (log grid will handle tails)
+        L_low = 4.0
+        L_high = 4.0
         S_min = max(1e-8, s_low / L_low)
         S_max = s_high * L_high
-
         if S_min >= S_max:
-            # fall back to something simple but safe
-            S_min = S0 / 5.0
-            S_max = S0 * 5.0
+            S_min = self.S0 / 5.0
+            S_max = self.S0 * 5.0
 
-        x_min = math.log(S_min)
-        x_max = math.log(S_max)
+        self._S_min, self._S_max = S_min, S_max
+
+        # --- Space step (log grid) ---
+        x_min, x_max = math.log(S_min), math.log(S_max)
         x_range = x_max - x_min
-
-        # ---- 1) Choose N_space from target Δx per σ√T -------------------
-        dx_target = (sigma * math.sqrt(T)) / float(points_per_sigma)  # 1σ move / N points
+        points_per_sigma = 12
+        dx_target = self.sigma * math.sqrt(self.T) / points_per_sigma
         if dx_target <= 0.0:
-            dx_target = x_range / 300.0  # fallback
+            dx_target = x_range / 300.0
 
-        N_space = max(min_space, int(math.ceil(x_range / dx_target)))
+        if self.N_space is None:
+            N_space = int(math.ceil(x_range / dx_target))
+            self.N_space = max(N_space, 300)  # never too coarse
 
-        # ---- 2) Choose N_time from λ-condition and monitor structure ----
-        dx = x_range / N_space
-        # λ = 0.5 σ^2 Δt / dx^2  ≤ λ_target → N_time ≥ 0.5 σ^2 T / (λ_target dx^2)
-        Ntime_opt = int(math.ceil(0.5 * sigma * sigma * T / (lambda_target * dx * dx)))
+        # --- Time step: λ = 0.5 σ² Δt / (Δx)² ~ 0.4, and enough steps per monitor ---
+        if self.N_time is None:
+            dx = x_range / self.N_space
+            lambda_target = 0.4
+            Ntime_opt = int(
+                math.ceil(
+                    0.5 * self.sigma * self.sigma * self.T
+                    / (lambda_target * dx * dx)
+                )
+            )
 
-        # at least as many time steps as space steps
-        N_time = max(Ntime_opt, N_space)
+            valid_mon = [
+                t for t in (self.monitor_times or [])
+                if 0.0 < t < self.T
+            ]
+            M_intervals = len(valid_mon) + 1
+            # At least as many time steps as space, and ~10 per interval
+            self.N_time = max(Ntime_opt, self.N_space, 10 * M_intervals)
 
-        # ensure enough steps between monitoring dates
-        if monitor_times:
-            # count intervals between 0, each monitor, and T
-            valid_monitors = [t for t in monitor_times if 0.0 < t < T]
-            M_intervals = len(valid_monitors) + 1
-        else:
-            M_intervals = 1
+    # ------------------------------------------------------------------
+    # Build log-spot grid
+    # ------------------------------------------------------------------
 
-        N_time = max(N_time, steps_per_interval * M_intervals)
-
-        return N_space, N_time, S_min, S_max
-    
-    def configure_grid(self) -> None:
-        """
-        Choose N_space, N_time, and price domain [S_min, S_max]
-        in a principled way based on the current trade parameters.
-        Call this once before pricing/greeks.
-        """
-        N_space, N_time, S_min, S_max = self.choose_grid_parameters(
-            S0=self.S0,
-            K=self.K,
-            lower_barrier=self.lower_barrier,
-            upper_barrier=self.upper_barrier,
-            T=self.T,
-            sigma=self.sigma,
-            monitor_times=self.monitor_times,
-            # you can override these knobs per product if you like:
-            L_low=4.0,
-            L_high=4.0,
-            min_space=300,
-            points_per_sigma=12,
-            lambda_target=0.4,
-            steps_per_interval=10,
-        )
-
-        self.N_space = N_space
-        self.N_time = N_time
-        self._S_min = S_min   # store if you want deterministic domain
-        self._S_max = S_max
-
-    def _build_log_grid(self) -> List[float]:
-        """
-        Build a uniform log-S grid on [S_min, S_max].
-        Assumes configure_grid() has been called to set N_space and S_min/S_max.
-        """
-        # If not configured, do it now with defaults
-        if not hasattr(self, "_S_min") or not hasattr(self, "_S_max"):
+    def _build_log_grid(self) -> float:
+        """Construct uniform grid in log S; return dx."""
+        if self._S_min <= 0.0 or self._S_max <= 0.0 or self.N_space is None:
             self.configure_grid()
 
-        S_min = self._S_min
-        S_max = self._S_max
+        x_min, x_max = math.log(self._S_min), math.log(self._S_max)
+        N = self.N_space
+        dx = (x_max - x_min) / N
 
-        x_min = math.log(S_min)
-        x_max = math.log(S_max)
-
-        n = self.N_space
-        dx = (x_max - x_min) / n
-        x_nodes = [x_min + i * dx for i in range(n + 1)]
-
-        # keep S-nodes for payoff/barrier checks
-        self.s_nodes = [math.exp(x) for x in x_nodes]
-        return x_nodes
-
-    def _build_space_grid(self) -> List[float]:
-        anchors = [self.S0, self.K]
-        if self.lower_barrier is not None:
-            anchors.append(self.lower_barrier)
-        if self.upper_barrier is not None:
-            anchors.append(self.upper_barrier)
-        Sref = max(anchors)
-        Smax = 4.5 * Sref * math.exp(self.sigma * math.sqrt(max(self.T, 1e-12)))
-        N = self.N
-
-        if self.grid_type == "uniform":
-            dS = Smax / N
-            nodes = [i * dS for i in range(N + 1)]
-        else:
-            # sinh clustering around KO barrier (if any) or around Sref
-            if self.barrier_type in ("down-and-out", "double-out") and self.lower_barrier:
-                Sc = self.lower_barrier
-            elif self.barrier_type in ("up-and-out", "double-out") and self.upper_barrier:
-                Sc = self.upper_barrier
-            else:
-                Sc = Sref
-            a = self.sinh_alpha
-            xs = [-1.0 + 2.0 * i / N for i in range(N + 1)]
-            span = Smax - Sc
-            scale = span / max(1e-12, math.sinh(a))
-            nodes = [Sc + scale * math.sinh(a * x) for x in xs]
-            shift = -min(0.0, min(nodes))
-            if shift > 0:
-                nodes = [s + shift for s in nodes]
-
-        # Snap strike / barriers to nodes
-        def snap(x: Optional[float]):
-            if x is None:
-                return
-            j = min(range(len(nodes)), key=lambda i: abs(nodes[i] - x))
-            nodes[j] = float(x)
-
-        snap(self.K)
-        snap(self.lower_barrier)
-        snap(self.upper_barrier)
-        return nodes
-
-    def _build_log_grid(self) -> List[float]:
-    # choose S_min/S_max symmetrically around S0, but respecting barriers/strike
-        s_ref_low = min(self.S0, self.K,
-                        self.lower_barrier or self.S0,
-                        self.upper_barrier or self.S0)
-        s_ref_high = max(self.S0, self.K,
-                            self.lower_barrier or self.S0,
-                            self.upper_barrier or self.S0)
-
-        S_min = max(1e-6, 0.1 * s_ref_low)        # avoid log(0)
-        S_max = 5.0 * s_ref_high
-
-        x_min = math.log(S_min)
-        x_max = math.log(S_max)
-
-        n = self.N_space
-        dx = (x_max - x_min) / n
-        x_nodes = [x_min + i * dx for i in range(n + 1)]
-
-        # precompute S-grid for convenience
+        x_nodes = [x_min + i * dx for i in range(N + 1)]
         self.s_nodes = [math.exp(x) for x in x_nodes]
 
-        # store log-barriers (for comparisons) if needed
-        self.lower_barrier_log = math.log(self.lower_barrier) if self.lower_barrier else None
-        self.upper_barrier_log = math.log(self.upper_barrier) if self.upper_barrier else None
+        return dx
 
-        return x_nodes
+    # ------------------------------------------------------------------
+    # Payoff and boundaries
+    # ------------------------------------------------------------------
 
-    # ---------------- payoff / KO projection ----------------
-    def _terminal_payoff(self, s_nodes: List[float]) -> List[float]:
-        if self.option_type == "call":
-            return [max(s - self.K, 0.0) for s in s_nodes]
-        return [max(self.K - s, 0.0) for s in s_nodes]
-
-    def _apply_KO_projection(self, V: List[float], s_nodes: List[float], tau_left: float) -> None:
-        # KO only; KI / vanilla do nothing here
-        if self.barrier_type in ("none", "down-and-in", "up-and-in", "double-in"):
-            return
-        lo, up = self.lower_barrier, self.upper_barrier
-        rebate = (
-            self.rebate_amount
-            if self.rebate_at_hit
-            else self.rebate_amount * math.exp(-self.r * tau_left)
-        )
-        for i, s in enumerate(s_nodes):
-            out = False
-            if self.barrier_type == "down-and-out" and lo is not None and s <= lo:
-                out = True
-            elif self.barrier_type == "up-and-out" and up is not None and s >= up:
-                out = True
-            elif self.barrier_type == "double-out":
-                if (lo is not None and s <= lo) or (up is not None and s >= up):
-                    out = True
-            if out:
-                V[i] = rebate
-                
-    def _apply_KO_projection(self, V: List[float], x_nodes: List[float], tau_left: float) -> None:
-        if self.barrier_type in ("none", "down-and-in", "up-and-in", "double-in"):
-            return
-
-        r = self.r_disc
-        if self.rebate_amount == 0.0:
-            rebate_val = 0.0
-        else:
-            rebate_val = self.rebate_amount if self.rebate_at_hit \
-                else self.rebate_amount * math.exp(-r * tau_left)
-
-        lo = self.lower_barrier
-        up = self.upper_barrier
-
-        for i, x in enumerate(x_nodes):
-            s = self.s_nodes[i]
-            out = False
-            if self.barrier_type in ("down-and-out", "double-out") and lo is not None and s <= lo:
-                out = True
-            if self.barrier_type in ("up-and-out", "double-out") and up is not None and s >= up:
-                out = True
-            if out:
-                V[i] = rebate_val
-
-    # ---------------- tridiagonal solver ----------------
-    @staticmethod
-    def _solve_tridiagonal(a: List[float], b: List[float], c: List[float], d: List[float]) -> List[float]:
-        n = len(d)
-        cp = [0.0] * n
-        dp = [0.0] * n
-        x = [0.0] * n
-
-        beta = b[0]
-        if abs(beta) < 1e-14:
-            beta = 1e-14
-        cp[0] = c[0] / beta
-        dp[0] = d[0] / beta
-
-        for i in range(1, n):
-            beta = b[i] - a[i] * cp[i - 1]
-            if abs(beta) < 1e-14:
-                beta = 1e-14
-            cp[i] = c[i] / beta if i < n - 1 else 0.0
-            dp[i] = (d[i] - a[i] * dp[i - 1]) / beta
-
-        x[-1] = dp[-1]
-        for i in range(n - 2, -1, -1):
-            x[i] = dp[i] - cp[i] * x[i + 1]
-        return x
-
-    # ---------------- CN over a sub-interval [t0, t1] ----------------
-    def _cn_subinterval(
-        self,
-        s_nodes: List[float],
-        V: List[float],
-        t0: float,
-        t1: float,
-        theta: float,
-        rannacher_left_steps: int,
-        m_steps: int,
-    ) -> Tuple[List[float], float]:
-        r, q, sig = self.r, self.q, self.sigma
-        N = len(s_nodes) - 1
-        L = t1 - t0
-        m = max(1, int(m_steps))
-        dt = L / m
-        last_dt_at_zero = None
-
-        mu = r - q
-
-        for step in range(m):
-            use_theta = 1.0 if (rannacher_left_steps > 0) else theta
-            if rannacher_left_steps > 0:
-                rannacher_left_steps -= 1
-
-            tau_left = t0 + (m - step - 1) * dt  # time-to-maturity after this step
-
-            sub = [0.0] * (N + 1)
-            main = [0.0] * (N + 1)
-            sup = [0.0] * (N + 1)
-            rhs = [0.0] * (N + 1)
-
-            # boundaries at after-step time
-            if self.option_type == "call":
-                rhs[0] = 0.0
-                rhs[N] = s_nodes[-1] * math.exp(-q * tau_left) - self.K * math.exp(-r * tau_left)
+    def _terminal_payoff(self) -> List[float]:
+        """Payoff at maturity for vanilla call/put."""
+        is_call = self.option_type.lower() == "call"
+        payoff = []
+        for S in self.s_nodes:
+            if is_call:
+                payoff.append(max(S - self.K, 0.0))
             else:
-                rhs[0] = self.K * math.exp(-r * tau_left)
-                rhs[N] = 0.0
-            main[0] = 1.0
-            main[N] = 1.0
+                payoff.append(max(self.K - S, 0.0))
+        return payoff
 
-            # Find node adjacent to KO barrier (for barrier-aware row)
-            ko_type = self.barrier_type
-            have_ko = ko_type in ("down-and-out", "up-and-out", "double-out")
-            i_adj = None
-            B = None
-            side = None
-            if have_ko:
-                if ko_type in ("down-and-out", "double-out") and self.lower_barrier is not None:
-                    B = self.lower_barrier
-                    side = "down"
-                    j = min(range(N + 1), key=lambda k: abs(s_nodes[k] - B))
-                    j = max(1, min(N - 1, j))
-                    if s_nodes[j] <= B and j < N:
-                        j += 1
-                    i_adj = j
-                elif ko_type in ("up-and-out", "double-out") and self.upper_barrier is not None:
-                    B = self.upper_barrier
-                    side = "up"
-                    j = min(range(N + 1), key=lambda k: abs(s_nodes[k] - B))
-                    j = max(1, min(N - 1, j))
-                    if s_nodes[j] >= B and j > 0:
-                        j -= 1
-                    i_adj = j
-
-            def barrier_value_prev() -> Optional[float]:
-                if i_adj is None or B is None:
-                    return None
-                if side == "down":
-                    j = i_adj
-                    S1, S2 = s_nodes[j], s_nodes[j + 1]
-                    if S2 == S1:
-                        return V[j]
-                    t = (B - S1) / (S2 - S1)
-                    V1, V2 = V[j], V[j + 1]
-                else:
-                    j = i_adj
-                    S1, S2 = s_nodes[j - 1], s_nodes[j]
-                    if S2 == S1:
-                        return V[j]
-                    t = (B - S1) / (S2 - S1)
-                    V1, V2 = V[j - 1], V[j]
-                return (1.0 - t) * V1 + t * V2
-
-            VB_prev = barrier_value_prev()
-
-            # interior rows
-            for i in range(1, N):
-                Si = s_nodes[i]
-                if i_adj is not None and i == i_adj and VB_prev is not None:
-                    # barrier-aware row at node next to KO barrier
-                    if side == "down":
-                        h_minus = max(1e-14, Si - B)
-                        h_plus = max(1e-14, s_nodes[i + 1] - Si)
-                        a1 = -h_plus / (h_minus * (h_minus + h_plus))
-                        a2 = (h_plus - h_minus) / (h_minus * h_plus)
-                        a3 = h_minus / (h_plus * (h_minus + h_plus))
-                        d1 = 2.0 / (h_minus * (h_minus + h_plus))
-                        d2 = -2.0 / (h_minus * h_plus)
-                        d3 = 2.0 / (h_plus * (h_minus + h_plus))
-                        A = 0.5 * sig * sig * Si * Si
-                        c_impl = use_theta * dt * (A * d3 + mu * Si * a3)
-                        b_impl = 1.0 + use_theta * dt * (A * d2 + mu * Si * a2 + r)
-                        c_expl = (1.0 - use_theta) * dt * (A * d3 + mu * Si * a3)
-                        b_expl = 1.0 - (1.0 - use_theta) * dt * (A * d2 + mu * Si * a2 + r)
-                        ghost_term = dt * (A * d1 + mu * Si * a1) * VB_prev
-                        sub[i] = 0.0
-                        main[i] = b_impl
-                        sup[i] = -c_impl
-                        rhs[i] = b_expl * V[i] + c_expl * V[i + 1] + ghost_term
-                    else:
-                        # side == "up"
-                        h_plus = max(1e-14, B - Si)
-                        h_minus = max(1e-14, Si - s_nodes[i - 1])
-                        a1 = -h_plus / (h_minus * (h_minus + h_plus))
-                        a2 = (h_plus - h_minus) / (h_minus * h_plus)
-                        a3 = h_minus / (h_plus * (h_minus + h_plus))
-                        d1 = 2.0 / (h_minus * (h_minus + h_plus))
-                        d2 = -2.0 / (h_minus * h_plus)
-                        d3 = 2.0 / (h_plus * (h_minus + h_plus))
-                        A = 0.5 * sig * sig * Si * Si
-                        a_impl = use_theta * dt * (A * d1 + mu * Si * a1)
-                        b_impl = 1.0 + use_theta * dt * (A * d2 + mu * Si * a2 + r)
-                        a_expl = (1.0 - use_theta) * dt * (A * d1 + mu * Si * a1)
-                        b_expl = 1.0 - (1.0 - use_theta) * dt * (A * d2 + mu * Si * a2 + r)
-                        ghost_term = dt * (A * d3 + mu * Si * a3) * VB_prev
-                        sub[i] = -a_impl
-                        main[i] = b_impl
-                        sup[i] = 0.0
-                        rhs[i] = a_expl * V[i - 1] + b_expl * V[i] + ghost_term
-                else:
-                    # standard non-uniform CN row
-                    h1 = s_nodes[i] - s_nodes[i - 1]
-                    h2 = s_nodes[i + 1] - s_nodes[i]
-                    A = 0.5 * sig * sig * Si * Si
-                    aI = use_theta * dt * (A * (2.0 / (h1 * (h1 + h2))) - mu * Si * (1.0 / (2.0 * h1)))
-                    bI = 1.0 + use_theta * dt * (A * (2.0 / (h1 * h2)) + r)
-                    cI = use_theta * dt * (A * (2.0 / (h2 * (h1 + h2))) + mu * Si * (1.0 / (2.0 * h2)))
-                    aE = (1.0 - use_theta) * dt * (A * (2.0 / (h1 * (h1 + h2))) - mu * Si * (1.0 / (2.0 * h1)))
-                    bE = 1.0 - (1.0 - use_theta) * dt * (A * (2.0 / (h1 * h2)) + r)
-                    cE = (1.0 - use_theta) * dt * (A * (2.0 / (h2 * (h1 + h2))) + mu * Si * (1.0 / (2.0 * h2)))
-                    sub[i] = -aI
-                    main[i] = bI
-                    sup[i] = -cI
-                    rhs[i] = aE * V[i - 1] + bE * V[i] + cE * V[i + 1]
-
-            V = self._solve_tridiagonal(sub, main, sup, rhs)
-            if abs(t0) < 1e-14 and step == m - 1:
-                last_dt_at_zero = dt
-
-        return V, (last_dt_at_zero if last_dt_at_zero is not None else dt)
-
-    def _cn_subinterval_log(
-        self,
-        x_nodes: List[float],
-        V: List[float],
-        t0: float,
-        t1: float,
-        theta: float,
-        rannacher_left_steps: int,
-        m_steps: int,
-    ) -> Tuple[List[float], float]:
-
+    def _boundary_values(self, tau: float) -> (float, float):
+        """
+        Dirichlet boundaries at time-to-maturity tau, consistent with
+        Black–Scholes with carry b and discount r.
+        """
+        S_min = self.s_nodes[0]
+        S_max = self.s_nodes[-1]
         r = self.r_disc
         b = self.b_carry
-        sig = self.sigma
+        is_call = self.option_type.lower() == "call"
 
-        N = len(x_nodes) - 1
-        L = t1 - t0
-        m = max(1, int(m_steps))
-        dt = L / m
-        last_dt_at_zero = None
+        if is_call:
+            V_min = 0.0
+            V_max = S_max * math.exp((b - r) * tau) - self.K * math.exp(-r * tau)
+        else:
+            V_max = 0.0
+            V_min = self.K * math.exp(-r * tau)
 
-        dx = x_nodes[1] - x_nodes[0]
+        return V_min, V_max
 
-        # log-PDE coefficients
-        mu_x = b - 0.5 * sig * sig
-        alpha = 0.5 * sig * sig / (dx * dx)           # diffusion term
-        beta  = mu_x / (2.0 * dx)                     # drift term
+    # ------------------------------------------------------------------
+    # Monitoring times mapping (calendar t -> tau index)
+    # ------------------------------------------------------------------
 
-        for step in range(m):
-            use_theta = 1.0 if (rannacher_left_steps > 0) else theta
-            if rannacher_left_steps > 0:
-                rannacher_left_steps -= 1
+    def _monitor_indices_tau(self, dt: float) -> set:
+        """
+        Map discrete monitoring times t_mon in [0,T] to indices in tau = T - t.
+        We project at tau_k = (k * dt) that corresponds to t = T - tau_k.
+        """
+        idx_set = set()
+        if not self.monitor_times:
+            return idx_set
 
-            t_after = t0 + (m - step - 1) * dt
-            tau_left = t_after
+        for t_mon in self.monitor_times:
+            if t_mon <= 0.0 or t_mon >= self.T:
+                continue
+            tau_mon = self.T - t_mon
+            k = int(round(tau_mon / dt))
+            if 0 < k < self.N_time:
+                idx_set.add(k)
+        return idx_set
 
-            a = [0.0] * (N + 1)
-            b_diag = [0.0] * (N + 1)
-            c = [0.0] * (N + 1)
-            rhs = [0.0] * (N + 1)
+    # ------------------------------------------------------------------
+    # Knock-out projection
+    # ------------------------------------------------------------------
 
-            # interior nodes
-            for i in range(1, N):
-                A  = dt * use_theta       * (alpha - beta)
-                B  = 1.0 + dt * use_theta * (r + 2.0 * alpha)
-                C  = dt * use_theta       * (alpha + beta)
+    def _apply_KO_projection(self, V: List[float]) -> None:
+        """Project values onto KO payoffs at a monitoring time."""
+        bt = self.barrier_type.lower()
 
-                A_ = dt * (1.0 - use_theta) * (alpha - beta)
-                B_ = 1.0 - dt * (1.0 - use_theta) * (r + 2.0 * alpha)
-                C_ = dt * (1.0 - use_theta) * (alpha + beta)
+        if bt == "down-and-out" and self.lower_barrier is not None:
+            B = self.lower_barrier
+            for i, S in enumerate(self.s_nodes):
+                if S <= B:
+                    V[i] = self.rebate
 
-                a[i]      = -A
-                b_diag[i] =  B
-                c[i]      = -C
-                rhs[i]    =  A_ * V[i - 1] + B_ * V[i] + C_ * V[i + 1]
+        elif bt == "up-and-out" and self.upper_barrier is not None:
+            B = self.upper_barrier
+            for i, S in enumerate(self.s_nodes):
+                if S >= B:
+                    V[i] = self.rebate
 
-            # boundaries still expressed in S-space
-            S_min = self.s_nodes[0]
-            S_max = self.s_nodes[-1]
+    # ------------------------------------------------------------------
+    # Crank–Nicolson solve in log-spot
+    # ------------------------------------------------------------------
 
-            if self.option_type == "call":
-                V_0 = 0.0
-            else:
-                V_0 = self.K * math.exp(-r * tau_left)
+    def _solve_grid(self, apply_KO: bool) -> List[float]:
+        """
+        Solve dV/dτ = L V with L from Black–Scholes in log S via CN,
+        marching τ from 0 to T (backwards in calendar time).
+        """
+        self.configure_grid()
+        dx = self._build_log_grid()
 
-            V_M = self._boundary_Smax(S_max, tau_left)
+        N = self.N_space
+        dt = self.T / self.N_time
 
-            b_diag[0] = 1.0; c[0] = 0.0; a[0] = 0.0; rhs[0] = V_0
-            b_diag[N] = 1.0; a[N] = 0.0; c[N] = 0.0; rhs[N] = V_M
+        sig2 = self.sigma * self.sigma
+        mu_x = self.b_carry - 0.5 * sig2
 
-            V = self._solve_tridiagonal(a, b_diag, c, rhs)
+        # Operator coefficients in log space
+        alpha = 0.5 * sig2 / (dx * dx)
+        beta_adv = mu_x / (2.0 * dx)
 
-            if abs(t0) < 1e-14 and step == m - 1:
-                last_dt_at_zero = dt
+        a = alpha - beta_adv                    # coeff for V_{j-1}
+        c = alpha + beta_adv                    # coeff for V_{j+1}
+        bcoef = -2.0 * alpha - self.r_disc      # coeff for V_j
 
-        return V, (last_dt_at_zero if last_dt_at_zero is not None else dt)
-    
-    def _interp_price(self, V: List[float]) -> float:
-        s = self.s_nodes
+        # CN matrices: (I - dt/2 L) V^{m+1} = (I + dt/2 L) V^m
+        A_L = -0.5 * dt * a
+        A_C = 1.0 - 0.5 * dt * bcoef
+        A_U = -0.5 * dt * c
+
+        B_L = 0.5 * dt * a
+        B_C = 1.0 + 0.5 * dt * bcoef
+        B_U = 0.5 * dt * c
+
+        def solve_tridiag(rhs: List[float]) -> List[float]:
+            """Thomas algorithm for Toeplitz tri-diagonal with A_L, A_C, A_U."""
+            n = len(rhs)
+            c_prime = [0.0] * n
+            d_prime = [0.0] * n
+
+            c_prime[0] = A_U / A_C
+            d_prime[0] = rhs[0] / A_C
+
+            for i in range(1, n):
+                denom = A_C - A_L * c_prime[i - 1]
+                if i < n - 1:
+                    c_prime[i] = A_U / denom
+                d_prime[i] = (rhs[i] - A_L * d_prime[i - 1]) / denom
+
+            x = [0.0] * n
+            x[-1] = d_prime[-1]
+            for i in range(n - 2, -1, -1):
+                x[i] = d_prime[i] - c_prime[i] * x[i + 1]
+            return x
+
+        # Terminal condition
+        V = self._terminal_payoff()
+
+        # Monitoring indices in tau
+        monitor_idx = self._monitor_indices_tau(dt)
+
+        # March tau from 0 -> T (m = 0 is τ=dt)
+        for m in range(self.N_time):
+            tau_next = (m + 1) * dt
+            V_min_next, V_max_next = self._boundary_values(tau_next)
+
+            # RHS for interior nodes j = 1..N-1
+            rhs = [0.0] * (N - 1)
+            for j in range(1, N):
+                Vjm1, Vj, Vjp1 = V[j - 1], V[j], V[j + 1]
+                rhs[j - 1] = B_L * Vjm1 + B_C * Vj + B_U * Vjp1
+
+            # Include boundaries (Dirichlet)
+            rhs[0]   -= A_L * V_min_next
+            rhs[-1]  -= A_U * V_max_next
+
+            V_int = solve_tridiag(rhs)
+
+            V[0] = V_min_next
+            V[-1] = V_max_next
+            V[1:-1] = V_int
+
+            # Apply KO at this monitoring time in tau-space
+            if apply_KO and (m + 1) in monitor_idx:
+                self._apply_KO_projection(V)
+
+        return V
+
+    # ------------------------------------------------------------------
+    # Interpolation & grid Greeks
+    # ------------------------------------------------------------------
+
+    def _interp_price_from_grid(self, V: List[float]) -> float:
+        """Linear interpolation of grid value at S0."""
         S0 = self.S0
+        s = self.s_nodes
+
         if S0 <= s[0]:
-            return float(V[0])
+            return V[0]
         if S0 >= s[-1]:
-            return float(V[-1])
+            return V[-1]
+
         lo, hi = 0, len(s) - 1
         while hi - lo > 1:
             mid = (lo + hi) // 2
@@ -651,333 +322,216 @@ class DiscreteBarrierFDMPricer:
                 hi = mid
             else:
                 lo = mid
+
         w = (S0 - s[lo]) / (s[hi] - s[lo])
-        return float((1.0 - w) * V[lo] + w * V[hi])
-    
-    def price(self) -> float:
-        x_nodes = self._build_log_grid()
+        return (1.0 - w) * V[lo] + w * V[hi]
 
-        # Vanilla
-        if self.barrier_type == "none":
-            V, _ = self._run_backward(x_nodes, apply_barrier=False)
-            return self._interp_price(V)
-
-        # Pure KO
-        if self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
-            V, _ = self._run_backward(x_nodes, apply_barrier=True)
-            return self._interp_price(V)
-
-        # KI via parity: V_in = V_van - V_KO
-        ko_type = self._map_KI_to_KO()
-        if ko_type is None:
-            raise ValueError(f"Unknown KI barrier_type {self.barrier_type}")
-
-        original_type = self.barrier_type
-
-        # vanilla
-        self.barrier_type = "none"
-        V_van, _ = self._run_backward(x_nodes, apply_barrier=False)
-
-        # KO with mapped type
-        self.barrier_type = ko_type
-        V_ko, _ = self._run_backward(x_nodes, apply_barrier=True)
-
-        self.barrier_type = original_type
-
-        V_in = [v - vko for v, vko in zip(V_van, V_ko)]
-        return self._interp_price(V_in)
-    
-    def greeks(self, vega_bump: float = 0.01) -> Dict[str, float]:
-        x_nodes = self._build_log_grid()
-
-        # Get grid for current barrier_type
-        if self.barrier_type == "none":
-            V, _ = self._run_backward(x_nodes, apply_barrier=False)
-        elif self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
-            V, _ = self._run_backward(x_nodes, apply_barrier=True)
-        else:
-            ko_type = self._map_KI_to_KO()
-            original_type = self.barrier_type
-
-            self.barrier_type = "none"
-            V_van, _ = self._run_backward(x_nodes, apply_barrier=False)
-
-            self.barrier_type = ko_type
-            V_ko, _ = self._run_backward(x_nodes, apply_barrier=True)
-
-            self.barrier_type = original_type
-            V = [vv - vk for vv, vk in zip(V_van, V_ko)]
-
-        P = self._interp_price(V)
-
-        # central-diff delta/gamma on S-grid
+    def _delta_gamma_from_grid(self, V: List[float]) -> (float, float):
+        """Non-uniform central differences for delta & gamma at S0."""
         s = self.s_nodes
-        i = min(range(len(s)), key=lambda k: abs(s[k] - self.S0))
-        i = max(1, min(len(s) - 2, i))
+        S0 = self.S0
 
-        h1 = s[i] - s[i - 1]
-        h2 = s[i + 1] - s[i]
+        # choose interior node closest to S0
+        idx = min(range(1, len(s) - 1), key=lambda i: abs(s[i] - S0))
+
+        S_im1, S_i, S_ip1 = s[idx - 1], s[idx], s[idx + 1]
+        V_im1, V_i, V_ip1 = V[idx - 1], V[idx], V[idx + 1]
+
+        h1 = S_i - S_im1
+        h2 = S_ip1 - S_i
 
         delta = (
-            -(h2 / (h1 * (h1 + h2))) * V[i - 1]
-            + ((h2 - h1) / (h1 * h2)) * V[i]
-            + (h1 / (h2 * (h1 + h2))) * V[i + 1]
+            -h2 / (h1 * (h1 + h2)) * V_im1
+            + (h2 - h1) / (h1 * h2) * V_i
+            + h1 / (h2 * (h1 + h2)) * V_ip1
         )
-
         gamma = 2.0 * (
-            V[i - 1] / (h1 * (h1 + h2))
-            - V[i] / (h1 * h2)
-            + V[i + 1] / (h2 * (h1 + h2))
+            V_im1 / (h1 * (h1 + h2))
+            - V_i / (h1 * h2)
+            + V_ip1 / (h2 * (h1 + h2))
         )
+        return delta, gamma
 
-        # vega via bump-and-revalue
-        sig0 = self.sigma
-        self.sigma = sig0 + vega_bump
-        P_up = self.price()
-        self.sigma = sig0 - vega_bump
-        P_dn = self.price()
-        self.sigma = sig0
-        vega = (P_up - P_dn) / (2.0 * vega_bump)
+    # ------------------------------------------------------------------
+    # Closed-form vanilla Black–Scholes (with continuous carry b, discount r)
+    # ------------------------------------------------------------------
 
-        # theta from PDE operator in S-space
+    def _vanilla_bs_price_and_greeks(self) -> Dict[str, float]:
+        """
+        Closed-form European vanilla under Black–Scholes with continuous
+        carry b and discount r. All Greeks are w.r.t SPOT S0.
+        """
+        S0 = self.S0
+        K = self.K
+        T = self.T
+        sigma = self.sigma
         r = self.r_disc
         b = self.b_carry
-        theta = -(b * self.S0 * delta + 0.5 * self.sigma * self.sigma * self.S0 * self.S0 * gamma - r * P)
+
+        if T <= 0.0 or sigma <= 0.0:
+            if self.option_type.lower() == "call":
+                price = max(S0 - K, 0.0)
+            else:
+                price = max(K - S0, 0.0)
+            return {
+                "price": price,
+                "delta": 0.0,
+                "gamma": 0.0,
+                "theta": 0.0,
+                "vega": 0.0,
+            }
+
+        # implied continuous dividend yield q from carry b = r - q
+        q = r - b
+        sqrtT = math.sqrt(T)
+
+        d1 = (math.log(S0 / K) + (b + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+        d2 = d1 - sigma * sqrtT
+
+        Nd1 = norm_cdf(d1)
+        Nd2 = norm_cdf(d2)
+        nd1 = norm_pdf(d1)
+
+        is_call = self.option_type.lower() == "call"
+
+        disc_q = math.exp(-q * T)
+        disc_r = math.exp(-r * T)
+
+        if is_call:
+            price = S0 * disc_q * Nd1 - K * disc_r * Nd2
+            delta = disc_q * Nd1
+        else:
+            price = K * disc_r * norm_cdf(-d2) - S0 * disc_q * norm_cdf(-d1)
+            delta = disc_q * (Nd1 - 1.0)
+
+        gamma = disc_q * nd1 / (S0 * sigma * sqrtT)
+        vega = S0 * disc_q * nd1 * sqrtT
+
+        # PDE-consistent theta at t=0
+        theta = -(
+            0.5 * sigma * sigma * S0 * S0 * gamma
+            + b * S0 * delta
+            - r * price
+        )
 
         return {
-            "delta": float(delta),
-            "gamma": float(gamma),
-            "vega": float(vega),
-            "theta": float(theta),
+            "price": price,
+            "delta": delta,
+            "gamma": gamma,
+            "theta": theta,
+            "vega": vega,
         }
 
-    # ---------------- time partition (with diffusion guard) ----------------
-    def _time_subgrid_counts(self) -> List[int]:
-        spans = [self.monitor_times[i + 1] - self.monitor_times[i] for i in range(len(self.monitor_times) - 1)]
-        total = sum(spans) or 1.0
-        mk = [max(self.min_substeps, int(round(self.M * (L / total)))) for L in spans]
-        diff = self.M - sum(mk)
-        j = 0
-        while diff != 0 and mk:
-            k = j % len(mk)
-            if diff > 0:
-                mk[k] += 1
-                diff -= 1
-            else:
-                if mk[k] > self.min_substeps:
-                    mk[k] -= 1
-                    diff += 1
-            j += 1
+    # ------------------------------------------------------------------
+    # PDE price + Greeks (for KO or vanilla via grid)
+    # ------------------------------------------------------------------
 
-        # diffusion-number guard near S0 / barrier
-        refs = [self.S0, self.K]
-        if self.barrier_type in ("down-and-out", "double-out") and self.lower_barrier:
-            refs.append(self.lower_barrier)
-        if self.barrier_type in ("up-and-out", "double-out") and self.upper_barrier:
-            refs.append(self.upper_barrier)
-        Sref = max(refs)
-        idx = min(range(len(self.S_nodes)), key=lambda i: abs(self.S_nodes[i] - Sref))
-        idx = max(1, min(len(self.S_nodes) - 2, idx))
-        dS_local = min(
-            self.S_nodes[idx] - self.S_nodes[idx - 1],
-            self.S_nodes[idx + 1] - self.S_nodes[idx],
-        )
-        a_ref = 0.5 * self.sigma * self.sigma * Sref * Sref
+    def _pde_price_and_greeks(self, apply_KO: bool, dv_sigma: float) -> Dict[str, float]:
+        """Use CN grid to compute price + Greeks for current barrier_type."""
+        V_grid = self._solve_grid(apply_KO=apply_KO)
+        price = self._interp_price_from_grid(V_grid)
+        delta, gamma = self._delta_gamma_from_grid(V_grid)
 
-        for k in range(len(spans)):
-            Lk = spans[k]
-            mk_k = max(1, mk[k])
-            dtk = Lk / mk_k
-            while a_ref * dtk / (dS_local * dS_local) > self.lambda_diff_target:
-                mk_k += 1
-                dtk = Lk / mk_k
-            mk[k] = mk_k
-        return mk
+        S0 = self.S0
+        sigma = self.sigma
+        r = self.r_disc
+        b = self.b_carry
 
-    # ---------------- full backward run ----------------
-    def _run_backward(self, s_nodes: List[float], apply_barrier: bool) -> Tuple[List[float], float]:
-        N = len(s_nodes) - 1
-        V = self._terminal_payoff(s_nodes)
-
-        # t=0 status flags
-        if apply_barrier:
-            if self.barrier_type in ("down-and-out", "up-and-out", "double-out") and self.already_hit:
-                instant = (
-                    self.rebate_amount
-                    if self.rebate_at_hit
-                    else self.rebate_amount * math.exp(-self.r * self.T)
-                )
-                return [instant] * (N + 1), 0.0
-            if self.barrier_type in ("down-and-in", "up-and-in", "double-in") and self.already_in:
-                apply_barrier = False  # treat as vanilla from now
-
-        theta = 0.5
-        subcounts = self._time_subgrid_counts()
-        rannacher_left = self.rannacher
-        dt_last_global = None
-
-        for k in range(len(self.monitor_times) - 1, 0, -1):
-            t0 = self.monitor_times[k - 1]
-            t1 = self.monitor_times[k]
-            m_steps = subcounts[k - 1] if k - 1 < len(subcounts) else 1
-
-            V, dt_last = self._cn_subinterval(s_nodes, V, t0, t1, theta, rannacher_left, m_steps)
-            rannacher_left = max(0, rannacher_left - m_steps)
-
-            if apply_barrier and (abs(t0) > 1e-14):
-                self._apply_KO_projection(V, s_nodes, tau_left=t0)
-                # Rannacher restart after KO projection
-                rannacher_left = max(rannacher_left, self.rannacher)
-
-            if abs(t0) < 1e-14:
-                dt_last_global = dt_last
-
-        # Knock-IN via parity: V_in = V_vanilla - V_out
-        if apply_barrier and self.barrier_type in ("down-and-in", "up-and-in", "double-in"):
-            V_out = V
-            V_van, _ = self._run_backward(s_nodes, apply_barrier=False)
-            V = [V_van[i] - V_out[i] for i in range(len(V))]
-
-        return V, (dt_last_global if dt_last_global is not None else (self.T / max(1, self.M)))
-
-    # ---------------- interpolation & Greeks ----------------
-    @staticmethod
-    def _interp_linear(x: float, xs: List[float], ys: List[float]) -> float:
-        if x <= xs[0]:
-            return float(ys[0])
-        if x >= xs[-1]:
-            return float(ys[-1])
-        lo, hi = 0, len(xs) - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if x < xs[mid]:
-                hi = mid
-            else:
-                lo = mid
-        x0, x1 = xs[lo], xs[hi]
-        y0, y1 = ys[lo], ys[hi]
-        w = (x - x0) / (x1 - x0)
-        return float((1 - w) * y0 + w * y1)
-
-    def _delta_gamma_nonuniform(self, s_nodes: List[float], V: List[float], Sx: float) -> Tuple[float, float]:
-        N = len(s_nodes) - 1
-        i = min(range(N + 1), key=lambda k: abs(s_nodes[k] - Sx))
-        i = max(1, min(N - 1, i))
-        h1 = s_nodes[i] - s_nodes[i - 1]
-        h2 = s_nodes[i + 1] - s_nodes[i]
-        delta_c = (
-            -(h2 / (h1 * (h1 + h2))) * V[i - 1]
-            + ((h2 - h1) / (h1 * h2)) * V[i]
-            + (h1 / (h2 * (h1 + h2))) * V[i + 1]
-        )
-        gamma_c = 2.0 * (
-            V[i - 1] / (h1 * (h1 + h2))
-            - V[i] / (h1 * h2)
-            + V[i + 1] / (h2 * (h1 + h2))
+        theta = -(
+            0.5 * sigma * sigma * S0 * S0 * gamma
+            + b * S0 * delta
+            - r * price
         )
 
-        if not self.use_one_sided:
-            return float(delta_c), float(gamma_c)
+        # Vega via central bump in sigma (same CN engine)
+        sigma_orig = sigma
 
-        # Barrier-aware Δ, Γ near KO barrier (optional refinement)
-        H = None
-        side = None
-        if self.barrier_type in ("down-and-out", "double-out") and self.lower_barrier is not None:
-            H = self.lower_barrier
-            side = "down"
-        if self.barrier_type in ("up-and-out", "double-out") and self.upper_barrier is not None and H is None:
-            H = self.upper_barrier
-            side = "up"
-        if H is None:
-            return float(delta_c), float(gamma_c)
+        self.sigma = sigma_orig + dv_sigma
+        V_up = self._solve_grid(apply_KO=apply_KO)
+        p_up = self._interp_price_from_grid(V_up)
 
-        j = min(range(N + 1), key=lambda k: abs(s_nodes[k] - H))
-        j = max(1, min(N - 1, j))
-        near = abs(i - j) <= self.barrier_safety_cells
-        if not near:
-            return float(delta_c), float(gamma_c)
+        self.sigma = sigma_orig - dv_sigma
+        V_dn = self._solve_grid(apply_KO=apply_KO)
+        p_dn = self._interp_price_from_grid(V_dn)
 
-        if side == "down":
-            jj = j if s_nodes[j] > H else min(j + 1, N - 1)
-            S1, S2 = s_nodes[jj], s_nodes[jj + 1]
-            h_minus = max(1e-14, S1 - H)
-            h_plus = max(1e-14, S2 - S1)
-            t = (H - S1) / (S2 - S1)
-            VB = (1.0 - t) * V[jj] + t * V[jj + 1]
-            a1 = -h_plus / (h_minus * (h_minus + h_plus))
-            a2 = (h_plus - h_minus) / (h_minus * h_plus)
-            a3 = h_minus / (h_plus * (h_minus + h_plus))
-            d1 = 2.0 / (h_minus * (h_minus + h_plus))
-            d2 = -2.0 / (h_minus * h_plus)
-            d3 = 2.0 / (h_plus * (h_minus + h_plus))
-            Ux = a1 * VB + a2 * V[jj] + a3 * V[jj + 1]
-            Uxx = d1 * VB + d2 * V[jj] + d3 * V[jj + 1]
-        else:
-            jj = j if s_nodes[j] < H else max(j - 1, 1)
-            S0, S1 = s_nodes[jj - 1], s_nodes[jj]
-            h_minus = max(1e-14, S1 - S0)
-            h_plus = max(1e-14, H - S1)
-            t = (H - S1) / (H - S0) if (H - S0) != 0 else 0.0
-            VB = (1.0 - t) * V[jj] + t * V[jj - 1]
-            a1 = -h_plus / (h_minus * (h_minus + h_plus))
-            a2 = (h_plus - h_minus) / (h_minus * h_plus)
-            a3 = h_minus / (h_plus * (h_minus + h_plus))
-            d1 = 2.0 / (h_minus * (h_minus + h_plus))
-            d2 = -2.0 / (h_minus * h_plus)
-            d3 = 2.0 / (h_plus * (h_minus + h_plus))
-            Ux = a1 * V[jj - 1] + a2 * V[jj] + a3 * VB
-            Uxx = d1 * V[jj - 1] + d2 * V[jj] + d3 * VB
+        self.sigma = sigma_orig
+        vega = (p_up - p_dn) / (2.0 * dv_sigma)
 
-        delta = Ux
-        gamma = max(min(Uxx, 1e6), -1e6)
-        return float(delta), float(gamma)
+        return {
+            "price": price,
+            "delta": delta,
+            "gamma": gamma,
+            "theta": theta,
+            "vega": vega,
+        }
 
-    # ---------------- public API ----------------
+    # ------------------------------------------------------------------
+    # Public API: price and Greeks
+    # ------------------------------------------------------------------
+
     def price(self) -> float:
-        V, _ = self._run_backward(self.S_nodes, apply_barrier=(self.barrier_type != "none"))
-        return self._interp_linear(self.S0, self.S_nodes, V)
+        """
+        Price dispatcher:
+        - vanilla (no barrier): closed-form Black–Scholes,
+        - KO: CN PDE with KO projection,
+        - KI: parity V_KI = V_vanilla - V_KO.
+        """
+        bt = self.barrier_type.lower()
 
-    def greeks(self, vega_bump: float = 1e-3) -> Dict[str, float]:
-        V, dt0 = self._run_backward(self.S_nodes, apply_barrier=(self.barrier_type != "none"))
-        P = self._interp_linear(self.S0, self.S_nodes, V)
-        delta, gamma = self._delta_gamma_nonuniform(self.S_nodes, V, self.S0)
+        # Vanilla: Black–Scholes closed form
+        if bt == "none":
+            return self._vanilla_bs_price_and_greeks()["price"]
 
-        # vega (bump σ; reuse grid)
-        sig0 = self.sigma
-        self.sigma = sig0 + vega_bump
-        V_up, _ = self._run_backward(self.S_nodes, apply_barrier=(self.barrier_type != "none"))
-        P_up = self._interp_linear(self.S0, self.S_nodes, V_up)
-        self.sigma = sig0 - vega_bump
-        V_dn, _ = self._run_backward(self.S_nodes, apply_barrier=(self.barrier_type != "none"))
-        P_dn = self._interp_linear(self.S0, self.S_nodes, V_dn)
-        self.sigma = sig0
-        vega = (P_up - P_dn) / (2.0 * vega_bump)
+        # Knock-out: PDE with KO projection
+        if bt in ("down-and-out", "up-and-out"):
+            return self._pde_price_and_greeks(apply_KO=True, dv_sigma=1e-3)["price"]
 
-        # PDE theta
-        theta_pde = -((self.r - self.q) * self.S0 * delta + 0.5 * self.sigma * self.sigma * self.S0 * self.S0 * gamma - self.r * P)
+        # Knock-in: parity vs vanilla and KO
+        if bt in ("down-and-in", "up-and-in"):
+            original_bt = bt
 
-        if not self.compute_numerical_theta:
-            theta = theta_pde
-        else:
-            dt_eps = max(1e-8, dt0)
-            V_now = V[:]
-            V_eps, _ = self._cn_subinterval(self.S_nodes, V_now, 0.0, dt_eps, theta=1.0, rannacher_left_steps=0, m_steps=1)
-            P_eps = self._interp_linear(self.S0, self.S_nodes, V_eps)
-            theta = -(P - P_eps) / dt_eps
+            g_van = self._vanilla_bs_price_and_greeks()
 
-        return {"delta": float(delta), "gamma": float(gamma), "vega": float(vega), "theta": float(theta)}
+            # matching knock-out
+            self.barrier_type = "down-and-out" if bt == "down-and-in" else "up-and-out"
+            g_ko = self._pde_price_and_greeks(apply_KO=True, dv_sigma=1e-3)
 
-    def print_details(self) -> None:
-        p = self.price()
-        g = self.greeks()
-        print("==== Discrete Barrier Option (CN + Rannacher) — Discrete monitors, S-space ====")
-        print(f"T (years)         : {self.T:.9f}   [{self.day_count}]")
-        print(f"sigma / r / q     : {self.sigma:.9f} / {self.r:.9f} / {self.q:.9f}")
-        print(f"Barrier type      : {self.barrier_type}  (lo={self.lower_barrier}, up={self.upper_barrier})")
-        print(f"Rebate (amt/hit)  : {self.rebate_amount} / {self.rebate_at_hit}")
-        print(f"Status (hit/in)   : {self.already_hit} / {self.already_in}")
-        print(f"Grid(S,N)         : {len(self.S_nodes)}, N={self.N}, grid_type={self.grid_type}")
-        print(f"Monitors count    : {len(self.monitor_times)}")
-        print(f"Spot/Strike       : {self.S0:.6f} / {self.K:.6f}")
-        print(f"Price             : {p:.9f}")
-        print(f"Greeks            : Δ={g['delta']:.9f}, Γ={g['gamma']:.9f}, ν={g['vega']:.9f}, Θ={g['theta']:.9f}")
+            self.barrier_type = original_bt
+            return g_van["price"] - g_ko["price"]
+
+        raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
+
+    def greeks(self, dv_sigma: float = 1e-3) -> Dict[str, float]:
+        """
+        Greeks consistent with:
+        - vanilla: closed-form Black–Scholes,
+        - KO: CN PDE,
+        - KI: parity (Greek_KI = Greek_vanilla − Greek_KO).
+        """
+        bt = self.barrier_type.lower()
+
+        # Vanilla
+        if bt == "none":
+            return self._vanilla_bs_price_and_greeks()
+
+        # KO
+        if bt in ("down-and-out", "up-and-out"):
+            return self._pde_price_and_greeks(apply_KO=True, dv_sigma=dv_sigma)
+
+        # KI via parity
+        if bt in ("down-and-in", "up-and-in"):
+            original_bt = bt
+
+            # Vanilla Greeks
+            self.barrier_type = "none"
+            g_van = self._vanilla_bs_price_and_greeks()
+
+            # KO Greeks
+            self.barrier_type = "down-and-out" if bt == "down-and-in" else "up-and-out"
+            g_ko = self._pde_price_and_greeks(apply_KO=True, dv_sigma=dv_sigma)
+
+            self.barrier_type = original_bt
+
+            return {k: g_van[k] - g_ko[k] for k in g_van}
+
+        raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
