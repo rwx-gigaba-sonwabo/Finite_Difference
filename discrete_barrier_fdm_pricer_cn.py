@@ -777,3 +777,16 @@ class DiscreteBarrierCrankNicolsonLog:
         }
 
         return result
+vega_diag = pricer.diagnose_order_of_accuracy(
+    quantity="vega",
+    base_time_steps=40,
+    refinements=3,
+)
+print("Empirical order for vega:", vega_diag["global_order"])
+print("N_time:", vega_diag["N_time_list"])
+print("vega:", vega_diag["values"])
+print("errors:", vega_diag["errors_vs_finest"])
+
+# Price or delta if you want a baseline
+price_diag = pricer.diagnose_order_of_accuracy("price", base_time_steps=40, refinements=3)
+delta_diag = pricer.diagnose_order_of_accuracy("delta", base_time_steps=40, refinements=3)
