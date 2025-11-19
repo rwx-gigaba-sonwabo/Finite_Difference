@@ -790,3 +790,228 @@ print("errors:", vega_diag["errors_vs_finest"])
 # Price or delta if you want a baseline
 price_diag = pricer.diagnose_order_of_accuracy("price", base_time_steps=40, refinements=3)
 delta_diag = pricer.diagnose_order_of_accuracy("delta", base_time_steps=40, refinements=3)
+
+
+    def compute_empirical_order(
+        self,
+        time_steps_list,
+        greek: str = "vega",
+        use_dt: bool = True,
+    ):
+        """
+        Empirically estimate the convergence order in time for price or a Greek.
+
+        Parameters
+        ----------
+        time_steps_list : iterable of int
+            List of N_time values to test, e.g. [30, 60, 120, 240].
+            Larger N means smaller time step.
+        greek : {"price", "delta", "gamma", "vega", "theta_annual", "theta_daily"}
+            Quantity to analyse. For Greeks we call `calculate_greeks(N)`,
+            which uses the same one-sided Vega bump as Front Arena.
+        use_dt : bool
+            If True, use dt = T_disc / N as the step size on the x-axis.
+            If False, use h = 1/N.
+
+        Returns
+        -------
+        dict
+            {
+              "order": p,         # estimated convergence order
+              "coeff": c,         # intercept in log(error) ≈ p log(h) + c
+              "r2": r2,           # goodness-of-fit R^2
+              "Ns": [...],        # N_time values used
+              "h_vals": [...],    # step sizes (dt or 1/N)
+              "errors": [...],    # absolute errors vs finest grid
+              "ref_value": float, # value on finest grid
+              "values": [...],    # raw values at each N (same order as Ns)
+            }
+        Notes
+        -----
+        * For Crank–Nicolson price/delta/gamma you expect p ≈ 2 (O(dt^2)).
+        * For one-sided Vega you typically see p ≈ 1–1.5, because the
+          Vega itself is a first-order FD in volatility and amplifies PDE noise.
+        """
+
+        # ----- 0. Prepare and sort N -----
+        Ns = sorted({int(N) for N in time_steps_list if int(N) > 0})
+        if len(Ns) < 3:
+            raise ValueError("Provide at least three different time step counts.")
+
+        # Time horizon for dt (same as your engine uses)
+        T_disc = float(self.time_to_discount)
+        if use_dt:
+            h_vals = [T_disc / N for N in Ns]
+        else:
+            h_vals = [1.0 / N for N in Ns]
+
+        # ----- 1. Reference on finest grid -----
+        N_ref = max(Ns)
+
+        greek_key_map = {
+            "delta": "Delta",
+            "gamma": "Gamma",
+            "vega": "Vega",
+            "theta_annual": "Theta (Annual)",
+            "theta_daily": "Theta (Daily)",
+        }
+
+        if greek.lower() == "price":
+            ref_value = float(self._price_once(N_ref))
+        else:
+            key = greek_key_map.get(greek.lower())
+            if key is None:
+                raise ValueError(f"Unsupported greek name: {greek}")
+            ref_value = float(self.calculate_greeks(N_ref)[key])
+
+        # ----- 2. Compute values and errors for each N -----
+        values = []
+        errors = []
+
+        for N in Ns:
+            if greek.lower() == "price":
+                val = float(self._price_once(N))
+            else:
+                val = float(self.calculate_greeks(N)[key])
+
+            values.append(val)
+            errors.append(abs(val - ref_value))
+
+        # Filter out any zero errors (cannot take log)
+        pairs = [(h, e) for (h, e) in zip(h_vals, errors) if e > 0.0]
+        if len(pairs) < 2:
+            raise RuntimeError("Not enough non-zero errors to estimate order.")
+
+        h_vals, errors = map(np.array, zip(*pairs))
+
+        logh = np.log(h_vals)
+        loge = np.log(errors)
+
+        # ----- 3. Least-squares fit: log(error) = p log(h) + c -----
+        x = logh
+        y = loge
+        x_mean = x.mean()
+        y_mean = y.mean()
+
+        Sxx = np.sum((x - x_mean) ** 2)
+        Sxy = np.sum((x - x_mean) * (y - y_mean))
+
+        p = Sxy / Sxx
+        c = y_mean - p * x_mean
+
+        # Goodness-of-fit R^2
+        y_hat = p * x + c
+        SS_res = np.sum((y - y_hat) ** 2)
+        SS_tot = np.sum((y - y_mean) ** 2)
+        r2 = 1.0 - SS_res / SS_tot if SS_tot > 0.0 else 1.0
+
+        return {
+            "order": float(p),
+            "coeff": float(c),
+            "r2": float(r2),
+            "Ns": Ns,
+            "h_vals": list(h_vals),
+            "errors": list(errors),
+            "ref_value": ref_value,
+            "values": values,
+        }
+
+    def expected_fd_error_at_N(
+        self,
+        result_dict: dict,
+        N_target: int,
+        use_dt: bool = True,
+    ) -> float:
+        """
+        Using the regression log(error) ≈ p log(h) + c returned by
+        `compute_empirical_order`, predict the FD truncation error
+        at a coarser grid with N_target time steps.
+        """
+        p = result_dict["order"]
+        c = result_dict["coeff"]
+
+        # We only care about h ∝ 1/N; absolute T_disc cancels in the slope.
+        if use_dt:
+            h = 1.0 / float(N_target)
+        else:
+            h = 1.0 / float(N_target)
+
+        log_err = p * np.log(h) + c
+        return float(np.exp(log_err))
+
+    def fa_vs_validation_vega_diagnostic(
+        self,
+        time_steps_list,
+        N_fa: int = 30,
+        vega_fa: float | None = None,
+        greek: str = "vega",
+    ) -> dict:
+        """
+        End-to-end diagnostic for FD vs Front Arena:
+
+        1. Compute empirical order for the chosen quantity (default: Vega).
+        2. Predict FD truncation error at FA-like grid (N_fa, e.g. 30 steps).
+        3. If vega_fa is provided, compare predicted error to observed
+           FA-vs-validation difference and print a conclusion.
+
+        Returns a dict with key stats so the main script can log / report.
+        """
+
+        print("\n========== FD ORDER-OF-ACCURACY DIAGNOSTIC ==========\n")
+
+        # Step 1 – empirical order
+        result = self.compute_empirical_order(
+            time_steps_list=time_steps_list,
+            greek=greek,
+            use_dt=True,
+        )
+        p = result["order"]
+        r2 = result["r2"]
+        ref_val = result["ref_value"]
+        N_ref = max(result["Ns"])
+
+        print(f"Quantity      : {greek}")
+        print(f"Empirical p   : {p:.3f}")
+        print(f"R^2 (fit)     : {r2:.4f}")
+        print(f"Reference N   : {N_ref}")
+        print(f"Reference {greek}: {ref_val:.8f}\n")
+
+        # Step 2 – predicted truncation error at FA grid
+        predicted_error = self.expected_fd_error_at_N(
+            result_dict=result,
+            N_target=N_fa,
+            use_dt=True,
+        )
+        print(f"Predicted FD truncation error at N={N_fa}: {predicted_error:.8f}")
+
+        fa_val = vega_fa
+        obs_diff = None
+
+        # Step 3 – compare to FA if provided
+        if fa_val is not None:
+            obs_diff = abs(fa_val - ref_val)
+            print(f"Observed FA vs validation difference    : {obs_diff:.8f}")
+
+            # Simple consistency check with a 1.5× buffer
+            if obs_diff <= 1.5 * predicted_error:
+                print(
+                    "\nConclusion: ✔ The observed discrepancy is CONSISTENT "
+                    "with expected FD truncation error (one-sided bump).\n"
+                )
+            else:
+                print(
+                    "\nConclusion: ✘ The discrepancy EXCEEDS the expected FD "
+                    "truncation error; investigate further (e.g. setup, inputs, "
+                    "dividend modelling).\n"
+                )
+
+        return {
+            "empirical_order": p,
+            "r2": r2,
+            "predicted_error_at_N_fa": predicted_error,
+            "reference_value": ref_val,
+            "N_ref": N_ref,
+            "N_fa": N_fa,
+            "fa_value": fa_val,
+            "observed_diff": obs_diff,
+        }
