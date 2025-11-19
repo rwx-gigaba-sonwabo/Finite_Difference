@@ -1032,3 +1032,159 @@ diag = pricer.fa_vs_validation_vega_diagnostic(
 
 # If you want to log or use diag further:
 print("Summary dict:", diag)
+
+    def _greek_at(self, greek_name: str, N: int) -> float:
+        """
+        Convenience helper: return a single Greek for a given number
+        of time steps N, using the *same* calculate_greeks routine
+        you use everywhere else.
+
+        greek_name examples: "Delta", "Gamma", "Vega", "Theta (Annual)", etc.
+        """
+        greeks = self._clone().calculate_greeks(N)
+        try:
+            return float(greeks[greek_name])
+        except KeyError:
+            raise KeyError(f"Greek '{greek_name}' not found in calculate_greeks output: {list(greeks.keys())}")
+        
+    def greek_order_of_accuracy(
+        self,
+        greek_name: str,
+        time_steps_list,
+        fa_time_steps: int,
+        fa_value: float,
+        ref_time_steps: int = None,
+    ) -> dict:
+        """
+        Estimate the empirical order of accuracy for a Greek with respect to
+        time step size (Crank–Nicolson is theoretically O(dt^2) in time).
+
+        Parameters
+        ----------
+        greek_name : str
+            Name of the Greek in calculate_greeks output, e.g. "Vega".
+        time_steps_list : sequence[int]
+            List of N values (time steps) to test, e.g. [30, 60, 120, 240, 480].
+            Must contain at least 3 distinct values.
+        fa_time_steps : int
+            Number of time steps used in Front Arena (e.g. 30).
+        fa_value : float
+            The Front Arena value for this Greek with fa_time_steps.
+        ref_time_steps : int, optional
+            The "reference" (finest) grid. If None, uses max(time_steps_list).
+
+        Returns
+        -------
+        dict with keys:
+            - 'empirical_order'
+            - 'r2'
+            - 'reference_value'
+            - 'N_ref'
+            - 'fa_value'
+            - 'N_fa'
+            - 'observed_diff'
+            - 'predicted_error_at_N_fa'
+        """
+        import numpy as np
+
+        # Ensure unique, sorted
+        Ns = sorted(set(int(n) for n in time_steps_list))
+        if len(Ns) < 3:
+            raise ValueError("Need at least 3 distinct time-steps to estimate order of accuracy.")
+
+        T = float(self.time_to_discount)
+        if T <= 0.0:
+            raise ValueError("time_to_discount must be positive for order-of-accuracy diagnostic.")
+
+        # Reference grid
+        if ref_time_steps is None:
+            N_ref = max(Ns)
+        else:
+            N_ref = int(ref_time_steps)
+            if N_ref not in Ns:
+                Ns.append(N_ref)
+                Ns = sorted(set(Ns))
+
+        # Reference Greek = value at finest grid using the SAME routine
+        g_ref = self._greek_at(greek_name, N_ref)
+
+        # Build (dt, error) pairs
+        dts = []
+        errors = []
+        for N in Ns:
+            dt = T / float(N)
+            gN = self._greek_at(greek_name, N)
+            err = abs(gN - g_ref)
+            if err <= 0.0:
+                # avoid log(0): treat as very small but non-zero
+                err = 1e-16
+            dts.append(dt)
+            errors.append(err)
+
+        # log–log regression: log(err) = log(C) + p*log(dt)
+        log_dt = np.log(dts)
+        log_err = np.log(errors)
+        p, logC = np.polyfit(log_dt, log_err, 1)   # p ~ theoretical order (negative!)
+        C = np.exp(logC)
+
+        # empirical order should be -p because err ≈ C * dt^p with p < 0
+        empirical_order = -p
+
+        # R^2 of the regression as sanity check
+        ss_tot = np.sum((log_err - log_err.mean()) ** 2)
+        ss_res = np.sum((log_err - (p * log_dt + logC)) ** 2)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+
+        # Predicted truncation error at Front Arena grid
+        dt_fa = T / float(fa_time_steps)
+        predicted_err_fa = C * (dt_fa ** (-empirical_order))  # C * dt^p, with p = -empirical_order
+
+        # Observed FA vs validation difference at N_fa
+        g_fa_model = self._greek_at(greek_name, fa_time_steps)
+        observed_diff = abs(g_fa_model - fa_value)
+
+        summary = {
+            "empirical_order": float(empirical_order),
+            "r2": float(r2),
+            "reference_value": float(g_ref),
+            "N_ref": int(N_ref),
+            "fa_value": float(fa_value),
+            "N_fa": int(fa_time_steps),
+            "model_value_at_N_fa": float(g_fa_model),
+            "observed_diff": float(observed_diff),
+            "predicted_error_at_N_fa": float(predicted_err_fa),
+        }
+
+        # Nice textual printout so you can see it in the console
+        print("\n=== FD ORDER-OF-ACCURACY DIAGNOSTIC ===")
+        print(f"Quantity       : {greek_name}")
+        print(f"Empirical p    : {empirical_order:.3f}")
+        print(f"R^2 (fit)      : {r2:.3f}")
+        print(f"Reference N    : {N_ref}, {greek_name} = {g_ref:.8f}")
+        print(f"FA N           : {fa_time_steps}, FA {greek_name} = {fa_value:.8f}")
+        print(f"Model {greek_name} at N_FA: {g_fa_model:.8f}")
+        print(f"Predicted FD truncation error at N={fa_time_steps}: {predicted_err_fa:.8f}")
+        print(f"Observed |model(N_FA) - FA|: {observed_diff:.8f}")
+
+        if observed_diff <= predicted_err_fa:
+            print("Conclusion     : The discrepancy is CONSISTENT with FD truncation error.")
+        else:
+            print("Conclusion     : The discrepancy EXCEEDS expected FD truncation error; "
+                  "dividend modelling / early exercise handling / bump size etc. may also contribute.")
+
+        print("========================================\n")
+
+        return summary
+    
+
+time_steps_list = [30, 60, 120, 240, 480]
+fa_time_steps = 30
+fa_vega = 0.3375675  # <-- the vega read from Front Arena for this trade
+
+summary = pricer.greek_order_of_accuracy(
+    greek_name="Vega",
+    time_steps_list=time_steps_list,
+    fa_time_steps=fa_time_steps,
+    fa_value=fa_vega,
+    ref_time_steps=480,   # optional, but explicit
+)
