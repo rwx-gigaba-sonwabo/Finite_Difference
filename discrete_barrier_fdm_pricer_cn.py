@@ -635,3 +635,145 @@ class DiscreteBarrierCrankNicolsonLog:
             return {k: g_van[k] - g_ko[k] for k in g_van}
 
         raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
+    
+    def _grid_sizes_for(self, N_time: int) -> Tuple[float, float, int]:
+        """
+        Return (dt, dx, M_price) for a given number of time steps N_time.
+
+        dt  : time step size in years
+        dx  : log-price step size (Δlog S)
+        M_price : number of price steps produced by _xgrid_for
+        """
+        # This calls your existing FIS-style grid chooser
+        M_price = self._xgrid_for(N_time)
+
+        # Horizon and log-domain width (already used in your code)
+        T_disc = self.time_to_discount          # time to discount in years
+        L = self._domain_width_L()              # total log-width of the domain
+
+        if N_time <= 0:
+            raise ValueError("N_time must be positive.")
+
+        dt = T_disc / float(N_time)
+        dx = L / float(M_price)
+
+        return dt, dx, M_price
+    
+    def _quantity_on_grid(self, quantity: str, N_time: int) -> float:
+        """
+        Compute price or a Greek on a grid with N_time time steps.
+
+        quantity:
+            'price', 'delta', 'gamma', 'vega', 'theta_annual', 'theta_daily'
+        """
+        quantity = quantity.lower()
+
+        if quantity == "price":
+            # Use your existing one-shot pricing (no Richardson)
+            return float(self._price_once(N_time))
+
+        # Greeks: use existing bump-and-revalue routine
+        greeks = self.calculate_greeks(N_time)
+
+        if quantity == "delta":
+            return float(greeks["Delta"])
+        elif quantity == "gamma":
+            return float(greeks["Gamma"])
+        elif quantity == "vega":
+            return float(greeks["Vega"])
+        elif quantity in ("theta", "theta_annual"):
+            return float(greeks["Theta (Annual)"])
+        elif quantity in ("theta_daily", "theta_per_day"):
+            return float(greeks["Theta (Daily)"])
+        else:
+            raise ValueError(f"Unknown quantity '{quantity}'.")
+
+    def diagnose_order_of_accuracy(
+        self,
+        quantity: str = "vega",
+        base_time_steps: int = 50,
+        refinements: int = 3,
+    ) -> Dict[str, object]:
+        """
+        Empirically estimate the convergence order for a given quantity
+        (price or Greek) by refining the time grid.
+
+        Parameters
+        ----------
+        quantity : str
+            'price', 'delta', 'gamma', 'vega', 'theta_annual', 'theta_daily'.
+        base_time_steps : int
+            Coarsest number of time steps N0.
+        refinements : int
+            How many times to double N0, i.e. we use
+            N = [N0, 2*N0, 4*N0, ..., 2^refinements * N0].
+
+        Returns
+        -------
+        dict with keys:
+            'quantity'         : name of the quantity
+            'N_time_list'      : list of N_time values
+            'dt_list'          : list of Δt for each N_time
+            'dx_list'          : list of Δx = Δlog(S) for each N_time
+            'values'           : approximations on each grid
+            'errors_vs_finest' : |v(N) - v(N_max)| for each N
+            'local_orders'     : estimated order between grid levels
+            'global_order'     : overall order (median of local_orders)
+        """
+        if base_time_steps <= 0:
+            raise ValueError("base_time_steps must be positive.")
+        if refinements < 1:
+            raise ValueError("refinements must be at least 1.")
+
+        # Build refinement ladder
+        N_time_list: List[int] = [base_time_steps * (2 ** k) for k in range(refinements + 1)]
+
+        # Compute approximations and grid sizes
+        values: List[float] = []
+        dt_list: List[float] = []
+        dx_list: List[float] = []
+
+        for N in N_time_list:
+            dt, dx, _ = self._grid_sizes_for(N)
+            dt_list.append(dt)
+            dx_list.append(dx)
+            values.append(self._quantity_on_grid(quantity, N))
+
+        # Treat the finest grid as "reference" solution
+        v_ref = values[-1]
+
+        # Errors for each N vs finest grid
+        errors: List[float] = [abs(v - v_ref) for v in values]
+
+        # Local order estimates between refinement levels
+        local_orders: List[float] = []
+        for k in range(len(N_time_list) - 2):
+            e_k = errors[k]
+            e_k1 = errors[k + 1]
+            # Avoid log of zero – if errors are identical or zero, skip
+            if e_k > 0.0 and e_k1 > 0.0 and e_k != e_k1:
+                p_k = log(e_k / e_k1) / log(2.0)
+                local_orders.append(p_k)
+
+        global_order = float("nan")
+        if local_orders:
+            # Robust central tendency – median rather than mean
+            local_orders_sorted = sorted(local_orders)
+            mid = len(local_orders_sorted) // 2
+            if len(local_orders_sorted) % 2 == 1:
+                global_order = local_orders_sorted[mid]
+            else:
+                global_order = 0.5 * (local_orders_sorted[mid - 1] + local_orders_sorted[mid])
+
+        result = {
+            "quantity": quantity,
+            "N_time_list": N_time_list,
+            "dt_list": dt_list,
+            "dx_list": dx_list,
+            "values": values,
+            "errors_vs_finest": errors,
+            "local_orders": local_orders,
+            "global_order": global_order,
+        }
+
+        return result
