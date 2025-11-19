@@ -1015,3 +1015,20 @@ delta_diag = pricer.diagnose_order_of_accuracy("delta", base_time_steps=40, refi
             "fa_value": fa_val,
             "observed_diff": obs_diff,
         }
+        
+        # 2. Grid sizes to probe your solver's behaviour
+time_steps_list = [30, 60, 120, 240, 480]
+
+# 3. Front Arena's Vega for this trade (from FA report)
+vega_fa = -18.120345  # example – plug in the real value
+
+# 4. Run full diagnostic (for Vega)
+diag = pricer.fa_vs_validation_vega_diagnostic(
+    time_steps_list=time_steps_list,
+    N_fa=30,          # FA-like time steps
+    vega_fa=vega_fa,  # FA's reported vega
+    greek="vega",
+)
+
+# If you want to log or use diag further:
+print("Summary dict:", diag)
