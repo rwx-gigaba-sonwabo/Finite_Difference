@@ -1188,3 +1188,174 @@ summary = pricer.greek_order_of_accuracy(
     fa_value=fa_vega,
     ref_time_steps=480,   # optional, but explicit
 )
+
+    def fd_order_accuracy_diagnostic(
+        self,
+        quantity: str = "vega",
+        N_list=None,
+        N_ref: int = 500,
+        N_fa: int = 30,
+        fa_value: float | None = None,
+        min_error: float = 1e-10,
+        verbose: bool = True,
+    ):
+        """
+        Diagnose empirical FD order-of-accuracy for a given quantity (price or greek).
+
+        Parameters
+        ----------
+        quantity : {"price","delta","gamma","vega","theta"}
+            Which output to analyse.
+        N_list : list[int] or None
+            Time-step counts to include in the fit. If None, a default list is used.
+        N_ref : int
+            Reference (very fine) number of time steps used to approximate "true" value.
+        N_fa : int
+            Number of time steps used by Front Arena (for error-at-FA prediction).
+        fa_value : float or None
+            Front Arena value for the same trade & quantity. If provided, the function
+            compares predicted FD truncation error at N_fa to the observed FA-vs-validation
+            difference.
+        min_error : float
+            Minimum error magnitude kept in the regression (filters numerical noise).
+        verbose : bool
+            If True, prints a human-readable summary.
+
+        Returns
+        -------
+        dict
+            {
+              "empirical_order": p,
+              "r2": r2,
+              "reference_value": ref_val,
+              "N_ref": N_ref,
+              "predicted_error_at_N_fa": pred_err_fa or None,
+              "N_fa": N_fa,
+              "fa_value": fa_value,
+              "observed_fa_vs_ref": obs_diff or None,
+            }
+        """
+        # ---------- helpers to get quantity for a given N ----------
+        def _get_quantity_at_N(N: int) -> float:
+            if quantity.lower() == "price":
+                return float(self.price_once(N))
+            else:
+                greeks = self.calculate_greeks(N)
+                key_map = {
+                    "delta": "Delta",
+                    "gamma": "Gamma",
+                    "vega": "Vega",
+                    "theta": "Theta (Annual)",
+                    "theta_daily": "Theta (Daily)",
+                }
+                try:
+                    return float(greeks[key_map[quantity.lower()]])
+                except KeyError:
+                    raise ValueError(f"Unsupported quantity '{quantity}'")
+
+        # ---------- choose N grid ----------
+        if N_list is None:
+            # you can tune this list as you wish
+            N_list = [30, 60, 120, 240, 480]
+
+        # make sure everything is int and sorted
+        N_list = sorted(int(N) for N in N_list)
+
+        # ---------- reference value ----------
+        ref_val = _get_quantity_at_N(int(N_ref))
+
+        # we need the time horizon corresponding to self.time_to_discount
+        # (same T used in your CN scheme)
+        T_disc = float(self.time_to_discount)
+        if T_disc <= 0.0:
+            raise ValueError("time_to_discount must be > 0 for FD diagnostic.")
+
+        # ---------- build (dt, error) data ----------
+        dt_list = []
+        err_list = []
+        N_used = []
+
+        for N in N_list:
+            val_N = _get_quantity_at_N(N)
+            err = abs(val_N - ref_val)
+            if err >= min_error:
+                dt = T_disc / float(N)
+                dt_list.append(dt)
+                err_list.append(err)
+                N_used.append(N)
+
+        if len(err_list) < 2:
+            raise RuntimeError(
+                "Not enough meaningful error points for regression "
+                f"(got {len(err_list)}; try different N_list or min_error)."
+            )
+
+        dt_arr = np.array(dt_list, dtype=float)
+        err_arr = np.array(err_list, dtype=float)
+
+        # ---------- regress log(error) on log(dt) ----------
+        log_dt = np.log(dt_arr)
+        log_err = np.log(err_arr)
+
+        A = np.vstack([log_dt, np.ones_like(log_dt)]).T
+        slope, intercept = np.linalg.lstsq(A, log_err, rcond=None)[0]
+
+        # Here slope IS p because error ~ C * dt^p
+        p_empirical = float(slope)
+
+        # ---------- goodness of fit (R^2) ----------
+        log_err_pred = slope * log_dt + intercept
+        ss_res = float(np.sum((log_err - log_err_pred) ** 2))
+        ss_tot = float(np.sum((log_err - np.mean(log_err)) ** 2))
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0.0 else float("nan")
+
+        # ---------- predicted error at N_fa ----------
+        pred_err_fa = None
+        obs_diff = None
+
+        if N_fa is not None:
+            dt_fa = T_disc / float(N_fa)
+            C_hat = float(np.exp(intercept))
+            pred_err_fa = C_hat * (dt_fa ** p_empirical)
+
+            if fa_value is not None:
+                # compare FA value to reference (very fine grid) value
+                obs_diff = abs(float(fa_value) - ref_val)
+
+        result = {
+            "empirical_order": p_empirical,
+            "r2": r2,
+            "reference_value": ref_val,
+            "N_ref": int(N_ref),
+            "N_used": N_used,
+            "predicted_error_at_N_fa": pred_err_fa,
+            "N_fa": int(N_fa) if N_fa is not None else None,
+            "fa_value": float(fa_value) if fa_value is not None else None,
+            "observed_fa_vs_ref": obs_diff,
+        }
+
+        if verbose:
+            print("=== FD ORDER-OF-ACCURACY DIAGNOSTIC ===")
+            print(f"Quantity       : {quantity}")
+            print(f"Empirical p    : {p_empirical:.3f}")
+            print(f"R^2 (fit)      : {r2:.3f}")
+            print(f"Reference N    : {N_ref}, value = {ref_val:.9f}")
+            print(f"Ns used        : {N_used}")
+
+            if pred_err_fa is not None and fa_value is not None:
+                print(f"\nPredicted FD truncation error at N={N_fa}: {pred_err_fa:.9f}")
+                print(f"Observed |FA - ref| difference         : {obs_diff:.9f}")
+                if obs_diff <= 1.5 * pred_err_fa:
+                    print(
+                        "Conclusion  : The discrepancy is CONSISTENT with FD truncation error."
+                    )
+                else:
+                    print(
+                        "Conclusion  : The discrepancy EXCEEDS the expected FD truncation "
+                        "error; investigate other causes (e.g. setup, dividends, parity)."
+                    )
+            elif pred_err_fa is not None:
+                print(f"\nPredicted FD truncation error at N={N_fa}: {pred_err_fa:.9f}")
+            print("========================================")
+
+        return result
