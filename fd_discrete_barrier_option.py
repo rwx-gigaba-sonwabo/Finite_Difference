@@ -421,3 +421,393 @@ class DiscreteBarrierCrankNicolsonLog:
             key: g_van[key] - g_ko[key]
             for key in g_van.keys()
         }
+
+    # --------------------------------------------------------------------
+# 1) Single CN / BE subinterval with optional Rannacher
+# --------------------------------------------------------------------
+def _cn_subinterval_log(
+    self,
+    s_nodes: List[float],
+    V: List[float],
+    t_left: float,
+    t_right: float,
+    theta: float,
+) -> Tuple[List[float], float]:
+    """
+    March one time subinterval [t_left, t_right] in log(S) using a
+    theta-scheme (theta=0.5 => Crank–Nicolson, theta=1.0 => fully implicit BE).
+
+    Returns:
+        V_new : option values at t_left
+        dt    : time step length (t_right - t_left) in YEARS
+    """
+    # Time step size in calendar years
+    dt = t_right - t_left
+    if dt <= 0.0:
+        raise ValueError("Non-positive dt in _cn_subinterval_log")
+
+    self.configure_grid()         # ensures self.num_space_nodes etc
+    dx = self._build_log_grid()   # also stores self.s_nodes
+
+    N  = self.num_space_nodes
+    sig2 = self.sigma * self.sigma
+    r   = self.discount_rate_nacc
+    b   = self.carry_rate_nacc    # includes any effective dividend
+
+    # Drift term in log-space
+    mu_x = (b - 0.5 * sig2)
+
+    # Operator coefficients in log-space:
+    # V_t = L V  with
+    # L V = 0.5 * sig2 * V_xx + mu_x * V_x - r * V
+    alpha = 0.5 * sig2 / (dx * dx)
+    beta  = 0.5 * mu_x / dx
+
+    # Build tri-diagonal system matrices for theta-scheme:
+    # (I + theta * dt * L) V^{n+1} = (I - (1 - theta) * dt * L) V^{n}
+    a_co = alpha - beta      # coeff for V_{j-1}
+    c_co = alpha + beta      # coeff for V_{j+1}
+    b_co = -2.0 * alpha - r  # coeff for V_j
+
+    # Left-hand and right-hand diagonals
+    A_L = [0.0] * N
+    A_C = [0.0] * N
+    A_U = [0.0] * N
+
+    B_L = [0.0] * N
+    B_C = [0.0] * N
+    B_U = [0.0] * N
+
+    for j in range(1, N - 1):
+        A_L[j] = -theta * dt * a_co
+        A_C[j] = 1.0 - theta * dt * b_co
+        A_U[j] = -theta * dt * c_co
+
+        B_L[j] = (1.0 + (1.0 - theta) * dt * a_co)
+        B_C[j] = (1.0 + (1.0 - theta) * dt * b_co)
+        B_U[j] = (1.0 + (1.0 - theta) * dt * c_co)
+
+    # Boundary rows will be replaced by Dirichlet boundary conditions below
+    # so we don't bother to fill them fully here.
+
+    # Apply theta-scheme for interior nodes j = 1..N-2
+    rhs = [0.0] * N
+    for j in range(1, N - 1):
+        rhs[j] = (
+            B_L[j] * V[j - 1]
+            + B_C[j] * V[j]
+            + B_U[j] * V[j + 1]
+        )
+
+    # Boundary values at time t_right (Dirichlet)
+    V_min_next, V_max_next = self._boundary_values(t_right)
+
+    # Impose boundary conditions in RHS
+    rhs[1]   -= A_L[1] * V_min_next
+    rhs[N-2] -= A_U[N-2] * V_max_next
+
+    # Fill tri-diagonal diagonal vectors for solver
+    diag  = [0.0] * N
+    lower = [0.0] * N
+    upper = [0.0] * N
+
+    for j in range(1, N - 1):
+        lower[j] = A_L[j]
+        diag[j]  = A_C[j]
+        upper[j] = A_U[j]
+
+    # Boundary rows: fix value = boundary
+    diag[0] = diag[N - 1] = 1.0
+    rhs[0]  = V_min_next
+    rhs[N-1] = V_max_next
+
+    # Solve tri-diagonal system (Thomas algorithm)
+    V_new = self._solve_tridiagonal_system(lower, diag, upper, rhs)
+
+    return V_new, dt
+
+# --------------------------------------------------------------------
+# 2) Backward time-march with monitoring + Rannacher
+# --------------------------------------------------------------------
+def _run_backward(
+    self,
+    s_nodes: List[float],
+    apply_barrier: bool,
+) -> Tuple[List[float], float, List[float]]:
+    """
+    March option values backward in time from T to 0 in log(S).
+
+    - Time is partitioned into intervals [t_{k-1}, t_k] that match the
+      monitoring dates in self.monitor_times (in YEARS from carry start).
+    - Within each interval we use a theta-scheme:
+        * For the first `self.rannacher_steps` *global* steps we use
+          BE (theta=1.0)  -> Rannacher smoothing.
+        * Thereafter we use CN (theta=0.5).
+    - At the end of any interval whose right end is a monitoring date,
+      we apply KO projection if `apply_barrier=True`.
+
+    Returns
+    -------
+    V_out            : option values at t=0
+    dt_last_global   : last time step size used (for diagnostics)
+    monitors_applied : list of monitoring times where KO was projected
+    """
+    # Start from terminal payoff at t = T
+    V = self._terminal_payoff()
+    monitors_applied: List[float] = []
+
+    # Basic checks
+    if not self.monitor_times:
+        raise ValueError("monitor_times must contain at least the expiry time.")
+
+    # Determine number of CN/BE steps per interval
+    subcounts = self._time_subgrid_counts()   # len == len(monitor_times)
+    if len(subcounts) != len(self.monitor_times):
+        raise ValueError("subcounts and monitor_times length mismatch.")
+
+    # Rannacher: number of *global* steps to do with BE
+    rannacher_left = getattr(self, "rannacher_steps", 2)
+    dt_last_global: Optional[float] = None
+
+    # March intervals backwards: [t_{k-1}, t_k], k = n..1
+    n_int = len(self.monitor_times)
+    for k in range(n_int - 1, -1, -1):
+        t_right = self.monitor_times[k]
+        t_left  = self.monitor_times[k - 1] if k > 0 else 0.0
+
+        # Subdivide this interval into subcounts[k] substeps
+        m_steps = subcounts[k]
+        if m_steps <= 0:
+            continue
+
+        dt_local = (t_right - t_left) / float(m_steps)
+        # march subintervals: t_right -> t_left
+        t_hi = t_right
+        for m in range(m_steps):
+            t_lo = t_hi - dt_local
+
+            # Rannacher: first rannacher_left global steps use BE (theta=1.0)
+            if rannacher_left > 0:
+                theta = 1.0
+                rannacher_left -= 1
+            else:
+                theta = 0.5  # standard Crank–Nicolson
+
+            V, dt_used = self._cn_subinterval_log(
+                s_nodes=s_nodes,
+                V=V,
+                t_left=t_lo,
+                t_right=t_hi,
+                theta=theta,
+            )
+            dt_last_global = dt_used
+            t_hi = t_lo
+
+        # After completing this interval, apply KO at t = t_left if it
+        # is a monitoring date and KO is requested.
+        if apply_barrier:
+            # By construction t_left equals the monitoring date
+            # (monitor_times[k-1] or 0.0 for k=0)
+            tau_here = t_left
+            V = self._apply_KO_projection_log(V, s_nodes, tau_here)
+            monitors_applied.append(tau_here)
+
+    # When done, V is at t = 0
+    return V, (dt_last_global if dt_last_global is not None else dt_local), monitors_applied
+
+# --------------------------------------------------------------------
+# 3) Black-76 Greeks via finite differences (no barrier)
+# --------------------------------------------------------------------
+def _vanilla_black76_greeks_fd(
+    self,
+    dS: float = 0.0001,
+    dSigma: float = 0.0001,
+    dT: float = 0.0001,
+) -> Dict[str, float]:
+    """
+    Finite-difference Greeks for the vanilla Black-76 price.
+
+    All bumps are ABSOLUTE bumps:
+        dS      : absolute spot bump
+        dSigma  : absolute vol bump (0.0001 ~ 1bp of vol)
+        dT      : absolute time bump in YEARS
+
+    Returns a dict with 'delta', 'gamma', 'vega', 'theta'.
+    """
+    S0     = self.spot
+    sigma0 = self.sigma
+    T0     = self.time_to_expiry
+
+    # Base price
+    p0 = self._vanilla_black76_price(S=S0, sigma=sigma0, T=T0)
+
+    # --- Delta & Gamma (bump in spot) ---
+    S_up  = S0 + dS
+    S_dn  = max(1e-12, S0 - dS)
+    p_up  = self._vanilla_black76_price(S=S_up, sigma=sigma0, T=T0)
+    p_dn  = self._vanilla_black76_price(S=S_dn, sigma=sigma0, T=T0)
+
+    delta = (p_up - p_dn) / (2.0 * dS)
+    gamma = (p_up - 2.0 * p0 + p_dn) / (dS * dS)
+
+    # --- Vega (central bump in sigma) ---
+    sig_up = sigma0 + dSigma
+    sig_dn = max(1e-12, sigma0 - dSigma)
+    p_vu   = self._vanilla_black76_price(S=S0, sigma=sig_up, T=T0)
+    p_vd   = self._vanilla_black76_price(S=S0, sigma=sig_dn, T=T0)
+    vega   = (p_vu - p_vd) / (2.0 * dSigma)
+
+    # --- Theta (central bump in time-to-expiry) ---
+    T_up = max(0.0, T0 - dT)      # d/dt with calendar time, so minus on T
+    T_dn = T0 + dT
+    p_tu = self._vanilla_black76_price(S=S0, sigma=sigma0, T=T_up)
+    p_td = self._vanilla_black76_price(S=S0, sigma=sigma0, T=T_dn)
+    theta = (p_tu - p_td) / (2.0 * dT)
+
+    return {
+        "delta": delta,
+        "gamma": gamma,
+        "vega": vega,
+        "theta": theta,
+    }
+
+# --------------------------------------------------------------------
+# 4) PDE price + Greeks with KO (CN + Rannacher)
+# --------------------------------------------------------------------
+def _pde_price_and_greeks(
+    self,
+    apply_KO: bool,
+    dSigma: float = 0.0001,
+) -> Dict[str, float]:
+    """
+    Price + Greeks from the CN PDE engine for the current barrier type.
+
+    If apply_KO is True, KO projection is applied at each monitoring date.
+    Greeks:
+        - Delta, Gamma from the grid around S0 (non-uniform central diff).
+        - Vega from CENTRAL bump in sigma (two PDE runs).
+        - Theta from PDE time-derivative formula.
+    """
+    # Base grid solution
+    V_grid, _, _ = self._run_backward(self.s_nodes, apply_barrier=apply_KO)
+    price = self._interp_price(V_grid)
+
+    # Delta & Gamma from grid
+    delta, gamma = self._delta_gamma_from_grid(V_grid)
+
+    # Theta from PDE identity: V_t = L V
+    S0    = self.spot
+    sigma = self.sigma
+    r     = self.discount_rate_nacc
+    b     = self.carry_rate_nacc
+
+    theta = 0.5 * sigma * sigma * S0 * S0 * gamma \
+            + (b - 0.0 * sigma * sigma) * S0 * delta \
+            - r * price
+
+    # Vega via central bump in sigma (CN engine)
+    sig_up = sigma + dSigma
+    sig_dn = max(1e-12, sigma - dSigma)
+
+    # up
+    sigma_saved = self.sigma
+    self.sigma  = sig_up
+    V_up, _, _  = self._run_backward(self.s_nodes, apply_barrier=apply_KO)
+    p_up        = self._interp_price(V_up)
+
+    # down
+    self.sigma  = sig_dn
+    V_dn, _, _  = self._run_backward(self.s_nodes, apply_barrier=apply_KO)
+    p_dn        = self._interp_price(V_dn)
+
+    # restore
+    self.sigma  = sigma_saved
+
+    vega = (p_up - p_dn) / (2.0 * dSigma)
+
+    return {
+        "price": price,
+        "delta": delta,
+        "gamma": gamma,
+        "vega": vega,
+        "theta": theta,
+    }
+
+# --------------------------------------------------------------------
+# 5) Public price() using parity for KI
+# --------------------------------------------------------------------
+def price_log2(self) -> float:
+    """
+    Barrier price in log-space:
+
+    - If barrier_type is 'none': vanilla Black-76.
+    - If KO ('down-and-out', 'up-and-out'): CN PDE with KO projection.
+    - If KI ('down-and-in', 'up-and-in'): vanilla - KO price (parity).
+    """
+    bt = self.barrier_type.lower()
+
+    # Vanilla (no barrier)
+    if bt == "none":
+        return self._vanilla_black76_price()
+
+    # Knock-out
+    if bt in ("down-and-out", "up-and-out"):
+        out = self._pde_price_and_greeks(apply_KO=True)
+        return out["price"]
+
+    # Knock-in via parity
+    if bt in ("down-and-in", "up-and-in"):
+        # Save original barrier type
+        original_bt = bt
+
+        # Vanilla leg
+        p_van = self._vanilla_black76_price()
+
+        # Matching KO type
+        self.barrier_type = "down-and-out" if bt == "down-and-in" else "up-and-out"
+        p_ko = self._pde_price_and_greeks(apply_KO=True)["price"]
+
+        # Restore
+        self.barrier_type = original_bt
+
+        return p_van - p_ko
+
+    raise ValueError(f"Unsupported barrier type: {bt}")
+
+# --------------------------------------------------------------------
+# 6) Public Greeks with parity for KI
+# --------------------------------------------------------------------
+def greeks_log2(self, dSigma: float = 0.0001) -> Dict[str, float]:
+    """
+    Greeks consistent with pricing:
+
+    - Vanilla: Black-76 FD Greeks.
+    - KO: CN PDE Greeks with KO projection.
+    - KI: vanilla Greeks - KO Greeks (parity).
+    """
+    bt = self.barrier_type.lower()
+
+    # Vanilla
+    if bt == "none":
+        return self._vanilla_black76_greeks_fd()
+
+    # KO
+    if bt in ("down-and-out", "up-and-out"):
+        return self._pde_price_and_greeks(apply_KO=True, dSigma=dSigma)
+
+    # KI = vanilla - KO
+    if bt in ("down-and-in", "up-and-in"):
+        original_bt = bt
+
+        g_van = self._vanilla_black76_greeks_fd()
+
+        self.barrier_type = "down-and-out" if bt == "down-and-in" else "up-and-out"
+        g_ko  = self._pde_price_and_greeks(apply_KO=True, dSigma=dSigma)
+
+        self.barrier_type = original_bt
+
+        return {
+            k: g_van[k] - g_ko[k] for k in g_van.keys()
+        }
+
+    raise ValueError(f"Unsupported barrier type: {bt}")
