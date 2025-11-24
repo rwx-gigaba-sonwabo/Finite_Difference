@@ -811,3 +811,97 @@ def greeks_log2(self, dSigma: float = 0.0001) -> Dict[str, float]:
         }
 
     raise ValueError(f"Unsupported barrier type: {bt}")
+
+# --------------------------------------------------------------------
+# KO PROJECTION IN LOG-SPACE
+# --------------------------------------------------------------------
+def _apply_KO_projection_log(
+    self,
+    V: List[float],
+    s_nodes: List[float],
+    tau: float
+) -> List[float]:
+    """
+    Apply knock-out (KO) projection to the grid values V at a monitoring time.
+
+    Parameters
+    ----------
+    V : List[float]
+        Option values on the grid BEFORE KO projection.
+    s_nodes : List[float]
+        Log-space grid mapped to spot prices.
+    tau : float
+        Calendar time (years from carry start) at which monitoring occurs.
+
+    Behavior
+    --------
+    If the barrier is of type:
+        - down-and-out:   KO if S <= barrier_level
+        - up-and-out:     KO if S >= barrier_level
+        - double-out:     KO if S <= lower or S >= upper
+    Otherwise (vanilla, knock-in): return V unchanged.
+
+    Notes
+    -----
+    - Projection occurs ONLY at monitoring dates.
+    - KO sets the option value to rebate discounted from carry end,
+      if rebate_at_hit=True OR rebate amount is defined.
+    - If no rebate, KO → value = 0.
+    """
+    bt = self.barrier_type.lower()
+
+    # Vanilla or knock-in = no KO projection
+    if bt in ("none", "down-and-in", "up-and-in"):
+        return V
+
+    N = len(s_nodes)
+    barrier = self.barrier_level
+    rebate  = self.rebate_amount
+    have_rebate = (rebate is not None and rebate > 0.0)
+
+    # Discount rebate from carry end back to time tau
+    if have_rebate:
+        df = math.exp(-self.discount_rate_nacc * (self.time_to_carry - tau))
+        rebate_value = rebate * df
+    else:
+        rebate_value = 0.0
+
+    # Prepare new array
+    V_new = V[:]
+
+    # -----------------------------
+    # DOWN-AND-OUT
+    # -----------------------------
+    if bt == "down-and-out":
+        for j, S in enumerate(s_nodes):
+            if S <= barrier:
+                V_new[j] = rebate_value
+
+    # -----------------------------
+    # UP-AND-OUT
+    # -----------------------------
+    elif bt == "up-and-out":
+        for j, S in enumerate(s_nodes):
+            if S >= barrier:
+                V_new[j] = rebate_value
+
+    # -----------------------------
+    # DOUBLE-OUT
+    # -----------------------------
+    elif bt == "double-out":
+        lower = self.lower_barrier
+        upper = self.upper_barrier
+        for j, S in enumerate(s_nodes):
+            if S <= lower or S >= upper:
+                V_new[j] = rebate_value
+
+    # Any other case → return unchanged
+    else:
+        return V
+
+    # Track which monitoring times applied KO (for validation reporting)
+    if not hasattr(self, "_ko_monitor_times"):
+        self._ko_monitor_times = []
+    self._ko_monitor_times.append(tau)
+
+    return V_new
