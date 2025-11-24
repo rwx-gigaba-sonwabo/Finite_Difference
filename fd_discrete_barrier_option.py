@@ -905,3 +905,103 @@ def _apply_KO_projection_log(
     self._ko_monitor_times.append(tau)
 
     return V_new
+
+class DiscreteBarrierFDMPricer:
+    ...
+
+    def _solve_grid(self, apply_KO: bool) -> List[float]:
+        """
+        Solve dV/dt = L V with L from Black–Scholes in log S using a
+        θ–scheme in time (Rannacher + Crank–Nicolson) and uniform grid in log S.
+
+        - First 2 global steps: θ = 1.0 (backward Euler, Rannacher smoothing)
+        - Remaining steps:      θ = 0.5 (Crank–Nicolson)
+
+        Barrier projection is done at the scheduled monitoring times.
+        """
+
+        # --- grid / basic coefficients --------------------------------------
+        self.configure_grid()
+        dx = self._build_log_grid()
+        N = self.num_space_nodes
+        dt = self.time_to_expiry / self.num_time_steps
+
+        sig2 = self.sigma * self.sigma
+        # drift in log S under risk-neutral measure
+        mu_x = (self.carry_rate_nacc - self.discount_rate_nacc) - 0.5 * sig2
+
+        # spatial operator coefficients in log-space
+        alpha = 0.5 * sig2 / (dx * dx)        # diffusion term
+        beta_adv = mu_x / (2.0 * dx)         # advection term
+
+        a = alpha + beta_adv                 # coeff for V_{j-1}
+        c = alpha - beta_adv                 # coeff for V_{j+1}
+        b0 = -2.0 * alpha + self.discount_rate_nacc  # coeff for V_j
+
+        # which time steps are monitoring dates?
+        monitor_idx = self._monitor_indices_tau(dt)   # e.g. set of step numbers
+
+        # --- initial condition at maturity ----------------------------------
+        V = self._terminal_payoff()
+        last_dt_at_zero = None
+
+        # --- march backwards in time ----------------------------------------
+        for n in range(self.num_time_steps):
+            # time level n -> n+1 in τ (or T -> 0 in calendar time, depending on your convention)
+            t_n = n * dt
+            t_np1 = (n + 1) * dt
+
+            # 1) choose θ for this global time step
+            #    (two Rannacher steps with BE, then CN)
+            theta = 1.0 if n < 2 else 0.5
+
+            # 2) build A,V^{n+1} = B,V^{n} system for this θ
+            A_L = -theta * dt * a
+            A_C = 1.0 - theta * dt * b0
+            A_U = -theta * dt * c
+
+            B_L = (1.0 - theta) * dt * a
+            B_C = 1.0 + (1.0 - theta) * dt * b0
+            B_U = (1.0 - theta) * dt * c
+
+            # 3) boundary values for next time level (Dirichlet)
+            V_min_next, V_max_next = self._boundary_values(t_np1)
+
+            # 4) build RHS = B V^n  (interior nodes j = 1..N-2)
+            rhs = [0.0] * N
+            for j in range(1, N - 1):
+                rhs[j] = (
+                    B_L * V[j - 1] +
+                    B_C * V[j] +
+                    B_U * V[j + 1]
+                )
+
+            # add boundary contributions to RHS
+            rhs[1]  += A_L * V_min_next   # left boundary affects j=1
+            rhs[N-2] += A_U * V_max_next  # right boundary affects j=N-2
+
+            # 5) solve tridiagonal system for interior points with Thomas
+            #    we only pass interior coefficients to the solver
+            V_int = self._solve_tridiagonal_system(
+                n_unknowns=N - 2,
+                A_L=A_L, A_C=A_C, A_U=A_U,
+                rhs=[rhs[j] for j in range(1, N - 1)]
+            )
+
+            # 6) reconstruct full grid including boundaries
+            V_new = [0.0] * N
+            V_new[0] = V_min_next
+            V_new[-1] = V_max_next
+            V_new[1:-1] = V_int
+            V = V_new
+
+            # 7) apply KO projection if this step is a monitoring date
+            if apply_KO and (n + 1) in monitor_idx:
+                tau_here = t_np1
+                V = self._apply_KO_projection_log(V, self.s_nodes, tau_here)
+
+            # keep the last dt close to t=0, in case a caller wants it
+            if abs(t_np1 - self.time_to_expiry) < 1e-14:
+                last_dt_at_zero = dt
+
+        return V
