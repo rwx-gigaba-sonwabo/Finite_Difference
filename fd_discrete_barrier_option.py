@@ -1005,3 +1005,127 @@ class DiscreteBarrierFDMPricer:
                 last_dt_at_zero = dt
 
         return V
+
+def _solve_grid(self, apply_KO: bool) -> List[float]:
+    """
+    Solve dV/dt = L V with L from Black–Scholes in log S using
+    Crank–Nicolson in log-space. Marches from tau = T (terminal) to tau = 0.
+
+    Uses:
+      - self._solve_tridiagonal_system(...) for the linear system at each step
+      - Dirichlet boundaries from self._boundary_values(tau)
+      - optional KO projection at monitoring times in tau-space
+      - Rannacher smoothing: first self.rannacher_steps global steps use BE (theta = 1.0),
+        remaining steps use CN (theta = 0.5).
+
+    Returns:
+        V at tau = 0 on the log-S grid (len == self.num_space_nodes).
+    """
+
+    # --- 1) Grid + PDE coefficients -------------------------------------------------
+    self.configure_grid()
+    dx = self._build_log_grid()
+    N = self.num_space_nodes              # total nodes, indices 0 .. N-1
+    dt = self.time_to_expiry / self.num_time_steps
+
+    sig2 = self.sigma * self.sigma
+
+    # drift in log-space (you already have this in your code; keep your exact formula)
+    mu_x = self.carry_rate_naec - self.discount_rate_naec - 0.5 * sig2
+
+    # spatial operator coefficients in log S
+    alpha = 0.5 * sig2 / (dx * dx)
+    beta_adv = mu_x / (2.0 * dx)
+
+    # L V_j = a V_{j-1} + b V_j + c V_{j+1}
+    a = alpha - beta_adv               # coefficient for V_{j-1}
+    c = alpha + beta_adv               # coefficient for V_{j+1}
+    b = -2.0 * alpha - self.discount_rate_naec  # coefficient for V_j  (−r term)
+
+    # monitoring indices (in tau = k * dt space)
+    monitor_idx = self._monitor_indices_tau(dt)
+
+    # Rannacher: how many global steps to do with theta=1.0
+    rannacher_left = getattr(self, "rannacher_steps", 2)
+
+    # --- 2) Terminal condition -------------------------------------------------------
+    V = self._terminal_payoff()        # len N
+
+    # --- 3) March backwards in time --------------------------------------------------
+    # time-level index n: tau_n = (n) * dt, tau_{n+1} = (n+1)*dt
+    for n in range(self.num_time_steps - 1, -1, -1):
+        tau_next = (n + 1) * dt  # this is where V is currently known
+        tau_curr = n * dt        # we are solving for this
+
+        # choose theta (Rannacher)
+        if rannacher_left > 0:
+            theta = 1.0          # backward Euler for first few global steps
+            rannacher_left -= 1
+        else:
+            theta = 0.5          # Crank–Nicolson afterwards
+
+        # boundaries at tau_next (Dirichlet)
+        V_min_next, V_max_next = self._boundary_values(tau_next)
+
+        # --- Build tri-diagonal system A V_int^{curr} = rhs -------------------------
+        n_int = N - 2                             # number of interior nodes
+        lower_diag = [0.0] * n_int               # sub-diagonal (for rows 1..n_int-1)
+        main_diag  = [0.0] * n_int               # main diagonal
+        upper_diag = [0.0] * n_int               # super-diagonal (for rows 0..n_int-2)
+        rhs        = [0.0] * n_int
+
+        # coefficients for A and B matrices (theta-scheme)
+        # A = I - theta * dt * L
+        # B = I + (1-theta) * dt * L
+        A_l = -theta * dt * a
+        A_c = 1.0 - theta * dt * b
+        A_u = -theta * dt * c
+
+        B_l = (1.0 - theta) * dt * a
+        B_c = 1.0 + (1.0 - theta) * dt * b
+        B_u = (1.0 - theta) * dt * c
+
+        # interior nodes j = 1 .. N-2  ->  row index i = j-1
+        for j in range(1, N - 1):
+            i = j - 1
+
+            # tri-diagonal coefficients:
+            main_diag[i] = A_c
+            lower_diag[i] = A_l if i > 0 else 0.0
+            upper_diag[i] = A_u if i < n_int - 1 else 0.0
+
+            # RHS from explicit part: B * V^{next}
+            rhs[i] = (
+                B_l * V[j - 1] +
+                B_c * V[j] +
+                B_u * V[j + 1]
+            )
+
+        # add boundary contributions to RHS (Dirichlet)
+        # first interior node (j=1) is affected by left boundary
+        rhs[0]  += A_l * V_min_next
+        # last interior node (j=N-2) is affected by right boundary
+        rhs[-1] += A_u * V_max_next
+
+        # --- Solve tri-diagonal system for interior values --------------------------
+        V_int = self._solve_tridiagonal_system(
+            lower_diag=lower_diag,
+            main_diag=main_diag,
+            upper_diag=upper_diag,
+            right_hand_side=rhs,
+        )
+
+        # reconstruct full solution at tau_curr
+        V_new = [0.0] * N
+        V_new[0] = V_min_next       # left boundary in tau_curr
+        V_new[-1] = V_max_next      # right boundary in tau_curr
+        for j in range(1, N - 1):
+            V_new[j] = V_int[j - 1]
+
+        V = V_new
+
+        # --- apply discrete KO at monitoring times (if requested) -------------------
+        if apply_KO and n in monitor_idx:
+            V = self._apply_KO_projection_log(V, self.s_nodes, tau_curr)
+
+    return V
