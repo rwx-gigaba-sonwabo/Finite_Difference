@@ -1456,3 +1456,384 @@ def price_log2(self, use_richardson: bool = True) -> float:
         return p_van - p_ko
 
     raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
+
+    def solve_grid(self, apply_KO: bool) -> list[float]:
+        """
+        Solve dV/dt = L V with L from Black–Scholes in S-space using
+        Rannacher + Crank–Nicolson between monitoring dates.
+
+        This keeps the external interface identical to the original
+        `solve_grid`, but internally delegates to the theoretically
+        consistent `_run_backward` + `_cn_subinterval` engine.
+
+        Parameters
+        ----------
+        apply_KO : bool
+            If True, knock-out projection is applied at monitoring dates.
+            If False, the barrier is ignored and a vanilla grid is returned.
+
+        Returns
+        -------
+        V : list[float]
+            Option values on the spatial grid `self.s_nodes` at valuation
+            time t = 0 (time-to-expiry τ = T). This grid is then used by
+            the interpolation routines to obtain the price at S0.
+        """
+        # Ensure grid in S is configured exactly once
+        self.configure_grid()     # sets up self.s_nodes, self.num_time_steps, etc.
+
+        # Run the backward time-march between all monitoring dates.
+        V, last_dt_at_zero, monitors_applied = self._run_backward(
+            s_nodes=self.s_nodes,
+            apply_barrier=apply_KO,
+        )
+
+        # Optionally store diagnostics if you want them later
+        self._last_dt_at_zero = last_dt_at_zero
+        self._monitors_applied = monitors_applied
+
+        return V
+    
+        def vanilla_black76_price(
+        self,
+        S: Optional[float] = None,
+        sigma: Optional[float] = None,
+        T: Optional[float] = None,
+    ) -> float:
+        """
+        Standard Black–76 price using the same rates and dividend
+        treatment that the PDE uses.
+
+        We treat the option as written on a forward with:
+            F = (S_eff) * exp(carry_rate * time_to_carry)
+        discounted back with:
+            df = exp(-discount_rate * time_to_discount)
+
+        Parameters
+        ----------
+        S : optional float
+            Spot. If None, self.spot is used.
+        sigma : optional float
+            Volatility. If None, self.sigma is used.
+        T : optional float
+            Time to expiry. If None, self.time_to_expiry is used.
+
+        Returns
+        -------
+        price : float
+            Vanilla option price (no barrier).
+        """
+        S0 = self.spot if S is None else S
+        vol = self.sigma if sigma is None else sigma
+        T_exp = self.time_to_expiry if T is None else T
+
+        if T_exp <= 0.0 or vol <= 0.0:
+            # Intrinsic value fallback
+            if self.option_type.lower() == "call":
+                return max(S0 - self.strike, 0.0)
+            else:
+                return max(self.strike - S0, 0.0)
+
+        # Same carry & discount as PDE
+        r = self.discount_rate_nacc
+        b = self.carry_rate_nacc
+
+        # If you pre-compute PV of discrete dividends and subtract on the PDE,
+        # do the same here for consistency:
+        if getattr(self, "pv_divs", 0.0) != 0.0:
+            S_eff = S0 - self.pv_divs
+        else:
+            S_eff = S0
+
+        # Forward (in whatever measure is consistent with your PDE)
+        F = S_eff * math.exp(b * self.time_to_carry)
+        df = math.exp(-r * self.time_to_discount)
+
+        sqrtT = math.sqrt(T_exp)
+        sig_sqrtT = vol * sqrtT
+
+        if F <= 0.0 or sig_sqrtT <= 0.0:
+            # Degenerate: behave like forward intrinsic
+            if self.option_type.lower() == "call":
+                return df * max(F - self.strike, 0.0)
+            else:
+                return df * max(self.strike - F, 0.0)
+
+        d1 = (math.log(F / self.strike) + 0.5 * vol * vol * T_exp) / sig_sqrtT
+        d2 = d1 - sig_sqrtT
+
+        Nd1 = norm.cdf(d1)
+        Nd2 = norm.cdf(d2)
+        if self.option_type.lower() == "call":
+            price = df * (F * Nd1 - self.strike * Nd2)
+        else:
+            Nmd1 = norm.cdf(-d1)
+            Nmd2 = norm.cdf(-d2)
+            price = df * (self.strike * Nmd2 - F * Nmd1)
+
+        return float(price)
+    
+       def vanilla_black76_greeks_fd(
+        self,
+        dS: float = 0.001,
+        dSigma: float = 0.0001,   # 1bp vol
+        dT: float = 1.0 / 365.0,  # 1 calendar day in years
+    ) -> dict[str, float]:
+        """
+        Greeks from finite differences on the vanilla Black–76 price.
+
+        dS      = absolute spot bump
+        dSigma  = absolute vol bump (e.g. 0.0001 = 1bp)
+        dT      = absolute time bump in YEARS
+        """
+        S0 = self.spot
+        sig0 = self.sigma
+        T0 = self.time_to_expiry
+
+        # Base price
+        p0 = self.vanilla_black76_price(S=S0, sigma=sig0, T=T0)
+
+        # Delta & Gamma (central in S)
+        p_up = self.vanilla_black76_price(S=S0 + dS, sigma=sig0, T=T0)
+        p_dn = self.vanilla_black76_price(S=S0 - dS, sigma=sig0, T=T0)
+
+        delta = (p_up - p_dn) / (2.0 * dS)
+        gamma = (p_up - 2.0 * p0 + p_dn) / (dS ** 2)
+
+        # Vega (one-sided bump in vol, to match FA convention)
+        p_vu = self.vanilla_black76_price(S=S0, sigma=sig0 + dSigma, T=T0)
+        vega = (p_vu - p0) / (dSigma * 100.0)  # “per 1% vol” like FA
+
+        # Theta (bump T *forward* in calendar time)
+        T1 = max(T0 - dT, 0.0)
+        p_T1 = self.vanilla_black76_price(S=S0, sigma=sig0, T=T1)
+        theta_annual = (p_T1 - p0) / dT   # per year
+        theta_daily = theta_annual / 365.0
+
+        return {
+            "price": p0,
+            "delta": delta,
+            "gamma": gamma,
+            "vega": vega,
+            "theta": theta_annual,
+            "theta_daily": theta_daily,
+        }
+        
+            def _pde_price_only(
+        self,
+        n_time: int,
+        apply_KO: bool,
+        sigma: Optional[float] = None,
+    ) -> float:
+        """
+        Helper: run the PDE with a given number of time steps and,
+        optionally, a bumped volatility; return the price at S0.
+        """
+        # Save original state
+        orig_sigma = self.sigma
+        orig_N = self.num_time_steps
+
+        try:
+            if sigma is not None:
+                self.sigma = sigma
+            self.num_time_steps = n_time
+
+            V_grid = self.solve_grid(apply_KO=apply_KO)
+            price = self._interp_price_from_grid(V_grid)  # your existing interp
+        finally:
+            # Restore
+            self.sigma = orig_sigma
+            self.num_time_steps = orig_N
+
+        return price
+
+    def _pde_price_and_greeks(
+        self,
+        apply_KO: bool,
+        dv_sigma: float = 0.0001,
+        use_richardson: bool = True,
+    ) -> dict[str, float]:
+        """
+        Use the CN+Rannacher PDE engine to compute price & Greeks.
+
+        * Price, delta, gamma, theta come from the base grid.
+        * Vega uses a one-sided bump in σ (to match FA) and can
+          also benefit from Richardson extrapolation in time.
+
+        If use_richardson is True, we assume the temporal error
+        behaves like O((Δt)^2) and combine N and N/2 solutions via:
+
+            V* ≈ (4 V_N  - V_{N/2}) / 3
+        """
+        N_full = self.num_time_steps
+        N_half = max(N_full // 2, 1)
+
+        # ---------- Base grid: N_full steps ----------
+        V_full = self.solve_grid(apply_KO=apply_KO)
+        price_full = self._interp_price_from_grid(V_full)
+        delta_full, gamma_full = self._delta_gamma_from_grid(V_full)
+
+        # A crude theta from the PDE grid: treat last global Δt as “time step”
+        # You already store this in _last_dt_at_zero from _run_backward.
+        dt_last = getattr(self, "_last_dt_at_zero", None)
+        if dt_last is not None and dt_last > 0.0:
+            # Re-use grid at t=0 and t=dt_last from diagnostics if you store it.
+            # If not available, you can approximate theta from PDE vs vanilla:
+            theta_full = (price_full - self.vanilla_black76_price()) / dt_last
+        else:
+            theta_full = float("nan")
+
+        # ---------- Base grid at N_half for Richardson ----------
+        if use_richardson and N_half != N_full:
+            orig_N = self.num_time_steps
+            try:
+                self.num_time_steps = N_half
+                V_half = self.solve_grid(apply_KO=apply_KO)
+                price_half = self._interp_price_from_grid(V_half)
+            finally:
+                self.num_time_steps = orig_N
+
+            # Richardson on price (p≈2)
+            price_base = (4.0 * price_full - price_half) / 3.0
+        else:
+            price_base = price_full
+
+        # ---------- Vega: one-sided bump in vol ----------
+        sig0 = self.sigma
+        sig_up = sig0 + dv_sigma
+
+        # For vega we also want Richardson on EACH price run if enabled
+        # so that the vega error is dominated by the bump, not Δt.
+        if use_richardson and N_half != N_full:
+            # Base price we already have (price_base).
+            # Now bumped vol:
+            p_up_full = self._pde_price_only(
+                n_time=N_full, apply_KO=apply_KO, sigma=sig_up
+            )
+            p_up_half = self._pde_price_only(
+                n_time=N_half, apply_KO=apply_KO, sigma=sig_up
+            )
+            p_up = (4.0 * p_up_full - p_up_half) / 3.0
+        else:
+            # No Richardson: just N_full
+            p_up = self._pde_price_only(
+                n_time=N_full, apply_KO=apply_KO, sigma=sig_up
+            )
+
+        vega = (p_up - price_base) / (dv_sigma * 100.0)  # “per 1% vol”
+
+        return {
+            "price": price_base,
+            "delta": delta_full,
+            "gamma": gamma_full,
+            "vega": vega,
+            "theta": theta_full,
+        }
+        
+            def price_log2(self) -> float:
+        """
+        Barrier price using PDE + Rannacher+CN with optional KO projection,
+        and KI/KO parity when needed. This is the main pricing interface.
+
+        - bt == 'none': vanilla Black–76 (no barrier)
+        - KO types: PDE price with KO projection
+        - KI types: vanilla price minus matching KO price
+        """
+        bt = self.barrier_type.lower()
+
+        if bt == "none":
+            # Pure vanilla
+            return self.vanilla_black76_price()
+
+        # 1) Knock-out: directly from PDE
+        if bt in ("down-and-out", "up-and-out", "double-out"):
+            if getattr(self, "already_hit", False):
+                # Immediate rebate if already knocked out (if you have this)
+                if self.rebate_at_hit:
+                    df = math.exp(-self.discount_rate_nacc * self.time_to_discount)
+                    return df * self.rebate_amount
+                return 0.0
+            res = self._pde_price_and_greeks(apply_KO=True)
+            return res["price"]
+
+        # 2) Knock-in: parity with KO
+        if bt in ("down-and-in", "up-and-in", "double-in"):
+            # Save / restore barrier_type
+            original_bt = bt
+            try:
+                # Vanilla price (no barrier)
+                self.barrier_type = "none"
+                p_van = self.vanilla_black76_price()
+
+                # Matching KO type:
+                if original_bt == "down-and-in":
+                    self.barrier_type = "down-and-out"
+                elif original_bt == "up-and-in":
+                    self.barrier_type = "up-and-out"
+                else:  # double-in
+                    self.barrier_type = "double-out"
+
+                p_KO = self._pde_price_and_greeks(apply_KO=True)["price"]
+
+            finally:
+                # Restore
+                self.barrier_type = original_bt
+
+            return p_van - p_KO
+
+        raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
+    
+       def greeks_log2(self, dv_sigma: float = 0.0001) -> dict[str, float]:
+        """
+        Barrier Greeks consistent with price_log2:
+
+        - For KO: directly from PDE _pde_price_and_greeks.
+        - For KI: vanilla Greeks minus matching KO Greeks (parity).
+        - For 'none': vanilla Black–76 Greeks.
+
+        Uses a one-sided vol bump for vega to be consistent with FA.
+        """
+        bt = self.barrier_type.lower()
+
+        if bt == "none":
+            return self.vanilla_black76_greeks_fd(dSigma=dv_sigma)
+
+        # KO types: full PDE Greeks
+        if bt in ("down-and-out", "up-and-out", "double-out"):
+            return self._pde_price_and_greeks(apply_KO=True, dv_sigma=dv_sigma)
+
+        # KI types: parity
+        if bt in ("down-and-in", "up-and-in", "double-in"):
+            original_bt = bt
+            try:
+                # Vanilla Greeks (no barrier)
+                self.barrier_type = "none"
+                g_van = self.vanilla_black76_greeks_fd(dSigma=dv_sigma)
+
+                # Matching KO Greeks
+                if original_bt == "down-and-in":
+                    self.barrier_type = "down-and-out"
+                elif original_bt == "up-and-in":
+                    self.barrier_type = "up-and-out"
+                else:  # double-in
+                    self.barrier_type = "double-out"
+
+                g_KO = self._pde_price_and_greeks(
+                    apply_KO=True,
+                    dv_sigma=dv_sigma,
+                )
+
+            finally:
+                self.barrier_type = original_bt
+
+            # Parity: KI = vanilla − KO, applied component-wise
+            return {
+                "price": g_van["price"] - g_KO["price"],
+                "delta": g_van["delta"] - g_KO["delta"],
+                "gamma": g_van["gamma"] - g_KO["gamma"],
+                "vega": g_van["vega"] - g_KO["vega"],
+                "theta": g_van["theta"] - g_KO["theta"],
+                "theta_daily": g_van["theta_daily"] - g_KO.get("theta_daily", 0.0),
+            }
+
+        raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
