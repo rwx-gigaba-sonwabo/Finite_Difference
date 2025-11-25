@@ -1129,3 +1129,108 @@ def _solve_grid(self, apply_KO: bool) -> List[float]:
             V = self._apply_KO_projection_log(V, self.s_nodes, tau_curr)
 
     return V
+
+    def _solve_grid(self, apply_KO: bool) -> list[float]:
+        """
+        Solve dV/dt = L V on log-S grid using Rannacher-smoothed
+        Crank–Nicolson and Dirichlet boundaries.
+
+        Returns the value vector V(t=0, S_j) on the existing grid self.s_nodes.
+        """
+        # 1) Grid & time set-up
+        self.configure_grid()
+        dx = self._build_log_grid()             # uniform log spacing
+        N = self.num_space_nodes                # number of spatial nodes
+        M = self.num_time_steps                 # number of time steps
+        dt = self.time_to_expiry / float(M)     # constant Δt
+
+        if N < 3:
+            raise ValueError("Need at least 3 space nodes for CN scheme.")
+
+        # 2) PDE coefficients in log space
+        sig = self.sigma
+        sig2 = sig * sig
+
+        # Discount & dividend yields in *continuous* compounding
+        r = self.discount_rate_nacc
+        q = getattr(self, "div_yield_nacc", 0.0)
+
+        alpha = 0.5 * sig2
+        beta  = (r - q - 0.5 * sig2)
+
+        a = alpha / (dx * dx) - beta / (2.0 * dx)
+        b = -2.0 * alpha / (dx * dx) - r
+        c = alpha / (dx * dx) + beta / (2.0 * dx)
+
+        # 3) Terminal condition at maturity (τ = 0)
+        V = self._terminal_payoff()             # length N
+
+        # 4) Monitoring structure in τ-space
+        #    monitor step indices k such that τ_k = k*dt is a monitoring time
+        monitor_indices = set(self._monitor_indices_tau(dt))
+
+        # 5) Rannacher: number of *global* BE steps
+        rannacher_steps = 2
+
+        # --- time-stepping from τ=0 -> τ=T (backwards in calendar time) ---
+        for n_step in range(M):
+            tau_next = (n_step + 1) * dt
+
+            # 5a) choose θ for this step
+            theta = 1.0 if n_step < rannacher_steps else 0.5
+
+            # 5b) precompute θ-dependent matrix coefficients
+            AL = -theta * dt * a
+            AC = 1.0   - theta * dt * b
+            AU = -theta * dt * c
+
+            BL = (1.0 - theta) * dt * a
+            BC = 1.0   + (1.0 - theta) * dt * b
+            BU = (1.0 - theta) * dt * c
+
+            # 5c) Boundary values at τ_next
+            V_min_next, V_max_next = self._boundary_values(tau_next)
+
+            # 5d) Build RHS for interior nodes j = 1..N-2
+            n_int = N - 2
+            rhs = [0.0] * n_int
+
+            for j in range(1, N - 1):
+                rhs[j - 1] = (
+                    BL * V[j - 1] +
+                    BC * V[j]     +
+                    BU * V[j + 1]
+                )
+
+            # Add boundary contributions moved to RHS:
+            # left boundary enters at j=1 (index 0 in rhs)
+            rhs[0]      -= AL * V_min_next
+            # right boundary enters at j=N-2 (index n_int-1 in rhs)
+            rhs[-1]     -= AU * V_max_next
+
+            # 5e) Build tri-diagonal system for interior nodes
+            lower = [0.0] + [AL] * (n_int - 1)      # length n_int
+            main  = [AC]  * n_int
+            upper = [AU] * (n_int - 1) + [0.0]
+
+            V_int = self._solve_tridiagonal_system(
+                lower_diag=lower,
+                main_diag=main,
+                upper_diag=upper,
+                right_hand_side=rhs,
+            )
+
+            # 5f) Assemble full solution at τ_next
+            V_new = [0.0] * N
+            V_new[0]    = V_min_next
+            V_new[-1]   = V_max_next
+            V_new[1:-1] = V_int
+
+            # 5g) Apply knock-out at this monitoring time (in τ-space)
+            if apply_KO and (n_step + 1) in monitor_indices:
+                V_new = self._apply_KO_projection_log(V_new, self.s_nodes, tau_next)
+
+            V = V_new
+
+        # Finished marching to τ = T (calendar t = 0)
+        return V
