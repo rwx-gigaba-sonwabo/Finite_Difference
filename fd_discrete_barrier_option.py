@@ -1234,3 +1234,225 @@ def _solve_grid(self, apply_KO: bool) -> List[float]:
 
         # Finished marching to τ = T (calendar t = 0)
         return V
+    
+    def _build_CN_coeffs(self, dt: float, dx: float, theta: float):
+        sig2 = self.sigma * self.sigma
+        mu_x = (self.carry_rate_nacc - 0.5 * sig2)
+
+        alpha = 0.5 * sig2 / (dx * dx)
+        beta  = mu_x / (2.0 * dx)
+
+        # continuous operator L V = a V_{j-1} + b V_j + c V_{j+1}
+        a = alpha - beta
+        b = -2.0 * alpha - self.discount_rate_nacc
+        c = alpha + beta
+
+        # generic θ-scheme: (I - θ dt L) V^{n+1} = (I + (1-θ) dt L) V^n
+        A_L = -theta    * dt * a
+        B_C = 1.0 - theta    * dt * b
+        C_U = -theta    * dt * c
+
+        A_L_rhs = (1.0 - theta) * dt * a
+        B_C_rhs = 1.0 + (1.0 - theta) * dt * b
+        C_U_rhs = (1.0 - theta) * dt * c
+
+        return (A_L, B_C, C_U, A_L_rhs, B_C_rhs, C_U_rhs)
+
+    def _solve_grid(self, apply_KO: bool) -> List[float]:
+    self.configure_grid()
+    dx = self._build_log_grid()
+    dt = self.time_to_expiry / self.num_time_steps
+
+    N = self.num_space_nodes
+    V = self._terminal_payoff()   # size N
+
+    # Precompute barrier monitor indices in τ if needed
+    monitor_idx = self._monitor_indices_tau(dt)
+
+    # global step counter (from t = T down to 0)
+    for n in range(self.num_time_steps):
+        tau_next = (n + 1) * dt
+
+        # ---------- Rannacher: θ = 1 for first 2 global steps ----------
+        theta = 1.0 if n < 2 else 0.5
+
+        (A_L, B_C, C_U,
+         A_L_rhs, B_C_rhs, C_U_rhs) = self._build_CN_coeffs(dt, dx, theta)
+
+        # boundaries at tau_next (Dirichlet)
+        V_min_next, V_max_next = self._boundary_values(tau_next)
+
+        # build RHS for interior nodes j = 1..N-2
+        rhs = [0.0] * (N - 2)
+        for j in range(1, N-1):
+            jm = j - 1
+            jp = j + 1
+            i  = j - 1        # index in rhs
+
+            rhs[i] = (
+                A_L_rhs * V[jm] +
+                B_C_rhs * V[j]  +
+                C_U_rhs * V[jp]
+            )
+
+        # add boundaries to RHS (only interior nodes see boundaries)
+        rhs[0]     += -A_L * V_min_next
+        rhs[-1]    += -C_U * V_max_next
+
+        # tri-diagonal coefficients for interior
+        lower = [A_L] * (N - 3)
+        main  = [B_C] * (N - 2)
+        upper = [C_U] * (N - 3)
+
+        V_int = self._solve_tridiagonal_system(lower, main, upper, rhs)
+
+        # reconstruct full grid including boundaries
+        V_new = [0.0] * N
+        V_new[0]  = V_min_next
+        V_new[-1] = V_max_next
+        V_new[1:-1] = V_int
+
+        V = V_new
+
+        # Apply KO projection if this is a monitoring date
+        if apply_KO and n in monitor_idx:
+            V = self._apply_KO_projection_log(V, self.s_nodes, tau_next)
+
+    return V
+
+def pde_price_and_greeks(
+    self,
+    apply_KO: bool,
+    dv_sigma: float = 0.0001,
+    N_time_override: int | None = None,
+) -> dict[str, float]:
+    """
+    Solve PDE grid and compute price & Greeks for the current barrier type.
+
+    Parameters
+    ----------
+    apply_KO : bool
+        Whether to project out knock-out at monitoring times.
+    dv_sigma : float
+        Vol bump for Vega (absolute, e.g. 0.0001 = 1bp vol).
+    N_time_override : int, optional
+        If provided, temporarily override self.num_time_steps.
+
+    Returns
+    -------
+    dict with keys 'price', 'delta', 'gamma', 'vega', 'theta'
+    """
+    # Temporarily override number of time steps
+    old_N = self.num_time_steps
+    if N_time_override is not None:
+        self.num_time_steps = int(N_time_override)
+
+    try:
+        # base grid
+        V_grid = self._solve_grid(apply_KO=apply_KO)
+        price = self._interp_price_from_grid(V_grid)
+        delta, gamma = self._delta_gamma_from_grid(V_grid)
+
+        # crude Theta from Black-76 parity (consistent with your existing code)
+        S0 = self.spot
+        r  = self.discount_rate_nacc
+        sigma = self.sigma
+        T = self.time_to_expiry
+
+        theta = r * price - 0.5 * sigma * sigma * S0 * S0 * gamma - r * S0 * delta
+
+        # Vega via central bump in sigma using CN engine
+        sigma_orig = self.sigma
+        self.sigma = sigma_orig + dv_sigma
+        V_up = self._solve_grid(apply_KO=apply_KO)
+        price_up = self._interp_price_from_grid(V_up)
+        self.sigma = sigma_orig - dv_sigma
+        V_dn = self._solve_grid(apply_KO=apply_KO)
+        price_dn = self._interp_price_from_grid(V_dn)
+        self.sigma = sigma_orig
+
+        vega = (price_up - price_dn) / (2.0 * dv_sigma)
+
+        return {
+            "price": price,
+            "delta": delta,
+            "gamma": gamma,
+            "vega": vega,
+            "theta": theta,
+        }
+    finally:
+        # restore time steps
+        self.num_time_steps = old_N
+
+def pde_price_and_greeks_richardson(
+    self,
+    apply_KO: bool,
+    dv_sigma: float = 0.0001,
+    N_time_base: int | None = None,
+) -> dict[str, float]:
+    """
+    Richardson-extrapolated price & Greeks.
+
+    Computes with N and N/2 time steps and combines
+    V* = (4 V_N - V_{N/2}) / 3, assuming error ~ O(N^{-2}).
+
+    This should be used for 'smooth enough' cases.
+    For barrier / very near barrier, you may want to switch it off.
+    """
+    # Choose base N: default to current num_time_steps
+    if N_time_base is None:
+        N_time_base = self.num_time_steps
+
+    N_time_base = int(N_time_base)
+    N_half = max(1, N_time_base // 2)
+
+    # Coarse (N/2) and fine (N) runs
+    res_half = self.pde_price_and_greeks(
+        apply_KO=apply_KO,
+        dv_sigma=dv_sigma,
+        N_time_override=N_half,
+    )
+    res_full = self.pde_price_and_greeks(
+        apply_KO=apply_KO,
+        dv_sigma=dv_sigma,
+        N_time_override=N_time_base,
+    )
+
+    res_extrap = {}
+    for key in res_full.keys():
+        vN = res_full[key]
+        vH = res_half[key]
+        res_extrap[key] = (4.0 * vN - vH) / 3.0
+
+    return res_extrap
+
+def price_log2(self, use_richardson: bool = True) -> float:
+    bt = self.barrier_type.lower()
+
+    # Vanilla: Black-76 closed form
+    if bt == "none":
+        return self._vanilla_black76_price()
+
+    # Knock-out: PDE with KO projection
+    if bt in ("down-and-out", "up-and-out"):
+        if not use_richardson:
+            price_greeks = self.pde_price_and_greeks(apply_KO=True)
+        else:
+            price_greeks = self.pde_price_and_greeks_richardson(apply_KO=True)
+        return price_greeks["price"]
+
+    # Knock-in via parity: V_KI = V_vanilla - V_KO
+    if bt in ("down-and-in", "up-and-in"):
+        # vanilla (no barrier), no need for Richardson – Black-76
+        p_van = self._vanilla_black76_price()
+
+        # KO with PDE, possibly Richardson
+        if not use_richardson:
+            g_ko = self.pde_price_and_greeks(apply_KO=True)
+        else:
+            g_ko = self.pde_price_and_greeks_richardson(apply_KO=True)
+        p_ko = g_ko["price"]
+
+        return p_van - p_ko
+
+    raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
