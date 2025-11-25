@@ -2105,3 +2105,132 @@ def price_log2(self, use_richardson: bool = True) -> float:
             dv_sigma=dv_sigma,
             use_richardson=use_richardson,
         )
+        
+    def _is_ko(self, barrier_type: str) -> bool:
+        bt = barrier_type.lower()
+        return bt in ("down-and-out", "up-and-out", "double-out")
+
+    def _is_ki(self, barrier_type: str) -> bool:
+        bt = barrier_type.lower()
+        return bt in ("down-and-in", "up-and-in", "double-in")
+
+    def _ko_type_from_ki(self, ki_type: str) -> str:
+        bt = ki_type.lower()
+        if bt == "down-and-in": return "down-and-out"
+        if bt == "up-and-in":   return "up-and-out"
+        if bt == "double-in":   return "double-out"
+        raise ValueError(f"Unknown KI type: {ki_type}")
+    
+        def _pde_solution(self, N_time: int, apply_KO: bool, sigma_override: float | None = None):
+        old_sig, old_N = self.sigma, self.N_time
+        try:
+            if sigma_override is not None:
+                self.sigma = sigma_override
+            self.N_time = N_time
+            V = self._solve_grid(apply_KO=apply_KO, N_time=N_time)
+        finally:
+            self.sigma = old_sig
+            self.N_time = old_N
+        return V
+
+    def _price_from_grid(self, V):
+        return self._interp_price_from_grid(V)
+
+    def _richardson_price(self, apply_KO: bool, sigma_override: float | None = None):
+        N = int(self.N_time)
+        if N < 2:
+            V = self._pde_solution(N_time=N, apply_KO=apply_KO, sigma_override=sigma_override)
+            return self._price_from_grid(V), V
+
+        N_half = max(1, N // 2)
+        V_N    = self._pde_solution(N_time=N,     apply_KO=apply_KO, sigma_override=sigma_override)
+        V_H    = self._pde_solution(N_time=N_half,apply_KO=apply_KO, sigma_override=sigma_override)
+        p_N    = self._price_from_grid(V_N)
+        p_H    = self._price_from_grid(V_H)
+        p_star = (4.0 * p_N - p_H) / 3.0
+        return p_star, V_N  # use hi-res grid for greeks
+
+    def pde_price_and_greeks(self, apply_KO: bool, dv_sigma: float = 1e-4, use_richardson: bool = True) -> dict:
+        N = int(self.N_time)
+        if use_richardson and N >= 2:
+            price_base, V_grid = self._richardson_price(apply_KO=apply_KO, sigma_override=None)
+        else:
+            V_grid = self._pde_solution(N_time=N, apply_KO=apply_KO, sigma_override=None)
+            price_base = self._price_from_grid(V_grid)
+
+        delta, gamma = self._delta_gamma_from_grid(V_grid)  # your existing non-uniform central diff
+
+        # one-sided vega (FA convention), *with* Richardson on each price if requested
+        sig_up = self.sigma + dv_sigma
+        if use_richardson and N >= 2:
+            price_up, _ = self._richardson_price(apply_KO=apply_KO, sigma_override=sig_up)
+        else:
+            V_up = self._pde_solution(N_time=N, apply_KO=apply_KO, sigma_override=sig_up)
+            price_up = self._price_from_grid(V_up)
+        vega = (price_up - price_base) / dv_sigma
+
+        return {"price": price_base, "delta": delta, "gamma": gamma, "vega": vega}
+    
+    
+        def price_log2(self, use_richardson: bool = True) -> float:
+        bt = self.barrier_type.lower()
+
+        # no barrier → pure vanilla
+        if bt == "none":
+            return self.vanilla_black76_price()
+
+        # KO → PDE
+        if self._is_ko(bt):
+            return self.pde_price_and_greeks(apply_KO=True, use_richardson=use_richardson)["price"]
+
+        # KI → parity: vanilla − KO (same rebate convention)
+        if self._is_ki(bt):
+            ko_type = self._ko_type_from_ki(bt)
+            # vanilla
+            p_van = self.vanilla_black76_price()
+            # KO price with PDE (temporarily switch type)
+            save_bt = self.barrier_type
+            try:
+                self.barrier_type = ko_type
+                p_ko = self.pde_price_and_greeks(apply_KO=True, use_richardson=use_richardson)["price"]
+            finally:
+                self.barrier_type = save_bt
+            return p_van - p_ko
+
+        raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
+    
+        def greeks_log2(self, dv_sigma: float = 1e-4, use_richardson: bool = True) -> dict:
+        bt = self.barrier_type.lower()
+
+        if bt == "none":
+            return self.vanilla_black76_greeks_fd(dSigma=dv_sigma)
+
+        # KO → PDE Greeks directly
+        if self._is_ko(bt):
+            return self.pde_price_and_greeks(apply_KO=True, dv_sigma=dv_sigma, use_richardson=use_richardson)
+
+        # KI → parity: (vanilla Greeks) − (KO Greeks)
+        if self._is_ki(bt):
+            ko_type = self._ko_type_from_ki(bt)
+
+            save_bt = self.barrier_type
+            try:
+                # vanilla Greeks
+                self.barrier_type = "none"
+                g_van = self.vanilla_black76_greeks_fd(dSigma=dv_sigma)
+
+                # KO Greeks via PDE
+                self.barrier_type = ko_type
+                g_ko  = self.pde_price_and_greeks(apply_KO=True, dv_sigma=dv_sigma, use_richardson=use_richardson)
+            finally:
+                self.barrier_type = save_bt
+
+            return {
+                "price": g_van["price"] - g_ko["price"],
+                "delta": g_van["delta"] - g_ko["delta"],
+                "gamma": g_van["gamma"] - g_ko["gamma"],
+                "vega":  g_van["vega"]  - g_ko["vega"],
+                "theta": g_van.get("theta", float("nan")) - g_ko.get("theta", 0.0),
+            }
+
+        raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
