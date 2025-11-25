@@ -2234,3 +2234,188 @@ def price_log2(self, use_richardson: bool = True) -> float:
             }
 
         raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
+    
+    def _solve_grid(self, apply_KO: bool) -> List[float]:
+    """
+    Solve the log-space Black–Scholes PDE on the full S-grid using
+    Rannacher + Crank–Nicolson, with KO projection at monitoring dates.
+
+    Returns the grid of option values V(S, tau=T) at valuation.
+    """
+
+    # --- 1. Grid and basic parameters ---------------------------------
+    self.configure_grid()
+    dx = self._build_log_grid()      # if uniform; otherwise ignore dx and use s_nodes
+    N = self.N_space                 # number of space nodes minus 1 (0..N)
+    dt = self.T / self.N_time        # global time step in tau
+
+    sig = self.sigma
+    sig2 = sig * sig
+    b_carry = self.b_carry           # r - q
+    r_disc = self.r_disc             # r
+
+    # drift in log-space
+    mu_x = b_carry - 0.5 * sig2
+
+    # CN coefficients for a uniform log grid
+    alpha = 0.5 * sig2 / (dx * dx)
+    beta_adv = mu_x / (2.0 * dx)
+
+    # operator L V_j = a V_{j-1} + b V_j + c V_{j+1}
+    a = alpha - beta_adv
+    c = alpha + beta_adv
+    bcoef = -2.0 * alpha - r_disc
+
+    # --- 2. Rannacher / theta handling --------------------------------
+    rannacher_steps = 2  # first 2 global steps implicit Euler
+
+    # matrices for theta = 0.5 (CN); we will override theta=1 on the fly
+    def build_matrices(theta: float):
+        """Return (A_L, A_C, A_U, B_L, B_C, B_U) for given theta."""
+        A_L = -theta * dt * a
+        A_C = 1.0 - theta * dt * bcoef
+        A_U = -theta * dt * c
+
+        B_L = (1.0 - theta) * dt * a
+        B_C = 1.0 + (1.0 - theta) * dt * bcoef
+        B_U = (1.0 - theta) * dt * c
+        return A_L, A_C, A_U, B_L, B_C, B_U
+
+    # Thomas solver for constant tridiagonal system
+    def solve_tridiag(A_L, A_C, A_U, rhs):
+        n = len(rhs)
+        c_prime = [0.0] * n
+        d_prime = [0.0] * n
+
+        # first row
+        denom = A_C
+        c_prime[0] = A_U / denom
+        d_prime[0] = rhs[0] / denom
+
+        # forward sweep
+        for i in range(1, n):
+            denom = A_C - A_L * c_prime[i - 1]
+            if i < n - 1:
+                c_prime[i] = A_U / denom
+            d_prime[i] = (rhs[i] - A_L * d_prime[i - 1]) / denom
+
+        # back substitution
+        x = [0.0] * n
+        x[-1] = d_prime[-1]
+        for i in range(n - 2, -1, -1):
+            x[i] = d_prime[i] - c_prime[i] * x[i + 1]
+        return x
+
+    # --- 3. Initial condition and monitoring indices ------------------
+    V = self._terminal_payoff()              # length N+1: j=0..N
+    monitor_idx = set(self._monitor_indices_tau(dt))  # set of step indices in {1..N_time}
+
+    # --- 4. March backward in tau -------------------------------------
+    for m in range(self.N_time):
+        tau_next = (m + 1) * dt
+
+        # choose theta for this *global* step (Rannacher)
+        theta = 1.0 if m < rannacher_steps else 0.5
+        A_L, A_C, A_U, B_L, B_C, B_U = build_matrices(theta)
+
+        # boundary values at tau_next (Dirichlet)
+        V_min_next, V_max_next = self._boundary_values(tau_next)
+
+        # build RHS for interior nodes j = 1..N-1
+        rhs = [0.0] * (N - 1)
+        for j in range(1, N):
+            Vjm1, Vj, Vjp1 = V[j - 1], V[j], V[j + 1]
+            rhs[j - 1] = B_L * Vjm1 + B_C * Vj + B_U * Vjp1
+
+        # add boundary contributions (note: A_* from left matrix)
+        rhs[0]  -= A_L * V_min_next
+        rhs[-1] -= A_U * V_max_next
+
+        # solve for interior values
+        V_int = solve_tridiag(A_L, A_C, A_U, rhs)
+
+        # write back full grid
+        V[0]  = V_min_next
+        V[-1] = V_max_next
+        V[1:-1] = V_int
+
+        # KO projection at monitoring dates
+        if apply_KO and ((m + 1) in monitor_idx):
+            self._apply_KO_projection(V)
+
+    return V
+
+def _pde_solution(self, N_time: int, apply_KO: bool, sigma_override: float | None = None) -> float:
+    """
+    Helper: run the PDE with a specified number of time steps and (optionally)
+    an overridden volatility, and return the interpolated price at S0.
+    """
+
+    # Save originals
+    sigma_orig = self.sigma
+    N_time_orig = self.N_time
+
+    try:
+        if sigma_override is not None:
+            self.sigma = sigma_override
+        self.N_time = N_time
+
+        V_grid = self._solve_grid(apply_KO=apply_KO)
+        price = self._interp_price_from_grid(V_grid)   # your existing interpolator
+        return price
+    finally:
+        # restore
+        self.sigma = sigma_orig
+        self.N_time = N_time_orig
+
+def price_log2(self) -> float:
+    """
+    Price the discrete barrier option in log-space with:
+
+    - Rannacher + CN PDE
+    - Richardson extrapolation in time
+    - KI/KO parity against vanilla Black-76.
+    """
+    bt = self.barrier_type.lower()
+
+    if bt in ("up-and-out", "down-and-out"):
+        # pure KO: PDE with KO projection
+        price_KO = self._pde_price_richardson(apply_KO=True)
+        return price_KO
+
+    elif bt in ("up-and-in", "down-and-in"):
+        # KI via parity: V_KI = V_vanilla - V_KO
+        vanilla_price = self.vanilla_black76_price()
+        price_KO = self._pde_price_richardson(apply_KO=True)
+
+        price_KI = vanilla_price - price_KO
+        return price_KI
+
+    else:
+        raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
+
+def _delta_gamma_from_grid(self, V: List[float]) -> tuple[float, float]:
+    """
+    Non-uniform central differences for delta and gamma at S0.
+    Assumes self.s_nodes contains the S-grid (not log S).
+    """
+
+    S_nodes = self.s_nodes
+    S0 = self.spot
+
+    # find index j* closest to S0, but not at the boundary
+    idx = min(range(1, len(S_nodes) - 1), key=lambda j: abs(S_nodes[j] - S0))
+
+    S_im1, S_i, S_ip1 = S_nodes[idx - 1], S_nodes[idx], S_nodes[idx + 1]
+    V_im1, V_i, V_ip1 = V[idx - 1], V[idx], V[idx + 1]
+
+    h1 = S_i   - S_im1
+    h2 = S_ip1 - S_i
+
+    # non-uniform central delta (second-order)
+    delta = ((-h2) * V_im1 + (h2 - h1) * V_i + h1 * V_ip1) / (h1 * h2 * (h1 + h2))
+
+    # non-uniform gamma (second-order)
+    gamma = (2.0 * (V_im1 * h2 - V_i * (h1 + h2) + V_ip1 * h1)) / (h1 * h2 * (h1 + h2))
+
+    return delta, gamma
