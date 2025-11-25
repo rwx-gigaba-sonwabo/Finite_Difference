@@ -1837,3 +1837,271 @@ def price_log2(self, use_richardson: bool = True) -> float:
             }
 
         raise ValueError(f"Unsupported barrier type: {self.barrier_type}")
+    
+        def _solve_grid(self, apply_KO: bool, N_time: int | None = None) -> list[float]:
+        """
+        Solve the PDE on the log-S grid using a theta-scheme with
+        Rannacher time-stepping (first few steps = BE, then CN).
+
+        Parameters
+        ----------
+        apply_KO : bool
+            If True, apply knock-out projection at monitoring times.
+        N_time : Optional[int]
+            Number of time steps for this solve. If None, uses self.N_time.
+
+        Returns
+        -------
+        V : list[float]
+            Option values on the S-grid at valuation time (tau = T).
+        """
+        # ----- grid & basic coefficients -----
+        self.configure_grid()
+        dx = self._build_log_grid()          # assumes uniform log grid
+        N = self.N_space                     # number of space steps (V has N+1 nodes)
+
+        # possibly override N_time for Richardson
+        N_time = int(N_time) if N_time is not None else int(self.N_time)
+        assert N_time >= 1
+
+        dt = self.T / float(N_time)
+
+        sig2 = self.sigma * self.sigma
+        # drift in log-space under risk-neutral measure
+        mu_x = self.b_carry - 0.5 * sig2
+
+        alpha = 0.5 * sig2 / (dx * dx)
+        beta_adv = mu_x / (2.0 * dx)
+
+        # spatial operator coefficients L V_j = a V_{j-1} + b V_j + c V_{j+1}
+        a = alpha - beta_adv
+        c = alpha + beta_adv
+        bcoef = -2.0 * alpha - self.r_disc
+
+        # ----- local Thomas solver (for interior nodes only) -----
+        def solve_tridiag(A_L: float, A_C: float, A_U: float,
+                          rhs: list[float]) -> list[float]:
+            """
+            Solve tri-diagonal system with *constant* diagonals:
+                (A_L, A_C, A_U) for interior nodes.
+            Dimension is len(rhs).
+            """
+            n = len(rhs)
+            c_prime = [0.0] * n
+            d_prime = [0.0] * n
+
+            # first row
+            pivot = A_C
+            if abs(pivot) < 1e-14:
+                pivot = 1e-14
+            c_prime[0] = A_U / pivot
+            d_prime[0] = rhs[0] / pivot
+
+            # forward sweep
+            for i in range(1, n):
+                pivot = A_C - A_L * c_prime[i - 1]
+                if abs(pivot) < 1e-14:
+                    pivot = 1e-14
+                if i < n - 1:
+                    c_prime[i] = A_U / pivot
+                d_prime[i] = (rhs[i] - A_L * d_prime[i - 1]) / pivot
+
+            # back substitution
+            x = [0.0] * n
+            x[-1] = d_prime[-1]
+            for i in range(n - 2, -1, -1):
+                x[i] = d_prime[i] - c_prime[i] * x[i + 1]
+
+            return x
+
+        # ----- initial condition at tau = 0 (maturity) -----
+        V = self._terminal_payoff()      # V[j] at tau = 0
+        monitor_idx = self._monitor_indices_tau(dt)
+
+        # ----- march forward in tau : 0 -> T (i.e. backward in calendar time) -----
+        for m in range(N_time):
+            # Rannacher: first RANNACHER_STEPS global steps = backward Euler
+            if m < self.RANNACHER_STEPS:
+                theta = 1.0   # fully implicit (EB)
+            else:
+                theta = 0.5   # CN afterwards
+
+            # theta–scheme matrices:
+            # (I - theta dt L) V^{m+1} = (I + (1-theta) dt L) V^m
+            A_L = -theta * dt * a
+            A_C = 1.0 - theta * dt * bcoef
+            A_U = -theta * dt * c
+
+            B_L = (1.0 - theta) * dt * a
+            B_C = 1.0 + (1.0 - theta) * dt * bcoef
+            B_U = (1.0 - theta) * dt * c
+
+            tau_next = (m + 1) * dt
+            V_min_next, V_max_next = self._boundary_values(tau_next)
+
+            # RHS for interior nodes j = 1..N-1
+            rhs = [0.0] * (N - 1)
+            for j in range(1, N):
+                Vjm1, Vj, Vjp1 = V[j - 1], V[j], V[j + 1]
+                rhs[j - 1] = (B_L * Vjm1 + B_C * Vj + B_U * Vjp1)
+
+            # Dirichlet boundary contributions for next step
+            rhs[0] -= A_L * V_min_next
+            rhs[-1] -= A_U * V_max_next
+
+            # solve for interior values at tau_next
+            V_int = solve_tridiag(A_L, A_C, A_U, rhs)
+
+            # inject boundaries and interior into full grid
+            V[0] = V_min_next
+            V[-1] = V_max_next
+            V[1:-1] = V_int
+
+            # knock-out projection at monitoring times
+            if apply_KO and (m + 1) in monitor_idx:
+                self._apply_KO_projection(V)
+
+        return V
+    
+        def _price_from_grid(self, V: list[float]) -> float:
+        """
+        Interpolate V(S) at spot S0 to get a single scalar price.
+        Assumes self._interp_price_from_grid exists.
+        """
+        return self._interp_price_from_grid(V)
+
+    # ---------- core PDE price (no Richardson) ----------
+    def _pde_price_single(self, N_time: int, apply_KO: bool) -> float:
+        V = self._solve_grid(apply_KO=apply_KO, N_time=N_time)
+        return self._price_from_grid(V)
+
+    # ---------- public price with optional Richardson ----------
+    def price_log2(self, apply_KO: bool = True, use_richardson: bool = True) -> float:
+        """
+        Discrete barrier price in log-space via FDM.
+
+        - Uses Rannacher time-stepping inside _solve_grid.
+        - Optionally applies Richardson extrapolation in *time*
+          assuming O(dt^2) temporal error.
+
+        Returns
+        -------
+        float : theoretical price per contract.
+        """
+        N = int(self.N_time)
+        if N < 2 or not use_richardson:
+            return self._pde_price_single(N_time=N, apply_KO=apply_KO)
+
+        # high-resolution solution
+        p_N = self._pde_price_single(N_time=N, apply_KO=apply_KO)
+
+        # coarser solution with half the steps
+        N_half = max(1, N // 2)
+        p_half = self._pde_price_single(N_time=N_half, apply_KO=apply_KO)
+
+        # Richardson (error ~ C dt^2):
+        # p* = p_N + (p_N - p_half) / (2^2 - 1) = (4 p_N - p_half) / 3
+        p_star = (4.0 * p_N - p_half) / 3.0
+        return p_star
+    
+        def _pde_solution(self, N_time: int, apply_KO: bool,
+                      sigma_override: float | None = None) -> list[float]:
+        """
+        Helper: run the PDE with optional volatility override and return V-grid.
+        """
+        old_sigma = self.sigma
+        old_Ntime = self.N_time
+
+        self.N_time = N_time
+        if sigma_override is not None:
+            self.sigma = sigma_override
+
+        try:
+            V = self._solve_grid(apply_KO=apply_KO, N_time=N_time)
+        finally:
+            self.sigma = old_sigma
+            self.N_time = old_Ntime
+
+        return V
+
+    def _richardson_price(self, apply_KO: bool,
+                          sigma_override: float | None = None) -> float:
+        """
+        Price with Richardson in time (N vs N/2), optionally with a given vol.
+        """
+        N = int(self.N_time)
+        if N < 2:
+            V = self._pde_solution(N_time=N, apply_KO=apply_KO,
+                                   sigma_override=sigma_override)
+            return self._price_from_grid(V)
+
+        N_half = max(1, N // 2)
+
+        V_N = self._pde_solution(N_time=N, apply_KO=apply_KO,
+                                 sigma_override=sigma_override)
+        p_N = self._price_from_grid(V_N)
+
+        V_half = self._pde_solution(N_time=N_half, apply_KO=apply_KO,
+                                    sigma_override=sigma_override)
+        p_half = self._price_from_grid(V_half)
+
+        return (4.0 * p_N - p_half) / 3.0, V_N  # return hi-res grid too
+
+    # ---------- PDE price + Greeks ----------
+    def pde_price_and_greeks(self,
+                             apply_KO: bool,
+                             dv_sigma: float = 0.0001,
+                             use_richardson: bool = True) -> dict[str, float]:
+        """
+        Use the CN+Rannacher PDE to compute:
+          - price
+          - Delta, Gamma from the high-res grid (log-S)
+          - Vega from vol bump, using same PDE and Richardson.
+
+        Returns dictionary keyed by 'price', 'delta', 'gamma', 'vega'.
+        """
+        N = int(self.N_time)
+
+        # Base price (with optional Richardson) + hi-res grid
+        if use_richardson and N >= 2:
+            base_price, V_grid = self._richardson_price(apply_KO=apply_KO)
+        else:
+            V_grid = self._pde_solution(N_time=N, apply_KO=apply_KO,
+                                        sigma_override=None)
+            base_price = self._price_from_grid(V_grid)
+
+        # Delta & Gamma from grid (existing routine)
+        delta, gamma = self._delta_gamma_from_grid(V_grid)
+
+        # Vega – one-sided vol bump, consistent with FA
+        sigma0 = self.sigma
+        sigma_up = sigma0 + dv_sigma
+
+        if use_richardson and N >= 2:
+            price_up, _ = self._richardson_price(apply_KO=apply_KO,
+                                                 sigma_override=sigma_up)
+        else:
+            V_up = self._pde_solution(N_time=N, apply_KO=apply_KO,
+                                      sigma_override=sigma_up)
+            price_up = self._price_from_grid(V_up)
+
+        vega = (price_up - base_price) / dv_sigma   # per absolute vol unit
+
+        return {
+            "price": base_price,
+            "delta": delta,
+            "gamma": gamma,
+            "vega": vega,
+        }
+
+    # ---------- external entry point used by your main script ----------
+    def greeks_log2(self, dv_sigma: float = 0.0001,
+                    use_richardson: bool = True) -> dict[str, float]:
+        """
+        Public interface: PDE-based price and Greeks in log-space.
+        """
+        return self.pde_price_and_greeks(
+            apply_KO=True,
+            dv_sigma=dv_sigma,
+            use_richardson=use_richardson,
+        )
