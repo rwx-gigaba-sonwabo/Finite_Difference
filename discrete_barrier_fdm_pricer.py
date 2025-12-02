@@ -79,6 +79,7 @@ class DiscreteBarrierFDMPricer:
         mollify_band_nodes: int = 2,
         price_extrapolation: bool = False,
         day_count: str = "ACT/365",
+        calculate_greeks_in_pde: bool = True,
     ) -> None:
         # Basic validation
         if any(x <= 0 for x in (spot, strike, sigma)):
@@ -135,6 +136,7 @@ class DiscreteBarrierFDMPricer:
         self.mollify_band_nodes = int(mollify_band_nodes)
         self.price_extrapolation = price_extrapolation
         self.use_one_sided_greeks_near_barrier = use_one_sided_greeks_near_barrier
+        self.calculate_greeks_in_pde = calculate_greeks_in_pde
 
         # Day count , spot adjustments
         self.day_count = day_count.upper().replace("F", "")
@@ -265,84 +267,6 @@ class DiscreteBarrierFDMPricer:
         times = sorted(set(times))
         return times
 
-    def _time_subgrid_counts(self) -> List[int]:
-        # Allocate substeps per interval proportionally to length, with a minimum
-        lengths = [self.monitor_times[i+1]-self.monitor_times[i] for i in range(len(self.monitor_times)-1)]
-        total = sum(lengths)
-
-        if total <= 0:
-            return [self.min_substeps]*(len(lengths))
-
-        raw = [max(self.min_substeps, int(round(self.num_time_steps * (L/total)))) for L in lengths]
-        # ensure at least 1 per interval and adjust sum
-        s = sum(raw)
-        if s == 0:
-            raw = [self.min_substeps]*len(lengths)
-            s = sum(raw)
-        # adjust to exactly M_target by distributing diff
-        diff = self.num_time_steps - s
-        i = 0
-        while diff != 0 and len(raw)>0:
-            j = i % len(raw)
-            if diff > 0:
-                raw[j] += 1
-                diff -= 1
-            else:
-                if raw[j] > self.min_substeps:
-                    raw[j] -= 1
-                    diff += 1
-            i += 1
-        return raw
-
-    def _build_stock_price_grid(self) -> List[float]:
-        """
-        Uniform price grid [0, S_max]. Snap strike and barriers to nodes for accuracy.
-        """
-        reference_points = [self.spot, self.strike]
-        if self.lower_barrier:
-            reference_points.append(self.lower_barrier)
-        if self.upper_barrier:
-            reference_points.append(self.upper_barrier)
-
-        s_star = max(reference_points) if reference_points else self.spot
-        s_max = self.s_max_mult * s_star * math.exp(self.sigma * math.sqrt(self.time_to_expiry))
-        s_min = 0.0
-        n = self.num_space_nodes
-
-        if self.grid_type == "uniform":
-            dS = (s_max - s_min) / n
-            grid = [s_min + i * dS for i in range(n + 1)]
-        else:
-            # sinh clustering around KO barrier (if any) or around Sref
-            if self.barrier_type in ("down-and-out", "double-out") and self.lower_barrier:
-                Sc = self.lower_barrier
-            elif self.barrier_type in ("up-and-out", "double-out") and self.upper_barrier:
-                Sc = self.upper_barrier
-            else:
-                Sc = s_star
-            a = self.sinh_alpha
-            # map x as an element between [-1,1] to S via sinh
-            xs = [-1.0 + 2.0* i / n for i in range(n+1)]
-            span = s_max-Sc
-            scale = span / max(1e-12, math.sinh(a))
-            grid = [Sc + scale * math.sinh(a * x) for x in xs]
-            # ensure lower bound >=0
-            shift = -min(0.0, min(grid))
-            if shift > 0:
-                grid = [s + shift for s in grid]
-
-        # Snap key levels to nearest grid nodes
-        def snap_to_grid(value: Optional[float]) -> None:
-            if value is None:
-                return
-            idx = min(range(len(grid)), key=lambda i: abs(grid[i] - value))
-            grid[idx] = float(value)
-
-        snap_to_grid(self.strike)
-        snap_to_grid(self.lower_barrier)
-        snap_to_grid(self.upper_barrier)
-        return grid
-
     def choose_grid_parameters(
         self,
         S0: float,
@@ -351,14 +275,6 @@ class DiscreteBarrierFDMPricer:
         upper_barrier: Optional[float],
         T: float,
         sigma: float,
-        monitor_times: Optional[List[float]] = None,
-        # tuning knobs
-        L_low: float = 4.0,          # how far down from min(ref) → S_min
-        L_high: float = 4.0,         # how far up from max(ref) → S_max
-        min_space: int = 300,        # minimum N_space for barrier work
-        points_per_sigma: int = 12,  # grid points per 1σ√T in log-space
-        lambda_target: float = 0.4,  # target diffusion number in log-space
-        steps_per_interval: int = 10 # min CN steps per (monitor) time interval
     ) -> Tuple[int, int, float, float]:
         """
         Return (N_space, N_time, S_min, S_max) for a log-space CN scheme,
@@ -416,14 +332,6 @@ class DiscreteBarrierFDMPricer:
             upper_barrier=self.upper_barrier,
             T=self.time_to_expiry,
             sigma=self.sigma,
-            monitor_times=self.monitor_times,
-            # you can override these knobs per product if you like:
-            L_low=4.0,
-            L_high=4.0,
-            min_space=300,
-            points_per_sigma=15,
-            lambda_target=0.5,
-            steps_per_interval=1,
         )
 
         self.num_space_nodes = N_space
@@ -454,12 +362,6 @@ class DiscreteBarrierFDMPricer:
         self.upper_barrier_log = math.log(self.upper_barrier) if self.upper_barrier else None
 
         return dx
-
-    def _european_payoff(self, S: float) -> float:
-        if self.option_type == "call":
-            return max(S - self.strike, 0.0)
-        else:
-            return max(self.strike - S, 0.0)
 
     def _terminal_payoff(self) -> List[float]:
         s_nodes = self.s_nodes
@@ -537,165 +439,6 @@ class DiscreteBarrierFDMPricer:
             if out:
                 V[i]=rebate
 
-    def _solve_tridiagonal_system(
-        self,
-        lower_diag: List[float],
-        main_diag: List[float],
-        upper_diag: List[float],
-        right_hand_side: List[float],
-    ) -> List[float]:
-        """Thomas algorithm specialized for tridiagonal matrices.
-            -Solve A x = b where A is tridiagonal with lower/main/upper diagonals.
-        """
-        n = len(right_hand_side)
-        modified_upper = [0.0] * n
-        modified_rhs = [0.0] * n
-        solution = [0.0] * n
-
-        # Forward sweep
-        pivot = main_diag[0]
-        if abs(pivot) < 1e-14:
-            pivot = 1e-14
-
-        modified_upper[0] = upper_diag[0] / pivot
-        modified_rhs[0] = right_hand_side[0] / pivot
-
-        for i in range(1, n):
-            pivot = main_diag[i] - lower_diag[i] * modified_upper[i - 1]
-
-            if abs(pivot) < 1e-14:
-                pivot = 1e-14
-            modified_upper[i] = upper_diag[i] / pivot if i < n - 1 else 0.0
-            modified_rhs[i] = (right_hand_side[i] - lower_diag[i] * modified_rhs[i - 1]) / pivot
-
-        # Back substitution
-        solution[-1] = modified_rhs[-1]
-        for i in range(n - 2, -1, -1):
-            solution[i] = modified_rhs[i] - modified_upper[i] * solution[i + 1]
-
-        return solution
-
-    def _cn_subinterval(self,
-                        s_nodes: List[float],
-                        V: List[float],
-                        t0: float,
-                        t1: float,
-                        theta: float,
-                        rannacher_left_steps: int,
-                        m_steps: int = 1,
-                        ) -> Tuple[List[float], float]:
-        """March from t1 to t0 (backwards). Return new V and dt used in the **last** step of the whole march when t0==0 (for theta)."""
-        self.configure_grid()
-        dx = self._build_log_grid()
-
-        r = self.discount_rate_nacc
-        b = self.carry_rate_nacc - self.div_yield_nacc
-        sig = self.sigma
-        q = self.div_yield_nacc
-
-        N = len(s_nodes) - 1
-        m = max(1, int(m_steps))
-        # choose number of steps in this sub-interval
-        L = t1 - t0
-        dt = L / m
-        last_dt_at_zero = None
-
-        # Assuming uniform grid here for simplicity
-        dS = s_nodes[1] - s_nodes[0]
-
-        for step in range(m):
-            use_theta = 1.0 if (rannacher_left_steps > 0) else theta
-            if rannacher_left_steps > 0:
-                rannacher_left_steps -= 1
-
-            tau_after = t0 + (m - step - 1) * dt  # time to maturity after this step
-            tau_left = tau_after
-
-            # Build tri-diagonal using non‑uniform coefficients (Tavella–Randall)
-            sub= [0.0] * (N + 1)
-            main= [0.0] * (N + 1)
-            sup= [0.0] * (N + 1)
-            rhs= [0.0] * (N + 1)
-
-
-            # Dirichlet boundaries at after-step time
-            if self.option_type=="call":
-                rhs[0] = 0.0
-                rhs[N] = s_nodes[-1]*math.exp(-q*tau_left) - self.strike*math.exp(-r*tau_left)
-            else:
-                rhs[0] = self.strike*math.exp(-r*tau_left)
-                rhs[N] = 0.0
-
-            main[0]=1.0
-            main[N]=1.0
-
-
-            for i in range(1,N):
-                Si = s_nodes[i]
-                h1 = s_nodes[i] - s_nodes[i-1]
-                h2 = s_nodes[i+1] - s_nodes[i]
-                A = 0.5*sig*sig*Si*Si
-                mu = b
-
-                # Canonical non‑uniform coefficients:
-                aI = use_theta*dt*( A*(2.0/(h1*(h1+h2))) - mu*Si*(1.0/(2.0*h1)) )
-                bI = 1.0 + use_theta*dt*( A*(2.0/(h1*h2)) + r )
-                cI = use_theta*dt*( A*(2.0/(h2*(h1+h2))) + mu*Si*(1.0/(2.0*h2)) )
-
-                aE = (1.0-use_theta)*dt*( A*(2.0/(h1*(h1+h2))) - mu*Si*(1.0/(2.0*h1)) )
-                bE = 1.0 - (1.0-use_theta)*dt*( A*(2.0/(h1*h2)) + r )
-                cE = (1.0-use_theta)*dt*( A*(2.0/(h2*(h1+h2))) + mu*Si*(1.0/(2.0*h2)) )
-
-                sub[i]  = -aI
-                main[i] =  bI
-                sup[i]  = -cI
-                rhs[i]  =  aE*V[i-1] + bE*V[i] + cE*V[i+1]
-            
-            V = self._solve_tridiagonal_system(sub, main, sup, rhs)
-
-            if abs(t0) < 1e-14 and step == m-1:
-                last_dt_at_zero = dt
-
-        return V, (last_dt_at_zero if last_dt_at_zero is not None else dt)
-
-    def solve_grid2(self, apply_KO: bool) -> list[float]:
-        """
-        Solve dV/dt = L V with L from Black–Scholes in S-space using
-        Rannacher + Crank–Nicolson between monitoring dates.
-
-        This keeps the external interface identical to the original
-        `solve_grid`, but internally delegates to the theoretically
-        consistent `_run_backward` + `_cn_subinterval` engine.
-
-        Parameters
-        ----------
-        apply_KO : bool
-            If True, knock-out projection is applied at monitoring dates.
-            If False, the barrier is ignored and a vanilla grid is returned.
-
-        Returns
-        -------
-        V : list[float]
-            Option values on the spatial grid `self.s_nodes` at valuation
-            time t = 0 (time-to-expiry τ = T). This grid is then used by
-            the interpolation routines to obtain the price at S0.
-        """
-        # Ensure grid in S is configured exactly once
-        self.configure_grid()
-        dx = self._build_log_grid()
-
-        # Run the backward time-march between all monitoring dates.
-        V, last_dt_at_zero, monitors_applied = self._run_backward(
-            s_nodes=self.s_nodes,
-            apply_barrier=apply_KO,
-        )
-
-        # Optionally store diagnostics if you want them later
-        self._last_dt_at_zero = last_dt_at_zero
-        self._monitors_applied = monitors_applied
-
-        return V
-
     def _solve_grid(self, apply_KO: bool, N_time: int = None) -> List[float]:
         """
         Solve dV/dτ = L V with L from Black–Scholes in log S via CN,
@@ -714,21 +457,12 @@ class DiscreteBarrierFDMPricer:
 
         # Discount & dividend yields in *continuous* compounding
         r = self.discount_rate_nacc
+        b = self.carry_rate_nacc 
         q = self.div_yield_nacc
-        mu_x = self.carry_rate_nacc - q
-        """
-        alpha = 0.5 * sig2
-        beta  = (mu_x - 0.5 * sig2)
-        
-        a = alpha / (dx * dx) - beta / (2.0 * dx)
-        b = -2.0 * alpha / (dx * dx) - r
-        c = alpha / (dx * dx) + beta / (2.0 * dx)
-        """
-        """"""
-        sig2 = self.sigma * self.sigma
-        mu_x = (self.carry_rate_nacc - self.div_yield_nacc) - 0.5 * sig2
 
-        
+        sig2 = self.sigma * self.sigma
+        mu_x = (b - q) - 0.5 * sig2
+
         # Operator coefficients in log space
         alpha = 0.5 * sig2 / (dx * dx)
         beta_adv = mu_x / (2.0 * dx)
@@ -812,48 +546,6 @@ class DiscreteBarrierFDMPricer:
                 self._apply_KO_projection(V,self.s_nodes, tau_next)
         return V
 
-    def _run_backward(self, s_nodes: List[float], apply_barrier: bool) -> Tuple[List[float], float,List[float]]:
-        """Return (final V at t=0, dt_last, monitors_applied_times)."""
-        N = len(s_nodes) - 1
-        V = self._terminal_payoff()
-
-        # Handle status flags at t=0 before marching
-        if apply_barrier:
-            if self.barrier_type in ("down-and-out","up-and-out","double-out") and self.already_hit:
-                # immediate rebate
-                instant = self.rebate_amount if self.rebate_at_hit else self.rebate_amount*math.exp(-self.carry_rate_nacc * self.time_to_carry)
-                return [instant]* (N+1), 0.0,[]
-            if self.barrier_type in ("down-and-in","up-and-in","double-in") and self.already_in:
-                apply_barrier = False  # vanilla from the start
-
-        theta = 0.5
-        monitors_applied = []
-        # Allocate substeps per interval (approximately M_target total)
-        subcounts = self._time_subgrid_counts()
-
-        rannacher_left = self.rannacher_steps
-        dt_last_global = None
-
-        # March interval by interval: [t_{k-1}, t_k], backward in time
-        for k in range(len(self.monitor_times)-1, 0, -1):
-            t0 = self.monitor_times[k-1]
-            t1 = self.monitor_times[k]
-            m_steps = subcounts[k-1] if k-1 < len(subcounts) else 1
-
-            V, dt_last = self._cn_subinterval(s_nodes, V, t0, t1, theta, rannacher_left, m_steps)
-            rannacher_left = max(0, rannacher_left - m_steps)
-
-            # After completing the subinterval, apply KO projection if t0 is a monitor
-            if apply_barrier and (abs(t0) > 1e-14):  # do not project at t=0
-                self._apply_KO_projection(V, s_nodes, tau_left=t0)
-                monitors_applied.append(t0)
-
-            if abs(t0) < 1e-14:
-                dt_last_global = dt_last
-
-        return V, (dt_last_global if dt_last_global is not None else self.time_spacing), monitors_applied
-
-
     def _delta_gamma_nonuniform(self, s_nodes: List[float], V: List[float]) -> Tuple[float, float]:
         """
         N=len(s_nodes)-1
@@ -933,64 +625,6 @@ class DiscreteBarrierFDMPricer:
 
         return None
 
-    def _interp_linear(self, x: float, xs: List[float], ys: List[float]) -> float:
-        if x <= xs[0]:
-            return ys[0]
-        if x >= xs[-1]:
-            return ys[-1]
-
-        lo, hi = 0, len(xs)-1
-        while hi - lo > 1:
-            mid = (lo + hi)//2
-            if x < xs[mid]:
-                hi = mid
-            else:
-                lo = mid
-        w = (x - xs[lo])/(xs[hi] - xs[lo])
-        return (1-w)*ys[lo] + w* ys[hi]
-
-    def price(self) -> float:
-        s_nodes = self.s_nodes
-
-        # Pure Vanilla
-        if self.barrier_type == "none":
-            V, _, _ = self._run_backward(s_nodes,apply_barrier=False)
-            return self._interp_linear(self.spot, s_nodes, V)
-
-        # Knock-out directly
-        if self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
-            V, _, _ = self._run_backward(s_nodes,apply_barrier=True)
-            return self._interp_linear(self.spot, s_nodes, V)
-
-        # Knock-in via parity
-        bt = self.barrier_type
-        if bt in ("down-and-in", "up-and-in"):
-            if self.already_in:
-                return self._vanilla_black76_price()
-            else:
-                original_bt = bt
-
-                P_van = self._vanilla_black76_price()
-
-                # matching knock-out
-                self.barrier_type = "down-and-out" if bt == "down-and-in" else "up-and-out"
-                g_ko = self._pde_price_and_greeks(apply_KO=True, dv_sigma=0.0001)
-
-                self.barrier_type = original_bt
-                return P_van - g_ko["price"]
-        
-        # Double-in or unsupported barrier type
-        if bt == "double-in":
-            if self.already_in:
-                return self._vanilla_black76_price()
-            else:
-                P_van = self._vanilla_black76_price()
-                self.barrier_type = "double-out"
-                g_ko = self._pde_price_and_greeks(apply_KO=True, dv_sigma=0.0001)
-                self.barrier_type = bt
-                return P_van - g_ko["price"]
-        
-        raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
 
     def _interp_price(self, V: List[float]) -> float:
         nodes = self.s_nodes
@@ -1109,7 +743,143 @@ class DiscreteBarrierFDMPricer:
             "theta": theta,
             "vega": vega,
     }
+    """
+    def _delta_gamma_from_grid(self, V: List[float]) -> Tuple[float, float]:
+        """
+        Compute delta and gamma at S0 from the PDE grid in *spot* space.
 
+        - Uses a non-uniform 3-point stencil.
+        - Away from barriers: central difference.
+        - Within `mollify_band_nodes` of a barrier and
+          `use_one_sided_greeks_near_barrier=True`, switches to a
+          one-sided stencil pointing *away* from the barrier.
+
+        This is the "model delta" and "model gamma" that the FIS-style
+        risk function will later use in the Taylor approximation.
+        """
+        s = self.s_nodes
+        V_arr = V
+        S0 = self.spot
+        N = len(s)
+
+        if N < 3:
+            raise RuntimeError("Need at least 3 spatial nodes for Greeks.")
+
+        # --- find interior node closest to S0 ---
+        idx = min(range(1, N - 1), key=lambda i: abs(s[i] - S0))
+
+        # --- locate barrier indices (if any) ---
+        barrier_indices: List[int] = []
+        if self.lower_barrier is not None:
+            i_low = min(range(N), key=lambda i: abs(s[i] - self.lower_barrier))
+            barrier_indices.append(i_low)
+        if self.upper_barrier is not None:
+            i_up = min(range(N), key=lambda i: abs(s[i] - self.upper_barrier))
+            barrier_indices.append(i_up)
+
+        # nearest barrier in index-space
+        near_barrier = False
+        is_lower_side = False
+        if barrier_indices and self.use_one_sided_greeks_near_barrier:
+            i_bar = min(barrier_indices, key=lambda j: abs(j - idx))
+            dist = abs(idx - i_bar)
+            if dist <= self.mollify_band_nodes:
+                near_barrier = True
+                # if barrier index is below idx, it's a lower barrier; otherwise upper
+                is_lower_side = i_bar < idx
+
+        # Helper functions for non-uniform finite differences
+        def central_stencil(i: int) -> Tuple[float, float]:
+            S_im1, S_i, S_ip1 = s[i - 1], s[i], s[i + 1]
+            V_im1, V_i, V_ip1 = V_arr[i - 1], V_arr[i], V_arr[i + 1]
+            h1 = S_i - S_im1
+            h2 = S_ip1 - S_i
+            delta_c = (
+                -h2 / (h1 * (h1 + h2)) * V_im1
+                + (h2 - h1) / (h1 * h2) * V_i
+                + h1 / (h2 * (h1 + h2)) * V_ip1
+            )
+            gamma_c = 2.0 * (
+                V_im1 / (h1 * (h1 + h2))
+                - V_i / (h1 * h2)
+                + V_ip1 / (h2 * (h1 + h2))
+            )
+            return float(delta_c), float(gamma_c)
+
+        def forward_stencil(i: int) -> Tuple[float, float]:
+            """
+            One-sided forward stencil at node i using i, i+1, i+2.
+            Appropriate when barrier is below and we want information
+            from the interior (higher S).
+            """
+            if i + 2 >= N:
+                return central_stencil(i)
+
+            S0_, S1, S2 = s[i], s[i + 1], s[i + 2]
+            V0, V1, V2 = V_arr[i], V_arr[i + 1], V_arr[i + 2]
+
+            h1 = S1 - S0_
+            h2 = S2 - S1
+
+            # first derivative coefficients (non-uniform forward)
+            a0 = (-2.0 * h1 - h2) / (h1 * h1 + h1 * h2)
+            a1 = (h1 + h2) / (h1 * h2)
+            a2 = -h1 / (h1 * h2 + h2 * h2)
+
+            # second derivative coefficients (non-uniform forward)
+            b0 = 2.0 / (h1 * h1 + h1 * h2)
+            b1 = -2.0 / (h1 * h2)
+            b2 = 2.0 / (h1 * h2 + h2 * h2)
+
+            delta_f = a0 * V0 + a1 * V1 + a2 * V2
+            gamma_f = b0 * V0 + b1 * V1 + b2 * V2
+            return float(delta_f), float(gamma_f)
+
+        def backward_stencil(i: int) -> Tuple[float, float]:
+            """
+            One-sided backward stencil at node i using i, i-1, i-2.
+            Appropriate when barrier is above and we want information
+            from the interior (lower S).
+            """
+            if i - 2 <= 0:
+                return central_stencil(i)
+
+            S0_, S_1, S_2 = s[i], s[i - 1], s[i - 2]
+            V0, V1, V2 = V_arr[i], V_arr[i - 1], V_arr[i - 2]
+
+            h1 = S0_ - S_1
+            h2 = S_1 - S_2
+
+            # first derivative coefficients (non-uniform backward)
+            c0 = (2.0 * h1 + h2) / (h1 * h1 + h1 * h2)
+            c1 = -(h1 + h2) / (h1 * h2)
+            c2 = h1 / (h1 * h2 + h2 * h2)
+
+            # second derivative coefficients (same structure as forward)
+            d0 = 2.0 / (h1 * h1 + h1 * h2)
+            d1 = -2.0 / (h1 * h2)
+            d2 = 2.0 / (h1 * h2 + h2 * h2)
+
+            delta_b = c0 * V0 + c1 * V1 + c2 * V2
+            gamma_b = d0 * V0 + d1 * V1 + d2 * V2
+            return float(delta_b), float(gamma_b)
+
+        if near_barrier:
+            # If the nearest barrier is below idx, we are near a lower barrier
+            # and want a forward stencil (towards higher S). Otherwise backward.
+            if is_lower_side:
+                delta, gamma = forward_stencil(idx)
+            else:
+                delta, gamma = backward_stencil(idx)
+        else:
+            delta, gamma = central_stencil(idx)
+
+        # Small safety clamp on gamma to avoid exploding values
+        gamma = max(min(gamma, 1e5), -1e5)
+
+        return float(delta), float(gamma)
+    """
+    
     def _pde_price_and_greeks3(self, apply_KO: bool, dv_sigma: float = 0.0001, use_richardson: bool = False) -> Dict[str, float]:
         # Simplified: use_richardson is never True in practice, so removed that code path
         V_grid = self._solve_grid(apply_KO=apply_KO)
@@ -1133,41 +903,6 @@ class DiscreteBarrierFDMPricer:
 
         return {"price": price_base, "delta": delta, "gamma": gamma, "vega": vega, "theta": theta}
 
-    def _pde_price_and_greeks(self, apply_KO: bool, dv_sigma: float = 0.0001) -> Dict[str, float]:
-        """Use CN grid to compute price + Greeks for current barrier_type."""
-
-        V_grid = self._solve_grid(apply_KO=apply_KO)
-        price = self._interp_price(V_grid)
-        delta, gamma = self._delta_gamma_from_grid(V_grid)
-
-        S0 = self.spot
-        sigma = self.sigma
-        r = self.discount_rate_nacc
-        b = self.carry_rate_nacc
-
-        theta = -(
-            0.5 * sigma * sigma * S0 * S0 * gamma
-            + b * S0 * delta
-            - r * price
-        )
-
-        # Vega via central bump in sigma (same CN engine)
-        sigma_orig = sigma
-
-        self.sigma = sigma_orig + dv_sigma
-        V_up = self._solve_grid(apply_KO=apply_KO)
-        p_up = self._interp_price(V_up)
-
-        self.sigma = sigma_orig
-        vega = (p_up - price) / (100 * dv_sigma)
-
-        return {
-            "price": price,
-            "delta": delta,
-            "gamma": gamma,
-            "vega": vega,
-            "theta": theta,
-        }
 
     def price_log2(self, apply_KO: bool = True, use_richardson: bool = False) -> float:
         """
@@ -1210,41 +945,6 @@ class DiscreteBarrierFDMPricer:
 
         raise ValueError(f"Unsupported barrier_type: {self.barrier_type}")
 
-    def price_log(self) -> float:
-        dx = self._build_log_grid()
-
-        S_eff = self.spot
-
-        # Vanilla
-        if self.barrier_type == "none":
-            V = self._vanilla_black76_price()
-            return V
-
-        # Pure KO
-        if self.barrier_type in ("down-and-out", "up-and-out", "double-out"):
-            V, _,_ = self._run_backward(self.s_nodes, apply_barrier=True)
-            return self._interp_price(V)
-
-        # KI via parity: V_in = V_van - V_KO
-        ko_type = self._map_KI_to_KO()
-        if ko_type is None:
-            raise ValueError(f"Unknown KI barrier_type {self.barrier_type}")
-
-        original_type = self.barrier_type
-
-        # vanilla
-        self.barrier_type = "none"
-        V_van = self._vanilla_black76_price()
-
-        # KO with mapped type
-        self.barrier_type = ko_type
-        V_ko, _,_ = self._run_backward(self.s_nodes, apply_barrier=True)
-        P_ko = self._interp_price(V_ko)
-
-        self.barrier_type = original_type
-
-        V_in = V_van - P_ko
-        return V_in
 
     def _delta_gamma_from_grid(self, V: List[float]) -> Tuple[float, float]:
         """Non-uniform central differences for delta & gamma at S0."""
@@ -1382,3 +1082,162 @@ class DiscreteBarrierFDMPricer:
             print(f"{r['N']:5d} {r['M']:5d}  {r['price']:12.8f}  {r['delta']:13.8f}  {r['gamma']:13.8f}  {r['vega']:13.8f}  {r['theta']:13.8f}")
         return out
 
+        """
+            def _pde_price_and_greeks3(
+        self,
+        apply_KO: bool,
+        dv_sigma: float = 0.0001,
+        use_richardson: bool = False,
+    ) -> Dict[str, float]:
+        """
+        Core CN + Rannacher PDE engine.
+
+        Returns at least {"price": price}. If
+        `self.calculate_greeks_in_pde` is True, also returns
+        delta, gamma, vega, theta (the "model Greeks" used
+        by the FIS-style risk function).
+
+        - Price: interpolated at S0 from the grid.
+        - Delta, gamma: from the barrier-aware non-uniform stencil.
+        - Vega: bump-and-revalue on sigma.
+        - Theta: from the BS PDE relation at S0.
+        """
+        # Solve PDE once for base sigma
+        V_grid = self._solve_grid(apply_KO=apply_KO)
+        price_base = self._interp_price(V_grid)
+
+        # If Greeks disabled (e.g. risk-function full reval), stop here
+        if not self.calculate_greeks_in_pde:
+            return {"price": float(price_base)}
+
+        # Barrier-aware delta and gamma from grid
+        delta, gamma = self._delta_gamma_from_grid(V_grid)
+
+        # Vega via bump
+        orig_sigma = self.sigma
+        self.sigma = orig_sigma + dv_sigma
+        V_up = self._solve_grid(apply_KO=apply_KO)
+        price_up = self._interp_price(V_up)
+        self.sigma = orig_sigma
+
+        vega = (price_up - price_base) / (dv_sigma * 100.0)
+
+        # Theta from PDE relation at S0
+        theta = -(
+            0.5 * orig_sigma * orig_sigma * self.spot * self.spot * gamma
+            + (self.carry_rate_nacc - self.div_yield_nacc) * self.spot * delta
+            - self.discount_rate_nacc * price_base
+        )
+
+        return {
+            "price": float(price_base),
+            "delta": float(delta),
+            "gamma": float(gamma),
+            "vega": float(vega),
+            "theta": float(theta),
+        }
+        """
+        
+        """
+            def risk_reprice_spot(
+        self,
+        shifted_spot: float,
+        *,
+        rel_price_shift_model: float = 0.01,
+        price_domain_scale_factor: float = 1.1,
+        force_full_revaluation: bool = False,
+        base_price: Optional[float] = None,
+        base_greeks: Optional[Dict[str, float]] = None,
+    ) -> Dict[str, Any]:
+        """
+        FIS-style risk function for underlying price shifts using this PDE model.
+
+        - If only the underlying price is shifted and the shift magnitude is
+          within the price domain, approximate the shifted price via:
+
+              f̂(S*) = f(S0) + Δ_model * h + ½ Γ_model * h²
+
+          where h = S* - S0 and (Δ_model, Γ_model) are the model Greeks from
+          the base PDE run.
+
+        - If the shift is outside the price domain or force_full_revaluation=True,
+          perform a full PDE revaluation with Greeks turned off.
+
+        Parameters
+        ----------
+        shifted_spot : float
+            New underlying price S* for the shifted scenario.
+        rel_price_shift_model : float, optional
+            Relative price shift used in the model's own Greek calculation
+            (e.g. 0.01 for 1%). This defines the baseline "radius" in which
+            the Taylor approximation is trusted.
+        price_domain_scale_factor : float, optional
+            FIS priceDomainScaleFactor. Default 1.1.
+        force_full_revaluation : bool, optional
+            If True, always perform full PDE revaluation.
+        base_price : float, optional
+            Base price f(S0). If None, computed via price_log2().
+        base_greeks : dict, optional
+            Base Greeks, containing at least 'delta' and 'gamma'.
+            If None, computed via greeks_log2().
+
+        Returns
+        -------
+        dict
+            {
+                "result": shifted_price,
+                "used_taylor_approx": bool,
+                "shift_magnitude": float,
+                "price_domain": float,
+            }
+        """
+        from copy import deepcopy
+
+        # --- Base values ---
+        S0 = self.spot
+        if base_price is None:
+            base_price = self.price_log2()
+        if base_greeks is None:
+            base_greeks = self.greeks_log2()
+
+        price_shift = shifted_spot - S0
+        shift_magnitude = abs(price_shift)
+
+        # priceDomain = scaleFactor * relPriceShiftModel * S0
+        price_domain = price_domain_scale_factor * rel_price_shift_model * S0
+
+        # Decision: use full revaluation or Taylor approx?
+        outside_domain = shift_magnitude > price_domain
+
+        if force_full_revaluation or outside_domain:
+            # ---- Full revaluation branch ----
+            shifted_pricer = deepcopy(self)
+            shifted_pricer.spot = shifted_spot
+            shifted_pricer.calculate_greeks_in_pde = False  # price-only PDE
+
+            shifted_price = shifted_pricer.price_log2()
+
+            return {
+                "result": shifted_price,
+                "used_taylor_approx": False,
+                "shift_magnitude": shift_magnitude,
+                "price_domain": price_domain,
+            }
+
+        # ---- Taylor approximation branch ----
+        delta = base_greeks.get("delta", 0.0)
+        gamma = base_greeks.get("gamma", 0.0)
+
+        recalced_price = (
+            base_price
+            + delta * price_shift
+            + 0.5 * gamma * price_shift * price_shift
+        )
+
+        return {
+            "result": recalced_price,
+            "used_taylor_approx": True,
+            "shift_magnitude": shift_magnitude,
+            "price_domain": price_domain,
+        }
+        """
