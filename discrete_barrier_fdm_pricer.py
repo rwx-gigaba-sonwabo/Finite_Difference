@@ -1241,3 +1241,209 @@ class DiscreteBarrierFDMPricer:
             "price_domain": price_domain,
         }
         """
+
+    def __init__(..., 
+             spot_shift_rel_for_greeks: float = 0.0,
+             ...):
+    ...
+    self.spot_shift_rel_for_greeks = float(spot_shift_rel_for_greeks)
+    
+        def _interp_price_at_S(self, V: List[float], S_target: float) -> float:
+        """
+        Interpolate the PDE solution V(s) at an arbitrary spot S_target
+        using linear interpolation in spot-space.
+        """
+        s = self.s_nodes
+        N = len(s)
+        if S_target <= s[0]:
+            return float(V[0])
+        if S_target >= s[-1]:
+            return float(V[-1])
+
+        # find bracket i such that s[i] <= S_target <= s[i+1]
+        # (you can binary-search this later if you want)
+        for i in range(N - 1):
+            if s[i] <= S_target <= s[i + 1]:
+                w = (S_target - s[i]) / (s[i + 1] - s[i])
+                return float((1.0 - w) * V[i] + w * V[i + 1])
+
+        return float(V[-1])  # fallback
+
+        def _interp_price(self, V: List[float]) -> float:
+        return self._interp_price_at_S(V, self.spot)
+
+        def _delta_gamma_from_grid(
+        self,
+        V: List[float],
+        spot_shift_rel: float | None = None,
+    ) -> Tuple[float, float]:
+
+        def _delta_gamma_from_grid(
+        self,
+        V: List[float],
+        spot_shift_rel: float | None = None,
+    ) -> Tuple[float, float]:
+
+            s = self.s_nodes
+        V_arr = V
+        S0 = self.spot
+        N = len(s)
+
+        if N < 3:
+            raise RuntimeError("Need at least 3 spatial nodes for Greeks.")
+
+        # --- If a user-specified perturbation is provided, use bump-based Greeks ---
+        if spot_shift_rel is not None and spot_shift_rel > 0.0:
+            h = spot_shift_rel * S0
+            S_down = S0 - h
+            S_up = S0 + h
+
+            V0 = self._interp_price_at_S(V_arr, S0)
+            V_down = self._interp_price_at_S(V_arr, S_down)
+            V_up = self._interp_price_at_S(V_arr, S_up)
+
+            # central finite differences in *spot*
+            delta = (V_up - V_down) / (S_up - S_down)
+            h_eff = 0.5 * (S_up - S_down)
+            gamma = (V_up - 2.0 * V0 + V_down) / (h_eff * h_eff)
+
+            # small safety clamp on gamma
+            gamma = max(min(gamma, 1e5), -1e5)
+            return float(delta), float(gamma)
+
+    from typing import List, Tuple, Optional
+
+    def _interp_price_at_S(self, V: List[float], S_target: float) -> float:
+        """
+        Interpolate the PDE solution V(s) at an arbitrary spot S_target
+        using linear interpolation in spot space.
+        """
+        s = self.s_nodes
+        N = len(s)
+        if S_target <= s[0]:
+            return float(V[0])
+        if S_target >= s[-1]:
+            return float(V[-1])
+
+        for i in range(N - 1):
+            if s[i] <= S_target <= s[i + 1]:
+                w = (S_target - s[i]) / (s[i + 1] - s[i])
+                return float((1.0 - w) * V[i] + w * V[i + 1])
+
+        # Fallback (should not really be hit)
+        return float(V[-1])
+
+    def _delta_gamma_from_grid(
+        self,
+        V: List[float],
+        spot_shift_rel: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        """
+        Compute delta and gamma at S0 from the PDE grid in *spot* space.
+
+        Two modes:
+
+        1) If spot_shift_rel > 0:
+           - Use a bump-based central difference in spot:
+                 h = spot_shift_rel * S0
+                 Delta ~ [V(S0+h) - V(S0-h)] / (2h)
+                 Gamma ~ [V(S0+h) - 2V(S0) + V(S0-h)] / h^2
+           - All prices are obtained by interpolation on the existing grid.
+
+        2) If spot_shift_rel is None or <= 0:
+           - Use a non-uniform 3-point central stencil in spot.
+           - Near a barrier (within mollify_band_nodes in index-space) and
+             use_one_sided_greeks_near_barrier=True, shift the stencil one
+             node away from the barrier to avoid straddling it.
+        """
+        s = self.s_nodes
+        V_arr = V
+        S0 = self.spot
+        N = len(s)
+
+        if N < 3:
+            raise RuntimeError("Need at least 3 spatial nodes for Greeks.")
+
+        # ------------------------------------------------------------------
+        # 1) Bump-based Greeks (user-specified perturbation)
+        # ------------------------------------------------------------------
+        if spot_shift_rel is not None and spot_shift_rel > 0.0:
+            h = spot_shift_rel * S0
+            S_down = S0 - h
+            S_up = S0 + h
+
+            V0 = self._interp_price_at_S(V_arr, S0)
+            V_down = self._interp_price_at_S(V_arr, S_down)
+            V_up = self._interp_price_at_S(V_arr, S_up)
+
+            delta = (V_up - V_down) / (S_up - S_down)
+            h_eff = 0.5 * (S_up - S_down)
+            gamma = (V_up - 2.0 * V0 + V_down) / (h_eff * h_eff)
+
+            # Safety clamp on gamma
+            gamma = max(min(gamma, 1e5), -1e5)
+            return float(delta), float(gamma)
+
+        # ------------------------------------------------------------------
+        # 2) Grid-based non-uniform central stencil (with barrier awareness)
+        # ------------------------------------------------------------------
+
+        # Find interior node closest to S0
+        idx = min(range(1, N - 1), key=lambda i: abs(s[i] - S0))
+
+        # Identify barrier indices (if any)
+        barrier_indices: List[int] = []
+        if self.lower_barrier is not None:
+            i_low = min(range(N), key=lambda i: abs(s[i] - self.lower_barrier))
+            barrier_indices.append(i_low)
+        if self.upper_barrier is not None:
+            i_up = min(range(N), key=lambda i: abs(s[i] - self.upper_barrier))
+            barrier_indices.append(i_up)
+
+        near_barrier = False
+        is_lower_side = False  # True if nearest barrier lies below idx
+
+        if barrier_indices and self.use_one_sided_greeks_near_barrier:
+            i_bar = min(barrier_indices, key=lambda j: abs(j - idx))
+            dist = abs(idx - i_bar)
+            if dist <= self.mollify_band_nodes:
+                near_barrier = True
+                is_lower_side = i_bar < idx
+
+        # Choose stencil index:
+        #  - Default: idx (central around S0)
+        #  - Near lower barrier: move one node up (towards larger S)
+        #  - Near upper barrier: move one node down (towards smaller S)
+        i = idx
+        if near_barrier:
+            if is_lower_side:
+                i = min(idx + 1, N - 2)
+            else:
+                i = max(idx - 1, 1)
+
+        S_im1, S_i, S_ip1 = s[i - 1], s[i], s[i + 1]
+        V_im1, V_i, V_ip1 = V_arr[i - 1], V_arr[i], V_arr[i + 1]
+
+        h1 = S_i - S_im1
+        h2 = S_ip1 - S_i
+
+        # Non-uniform central finite-difference coefficients:
+        #   f'(x0) ≈ a_-1 f_{-1} + a_0 f_0 + a_+1 f_{+1}
+        #   f''(x0) ≈ b_-1 f_{-1} + b_0 f_0 + b_+1 f_{+1}
+        # with x0 = S_i, x_{-1} = S_i - h1, x_{+1} = S_i + h2.
+        a_m1 = -h2 / (h1 * (h1 + h2))
+        a_0 = (h2 - h1) / (h1 * h2)
+        a_p1 = h1 / (h2 * (h1 + h2))
+
+        b_m1 = 2.0 / (h1 * (h1 + h2))
+        b_0 = -2.0 / (h1 * h2)
+        b_p1 = 2.0 / (h2 * (h1 + h2))
+
+        delta = a_m1 * V_im1 + a_0 * V_i + a_p1 * V_ip1
+        gamma = b_m1 * V_im1 + b_0 * V_i + b_p1 * V_ip1
+
+        # Safety clamp on gamma
+        gamma = max(min(gamma, 1e5), -1e5)
+
+        return float(delta), float(gamma)
+
