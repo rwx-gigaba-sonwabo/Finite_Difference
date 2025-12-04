@@ -2049,3 +2049,208 @@ def front_arena_style_spot_curve(
         """
         return self._delta_gamma_nonuniform(self.s_nodes, V)
 
+    def _snap_critical_levels_to_grid(self) -> None:
+        """
+        Snap spot, barriers and strike to the *closest* S-grid nodes and
+        record both indices and snapped values.
+
+        We do NOT change self.spot / self.lower_barrier / self.strike
+        (they remain the 'true' economic inputs). The snapped versions
+        are only used inside the PDE / Greeks logic.
+        """
+        s = self.s_nodes
+        N = len(s)
+        if N == 0:
+            return
+
+        # Effective spot in S-domain (you’re already using spot - PV(divs) elsewhere)
+        S_eff = self.spot - self.pv_divs
+
+        # --- spot ---
+        self.spot_grid_index = min(range(N), key=lambda i: abs(s[i] - S_eff))
+        self.spot_snapped = s[self.spot_grid_index]
+
+        # --- lower barrier ---
+        if self.snap_barriers_to_grid and self.lower_barrier is not None:
+            idx = min(range(N), key=lambda i: abs(s[i] - self.lower_barrier))
+            self.lower_barrier_index = idx
+            self.lower_barrier_snapped = s[idx]
+        else:
+            self.lower_barrier_index = None
+            self.lower_barrier_snapped = self.lower_barrier
+
+        # --- upper barrier ---
+        if self.snap_barriers_to_grid and self.upper_barrier is not None:
+            idx = min(range(N), key=lambda i: abs(s[i] - self.upper_barrier))
+            self.upper_barrier_index = idx
+            self.upper_barrier_snapped = s[idx]
+        else:
+            self.upper_barrier_index = None
+            self.upper_barrier_snapped = self.upper_barrier
+
+        # --- strike ---
+        if self.snap_strike_to_grid:
+            idx = min(range(N), key=lambda i: abs(s[i] - self.strike))
+            self.strike_grid_index = idx
+            self.strike_snapped = s[idx]
+        else:
+            self.strike_grid_index = None
+            self.strike_snapped = self.strike
+
+    def _build_log_grid(self) -> float:
+        self.configure_grid()
+        S_min = self._S_min
+        S_max = self._S_max
+
+        x_min = math.log(S_min)
+        x_max = math.log(S_max)
+
+        n = self.num_space_nodes
+        dx = (x_max - x_min) / n
+        x_nodes = [x_min + i * dx for i in range(n + 1)]
+
+        # precompute S-grid
+        self.s_nodes = [math.exp(x) for x in x_nodes]
+
+        # (you already had the log-barrier lines here; keep them if you want)
+        self.lower_barrier_log = math.log(self.lower_barrier) if self.lower_barrier else None
+        self.upper_barrier_log = math.log(self.upper_barrier) if self.upper_barrier else None
+
+        # --- NEW: snap crit levels to the grid ---
+        self._snap_critical_levels_to_grid()
+
+        return dx
+
+    def _terminal_payoff(self) -> List[float]:
+        s_nodes = self.s_nodes
+        # use snapped strike if enabled
+        k = (
+            self.strike_snapped
+            if (self.snap_strike_to_grid and self.strike_snapped is not None)
+            else self.strike
+        )
+        if self.option_type == "call":
+            return [max(s - k, 0.0) for s in s_nodes]
+        else:
+            return [max(k - s, 0.0) for s in s_nodes]
+
+    def _apply_KO_projection(self, V: List[float], s_nodes: List[float], tau_left: float) -> None:
+        """
+        Project knock-outs at a monitoring time by zeroing / rebating values
+        on the KO side of the barrier. Uses snapped barrier indices if present.
+        """
+        if self.barrier_type in ("none", "down-and-in", "up-and-in", "double-in"):
+            return
+
+        if self.rebate_at_hit:
+            rebate = self.rebate_amount
+        else:
+            rebate = self.rebate_amount * math.exp(-self.carry_rate_nacc * tau_left)
+
+        n = min(len(V), len(s_nodes))
+
+        lo_idx = self.lower_barrier_index
+        up_idx = self.upper_barrier_index
+
+        for i in range(n):
+            out = False
+
+            if self.barrier_type == "down-and-out":
+                if lo_idx is not None and i <= lo_idx:
+                    out = True
+            elif self.barrier_type == "up-and-out":
+                if up_idx is not None and i >= up_idx:
+                    out = True
+            elif self.barrier_type == "double-out":
+                if (lo_idx is not None and i <= lo_idx) or (up_idx is not None and i >= up_idx):
+                    out = True
+
+            if out:
+                V[i] = rebate
+
+        # One-sided near KO barrier
+        H=None
+        side=None
+
+        if self.barrier_type in ("down-and-out","double-out") and self.lower_barrier is not None:
+            H=float(self.lower_barrier)
+            side="down"
+        elif self.barrier_type in ("up-and-out","double-out") and self.upper_barrier is not None:
+            H=float(self.upper_barrier)
+            side="up"
+
+        if H is None or side is None:
+            return float(delta_c), float(gamma_c)
+
+        if side=="up":
+            inside_indices = [k for k in range(N+1) if s_nodes[k]<H]
+            ...
+
+        # One-sided near KO barrier, using snapped indices if available
+        j: Optional[int] = None
+        side: Optional[str] = None
+
+        if self.barrier_type in ("down-and-out", "double-out") and self.lower_barrier_index is not None:
+            j = self.lower_barrier_index
+            side = "down"
+        elif self.barrier_type in ("up-and-out", "double-out") and self.upper_barrier_index is not None:
+            j = self.upper_barrier_index
+            side = "up"
+
+        if j is None or side is None:
+            return float(delta_c), float(gamma_c)
+
+        band = max(1, int(self.mollify_band_nodes))
+        dist = abs(i - j)
+
+        if dist > band:
+            # outside barrier band ⇒ pure central
+            return float(delta_c), float(gamma_c)
+
+        # linear weight q ∈ [0,1], q=1 at node closest to barrier, 0 at edge
+        q = 1.0 - dist / float(band)
+        q = max(0.0, min(1.0, q))
+
+        # One-sided approximations staying strictly inside the alive region
+        if side == "up":
+            # alive side is below j ⇒ use backward stencil at/near j
+            i1 = max(1, min(N - 1, j))
+            h_b = s_nodes[i1] - s_nodes[i1 - 1]
+            delta_os = (V[i1] - V[i1 - 1]) / h_b if h_b > 0 else delta_c
+
+            if i1 >= 2:
+                S_im2, S_im1, S_i = s_nodes[i1 - 2], s_nodes[i1 - 1], s_nodes[i1]
+                V_im2, V_im1, V_i = V[i1 - 2], V[i1 - 1], V[i1]
+                h1_b = S_im1 - S_im2
+                h2_b = S_i - S_im1
+                gamma_os = 2.0 * (
+                    V_im2 / (h1_b * (h1_b + h2_b))
+                    - V_im1 / (h1_b * h2_b)
+                    + V_i / (h2_b * (h1_b + h2_b))
+                )
+            else:
+                gamma_os = gamma_c
+        else:
+            # side == "down": alive side is above j ⇒ forward stencil
+            i1 = max(1, min(N - 2, j))
+            h_f = s_nodes[i1 + 1] - s_nodes[i1]
+            delta_os = (V[i1 + 1] - V[i1]) / h_f if h_f > 0 else delta_c
+
+            if i1 + 2 <= N:
+                S_i, S_ip1, S_ip2 = s_nodes[i1], s_nodes[i1 + 1], s_nodes[i1 + 2]
+                V_i, V_ip1, V_ip2 = V[i1], V[i1 + 1], V[i1 + 2]
+                h1_f = S_ip1 - S_i
+                h2_f = S_ip2 - S_ip1
+                gamma_os = 2.0 * (
+                    V_i / (h1_f * (h1_f + h2_f))
+                    - V_ip1 / (h1_f * h2_f)
+                    + V_ip2 / (h2_f * (h1_f + h2_f))
+                )
+            else:
+                gamma_os = gamma_c
+
+        delta = q * delta_os + (1.0 - q) * delta_c
+        gamma = q * gamma_os + (1.0 - q) * gamma_c
+        gamma = max(min(gamma, 1e5), -1e5)
+        return float(delta), float(gamma)
+
