@@ -2254,3 +2254,136 @@ def front_arena_style_spot_curve(
         gamma = max(min(gamma, 1e5), -1e5)
         return float(delta), float(gamma)
 
+def _delta_gamma_nonuniform(self, V, s_nodes):
+    """
+    Compute delta & gamma using:
+    - central finite difference away from barriers
+    - q-weighted blend of central + one-sided stencil near barrier (FIS FCA3761-09)
+    - full reliance on snapped barrier & spot indices
+    """
+
+    N = len(s_nodes) - 1
+
+    # ---- Effective spot
+    S0 = self.spot - self.pv_divs if self.pv_divs else self.spot
+
+    # ---- Index of spot on the grid (snapped if enabled)
+    if self.spot_grid_index is not None:
+        i = self.spot_grid_index
+    else:
+        i = min(range(N + 1), key=lambda k: abs(s_nodes[k] - S0))
+
+    # Require interior node
+    if i <= 0:
+        i = 1
+    if i >= N:
+        i = N - 1
+
+    # ---- Central FD stencil (non-uniform)
+    S_im1, S_i, S_ip1 = s_nodes[i - 1], s_nodes[i], s_nodes[i + 1]
+    V_im1, V_i, V_ip1 = V[i - 1], V[i], V[i + 1]
+
+    h1 = S_i - S_im1
+    h2 = S_ip1 - S_i
+
+    # Delta central
+    delta_c = (h2 * (V_i - V_im1) / h1 + h1 * (V_ip1 - V_i) / h2) / (h1 + h2)
+
+    # Gamma central
+    gamma_c = 2.0 * (
+        V_im1 / (h1 * (h1 + h2))
+        - V_i / (h1 * h2)
+        + V_ip1 / (h2 * (h1 + h2))
+    )
+    gamma_c = max(min(gamma_c, 1e5), -1e5)
+
+    # ---- If no barrier smoothing requested → return pure central
+    if not self.use_one_sided_greeks_near_barrier:
+        return float(delta_c), float(gamma_c)
+
+    # ---- Find nearest barrier index (snapped)
+    j = None
+    side = None   # whether we use backward or forward stencil
+
+    if self.barrier_type in ("up-and-out", "double-out") and self.upper_barrier_index is not None:
+        j = self.upper_barrier_index
+        side = "up"
+
+    if self.barrier_type in ("down-and-out", "double-out") and self.lower_barrier_index is not None:
+        # If both exist choose the closest
+        lo = self.lower_barrier_index
+        if j is None or abs(lo - i) < abs(j - i):
+            j = lo
+            side = "down"
+
+    if j is None:
+        return float(delta_c), float(gamma_c)
+
+    # ---- Distance in nodes
+    dist = abs(i - j)
+    band = max(1, self.mollify_band_nodes)
+
+    if dist > band:
+        # far from barrier → use central
+        return float(delta_c), float(gamma_c)
+
+    # ---- q-weight (FIS FCA3761-09 eqn)
+    q = 1.0 - dist / float(band)
+    q = max(0.0, min(1.0, q))
+
+    # ---- Compute one-sided approximations
+    if side == "up":  # alive region is *below* the barrier → backward stencil
+        idx = max(1, min(N - 1, j))  # ensure central region exists
+
+        # backward delta
+        h = s_nodes[idx] - s_nodes[idx - 1]
+        delta_os = (V[idx] - V[idx - 1]) / h if h > 0 else delta_c
+
+        # backward gamma
+        if idx >= 2:
+            S_m2, S_m1, S_m = s_nodes[idx - 2], s_nodes[idx - 1], s_nodes[idx]
+            V_m2, V_m1, V_m = V[idx - 2], V[idx - 1], V[idx]
+
+            h1b = S_m1 - S_m2
+            h2b = S_m - S_m1
+
+            gamma_os = 2.0 * (
+                V_m2 / (h1b * (h1b + h2b))
+                - V_m1 / (h1b * h2b)
+                + V_m / (h2b * (h1b + h2b))
+            )
+        else:
+            gamma_os = gamma_c
+
+    else:  # side == "down"  → alive region is *above* barrier → forward stencil
+        idx = max(1, min(N - 2, j))
+
+        # forward delta
+        h = s_nodes[idx + 1] - s_nodes[idx]
+        delta_os = (V[idx + 1] - V[idx]) / h if h > 0 else delta_c
+
+        # forward gamma
+        if idx + 2 <= N:
+            S_0, S_1, S_2 = s_nodes[idx], s_nodes[idx + 1], s_nodes[idx + 2]
+            V_0, V_1, V_2 = V[idx], V[idx + 1], V[idx + 2]
+
+            h1f = S_1 - S_0
+            h2f = S_2 - S_1
+
+            gamma_os = 2.0 * (
+                V_0 / (h1f * (h1f + h2f))
+                - V_1 / (h1f * h2f)
+                + V_2 / (h2f * (h1f + h2f))
+            )
+        else:
+            gamma_os = gamma_c
+
+    # ---- Blend central + one-sided smoothly (FIS "q D_s + (1-q) D_c")
+    delta = q * delta_os + (1.0 - q) * delta_c
+    gamma = q * gamma_os + (1.0 - q) * gamma_c
+
+    gamma = max(min(gamma, 1e5), -1e5)
+
+    return float(delta), float(gamma)
+
+
