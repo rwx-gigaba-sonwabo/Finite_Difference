@@ -1738,3 +1738,137 @@ class DiscreteBarrierFDMPricer:
         # only the price is computed.
         self.calculate_greeks_in_pde: bool = True
 
+    def price_delta_gamma_with_risk(
+        self,
+        shifted_spot: float,
+        *,
+        rel_price_shift_model: float = 0.01,
+        price_domain_scale_factor: float = 1.1,
+    ) -> Dict[str, float]:
+        """
+        Convenience wrapper: for this shifted_spot, either
+        - use Taylor approximation around current self.spot, or
+        - do a full PDE revaluation if outside price domain.
+
+        Returns price, delta, gamma for the scenario.
+        """
+        S0 = self.spot
+        base_price = self.price_log2()
+        base_greeks = self.greeks_log2()
+        delta0 = base_greeks["delta"]
+        gamma0 = base_greeks["gamma"]
+
+        rf_out = self.risk_reprice_spot(
+            shifted_spot=shifted_spot,
+            rel_price_shift_model=rel_price_shift_model,
+            price_domain_scale_factor=price_domain_scale_factor,
+            base_price=base_price,
+            base_greeks=base_greeks,
+        )
+
+        h = shifted_spot - S0
+
+        if rf_out["used_taylor_approx"]:
+            price = rf_out["result"]
+            delta = delta0 + gamma0 * h
+            gamma = gamma0
+        else:
+            # Full model run at shifted_spot
+            clone = deepcopy(self)
+            clone.spot = shifted_spot
+            g = clone.greeks_log2()
+            price = clone.price_log2()
+            delta = g["delta"]
+            gamma = g["gamma"]
+
+        return {"price": price, "delta": delta, "gamma": gamma}
+    
+    from copy import deepcopy
+from typing import Sequence, Dict, Any
+from discrete_barrier_fdm_pricer import DiscreteBarrierFDMPricer
+
+
+def front_arena_style_spot_curve(
+    base_pricer: DiscreteBarrierFDMPricer,
+    spot_grid: Sequence[float],
+    *,
+    rel_price_shift_model: float = 0.01,
+    price_domain_scale_factor: float = 1.1,
+) -> Dict[str, Any]:
+    """
+    Build a smooth Front-Arena-style curve of price, delta and gamma
+    as the underlying approaches a barrier, using the FIS-style
+    Taylor risk function to avoid noisy revaluations.
+
+    Parameters
+    ----------
+    base_pricer : DiscreteBarrierFDMPricer
+        Pricer set up at some central spot S0 (typically mid of spot_grid).
+    spot_grid : list/array of floats
+        Spots at which you want price/delta/gamma.
+    rel_price_shift_model : float
+        Relative spot shift used to define the price domain and (ideally)
+        also used in the PDE for model Greeks (e.g. 0.01 = 1%).
+    price_domain_scale_factor : float
+        Extension-like factor from the FIS doc (default 1.1).
+
+    Returns
+    -------
+    dict with keys "spots", "price", "delta", "gamma", "used_taylor".
+    """
+    # Ensure base_pricer's Greek bump matches risk-function notion
+    base_pricer.spot_shift_rel_for_greeks = rel_price_shift_model
+
+    # Base model run at S0
+    S0 = base_pricer.spot
+    base_price = base_pricer.price_log2()
+    base_greeks = base_pricer.greeks_log2()
+    delta0 = base_greeks["delta"]
+    gamma0 = base_greeks["gamma"]
+
+    prices = []
+    deltas = []
+    gammas = []
+    used_taylor_flags = []
+
+    for S in spot_grid:
+        h = S - S0
+
+        # Decide whether to use Taylor or full reval
+        rf_out = base_pricer.risk_reprice_spot(
+            shifted_spot=S,
+            rel_price_shift_model=rel_price_shift_model,
+            price_domain_scale_factor=price_domain_scale_factor,
+            base_price=base_price,
+            base_greeks=base_greeks,
+        )
+
+        prices.append(rf_out["result"])
+        used_taylor_flags.append(rf_out["used_taylor_approx"])
+
+        if rf_out["used_taylor_approx"]:
+            # Within price domain: Greeks come directly from Taylor
+            deltas.append(delta0 + gamma0 * h)
+            gammas.append(gamma0)
+        else:
+            # Outside domain: do a proper model run at S
+            pr = deepcopy(base_pricer)
+            pr.spot = S
+            # Here we want "true" model Greeks again
+            pr.calculate_greeks_in_pde = True
+            g = pr.greeks_log2()
+            deltas.append(g["delta"])
+            gammas.append(g["gamma"])
+
+    return {
+        "spots": list(spot_grid),
+        "price": prices,
+        "delta": deltas,
+        "gamma": gammas,
+        "used_taylor": used_taylor_flags,
+        "S0": S0,
+        "base_price": base_price,
+        "base_delta": delta0,
+        "base_gamma": gamma0,
+    }
+
