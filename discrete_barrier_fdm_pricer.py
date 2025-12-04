@@ -1872,3 +1872,180 @@ def front_arena_style_spot_curve(
         "base_gamma": gamma0,
     }
 
+    def _delta_gamma_nonuniform(
+        self, s_nodes: List[float], V: List[float]
+    ) -> Tuple[float, float]:
+        """
+        FIS-style approximation of delta and gamma from a *single* grid.
+
+        - Base: non-uniform central differences at the node closest to S0.
+        - If a KO barrier is present and S0 is within a "barrier band", we
+          blend central and one-sided approximations:
+
+              Δ ≈ q * Δ_one_sided + (1 - q) * Δ_central
+              Γ ≈ q * Γ_one_sided + (1 - q) * Γ_central
+
+          where q is 1 at the grid point closest to the barrier and decays
+          linearly to 0 at the edge of the band (cf. FIS "q D_s V + (1-q) D_c V").
+        """
+        N = len(s_nodes) - 1
+        if N < 2:
+            raise ValueError("Need at least 3 space nodes to compute Greeks.")
+
+        # --- 1) Base central non-uniform stencil at S0 --------------------
+        S0 = self.spot
+        i0 = min(range(N + 1), key=lambda k: abs(s_nodes[k] - S0))
+        # keep away from boundaries
+        i0 = max(1, min(N - 1, i0))
+
+        h1 = s_nodes[i0] - s_nodes[i0 - 1]
+        h2 = s_nodes[i0 + 1] - s_nodes[i0]
+
+        V_im1 = V[i0 - 1]
+        V_i = V[i0]
+        V_ip1 = V[i0 + 1]
+
+        # central first derivative (non-uniform three-point stencil)
+        delta_c = (
+            -h2 / (h1 * (h1 + h2)) * V_im1
+            + (h2 - h1) / (h1 * h2) * V_i
+            + h1 / (h2 * (h1 + h2)) * V_ip1
+        )
+
+        # central second derivative (non-uniform three-point stencil)
+        gamma_c = 2.0 * (
+            V_im1 / (h1 * (h1 + h2))
+            - V_i / (h1 * h2)
+            + V_ip1 / (h2 * (h1 + h2))
+        )
+
+        # If we are *not* doing FIS-style barrier smoothing, just return.
+        if not self.use_one_sided_greeks_near_barrier:
+            return float(delta_c), float(gamma_c)
+
+        # --- 2) Identify relevant knock-out barrier and "barrier band" ----
+        H: Optional[float] = None
+        side: Optional[str] = None
+
+        # we only care about KO behaviour for smoothing
+        if self.barrier_type in ("down-and-out", "double-out") and self.lower_barrier is not None:
+            H = float(self.lower_barrier)
+            side = "down"
+        elif self.barrier_type in ("up-and-out", "double-out") and self.upper_barrier is not None:
+            H = float(self.upper_barrier)
+            side = "up"
+
+        if H is None or side is None:
+            # no active KO => central is fine
+            return float(delta_c), float(gamma_c)
+
+        # We want the *last* node inside the domain before an up-barrier,
+        # or the *first* node inside the domain above a down-barrier.
+        if side == "up":
+            # nodes strictly below the barrier
+            inside_indices = [k for k in range(N + 1) if s_nodes[k] < H]
+            if not inside_indices:
+                return float(delta_c), float(gamma_c)
+            j = max(inside_indices)  # closest from below
+        else:  # side == "down"
+            inside_indices = [k for k in range(N + 1) if s_nodes[k] > H]
+            if not inside_indices:
+                return float(delta_c), float(gamma_c)
+            j = min(inside_indices)  # closest from above
+
+        # How far is our evaluation index i0 from the barrier index j?
+        band = max(1, int(self.mollify_band_nodes))
+        dist = abs(i0 - j)
+
+        # Outside the "barrier band": use pure central.
+        if dist > band:
+            return float(delta_c), float(gamma_c)
+
+        # Linear weight q in [0,1], as in FIS: q = 1 at closest-to-barrier
+        # node, decays to 0 at the edge of the band.
+        q = 1.0 - (dist / float(band))
+        q = max(0.0, min(1.0, q))
+
+        # --- 3) One-sided approximations that do *not* cross the barrier ---
+
+        if side == "up":
+            # Domain is S < H. Use backward stencil at node j (closest below).
+            i1 = max(1, min(N - 1, j))
+
+            # First-order backward for delta (safe, monotone close to barrier)
+            h_b = s_nodes[i1] - s_nodes[i1 - 1]
+            if h_b <= 0:
+                return float(delta_c), float(gamma_c)
+            delta_os = (V[i1] - V[i1 - 1]) / h_b
+
+            # Gamma based on three *inside* points (i1-2, i1-1, i1) if possible.
+            if i1 >= 2:
+                S_im2 = s_nodes[i1 - 2]
+                S_im1 = s_nodes[i1 - 1]
+                S_i   = s_nodes[i1]
+                V_im2 = V[i1 - 2]
+                V_im1 = V[i1 - 1]
+                V_i   = V[i1]
+
+                h1_b = S_im1 - S_im2
+                h2_b = S_i - S_im1
+
+                gamma_os = 2.0 * (
+                    V_im2 / (h1_b * (h1_b + h2_b))
+                    - V_im1 / (h1_b * h2_b)
+                    + V_i / (h2_b * (h1_b + h2_b))
+                )
+            else:
+                gamma_os = gamma_c  # fallback if we don't have enough points
+
+        else:  # side == "down"
+            # Domain is S > H. Use forward stencil at node j (closest above).
+            i1 = max(1, min(N - 2, j))
+
+            h_f = s_nodes[i1 + 1] - s_nodes[i1]
+            if h_f <= 0:
+                return float(delta_c), float(gamma_c)
+            delta_os = (V[i1 + 1] - V[i1]) / h_f
+
+            # Gamma based on three inside points (i1, i1+1, i1+2) if possible.
+            if i1 + 2 <= N:
+                S_i   = s_nodes[i1]
+                S_ip1 = s_nodes[i1 + 1]
+                S_ip2 = s_nodes[i1 + 2]
+                V_i   = V[i1]
+                V_ip1 = V[i1 + 1]
+                V_ip2 = V[i1 + 2]
+
+                h1_f = S_ip1 - S_i
+                h2_f = S_ip2 - S_ip1
+
+                gamma_os = 2.0 * (
+                    V_i / (h1_f * (h1_f + h2_f))
+                    - V_ip1 / (h1_f * h2_f)
+                    + V_ip2 / (h2_f * (h1_f + h2_f))
+                )
+            else:
+                gamma_os = gamma_c  # fallback if not enough points
+
+        # --- 4) Blend one-sided and central, as in FIS (q D_s + (1-q) D_c) ---
+
+        delta = q * delta_os + (1.0 - q) * delta_c
+        gamma = q * gamma_os + (1.0 - q) * gamma_c
+
+        # Light clipping to avoid ridiculous spikes
+        gamma = max(min(gamma, 1e5), -1e5)
+
+        return float(delta), float(gamma)
+
+    def _delta_gamma_from_grid(self, V: List[float]) -> Tuple[float, float]:
+        """
+        FIS-style delta/gamma from the *PDE* grid at t=0.
+
+        Delegates to `_delta_gamma_nonuniform`, which:
+        - uses a non-uniform central stencil away from the barrier,
+        - switches to a one-sided stencil in the interval closest to the barrier,
+        - linearly blends one-sided and central in a band of size
+          `self.mollify_band_nodes` around the barrier (q-weighting).
+        """
+        return self._delta_gamma_nonuniform(self.s_nodes, V)
+
