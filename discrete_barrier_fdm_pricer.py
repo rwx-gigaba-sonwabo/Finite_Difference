@@ -1447,3 +1447,294 @@ class DiscreteBarrierFDMPricer:
 
         return float(delta), float(gamma)
 
+    def _pde_price_and_greeks3(
+        self,
+        apply_KO: bool,
+        dv_sigma: float = 0.0001,
+        use_richardson: bool = False,
+    ) -> Dict[str, float]:
+        """
+        Core CN + Rannacher PDE engine.
+
+        Returns at least {"price": price}. If
+        self.calculate_greeks_in_pde is True, also returns
+        delta, gamma, vega, theta (the "model Greeks" used
+        by the risk function).
+        """
+        V_grid = self._solve_grid(apply_KO=apply_KO)
+        price_base = self._interp_price(V_grid)
+
+        # If Greeks disabled (e.g. risk-function full reval), stop here
+        if not self.calculate_greeks_in_pde:
+            return {"price": float(price_base)}
+
+        # Choose how to compute model delta/gamma
+        if self.use_local_quad_greeks:
+            delta, gamma = self._delta_gamma_local_quad(V_grid, self.spot)
+        elif self.spot_shift_rel_for_greeks > 0.0:
+            delta, gamma = self._delta_gamma_from_grid(
+                V_grid, spot_shift_rel=self.spot_shift_rel_for_greeks
+            )
+        else:
+            delta, gamma = self._delta_gamma_from_grid(V_grid, spot_shift_rel=None)
+
+        # Vega via bump
+        orig_sigma = self.sigma
+        self.sigma = orig_sigma + dv_sigma
+        V_up = self._solve_grid(apply_KO=apply_KO)
+        price_up = self._interp_price(V_up)
+        self.sigma = orig_sigma
+
+        vega = (price_up - price_base) / (dv_sigma * 100.0)
+
+        # Theta from PDE relation at S0
+        theta = -(
+            0.5 * orig_sigma * orig_sigma * self.spot * self.spot * gamma
+            + (self.carry_rate_nacc - self.div_yield_nacc) * self.spot * delta
+            - self.discount_rate_nacc * price_base
+        )
+
+        return {
+            "price": float(price_base),
+            "delta": float(delta),
+            "gamma": float(gamma),
+            "vega": float(vega),
+            "theta": float(theta),
+        }
+
+    def _delta_gamma_from_grid(
+        self,
+        V: List[float],
+        spot_shift_rel: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        """
+        Compute delta and gamma at S0 from the PDE grid in *spot* space.
+
+        Two modes:
+
+        1) Bump-based (spot_shift_rel > 0):
+           - Use perturbations of size h = spot_shift_rel * S0.
+           - Prefer central differences (S0-h, S0, S0+h).
+           - If that would cross a barrier, switch to a one-sided forward
+             (S0, S0+h, S0+2h) or backward (S0-2h, S0-h, S0) stencil,
+             chosen so all evaluation points lie on the alive side.
+
+        2) Grid-based (spot_shift_rel <= 0 or None):
+           - Use non-uniform central 3-point stencil in spot.
+           - Near a barrier (within mollify_band_nodes in index space) and
+             use_one_sided_greeks_near_barrier=True, shift the stencil one
+             node away from the barrier (effectively one-sided).
+        """
+        s = self.s_nodes
+        V_arr = V
+        S0 = self.spot
+        N = len(s)
+
+        if N < 3:
+            raise RuntimeError("Need at least 3 spatial nodes for Greeks.")
+
+        # ------------------------------------------------------------------
+        # 1) Bump-based Greeks (user-specified perturbation size)
+        # ------------------------------------------------------------------
+        if spot_shift_rel is not None and spot_shift_rel > 0.0:
+            h = spot_shift_rel * S0
+            S_down = S0 - h
+            S_up = S0 + h
+
+            # Collect barriers that are alive-side separators
+            barriers: List[float] = []
+            if self.lower_barrier is not None:
+                barriers.append(self.lower_barrier)
+            if self.upper_barrier is not None:
+                barriers.append(self.upper_barrier)
+
+            def crosses_barrier(S_lo: float, S_hi: float) -> bool:
+                for b in barriers:
+                    if S_lo < b < S_hi:
+                        return True
+                return False
+
+            central_crosses = crosses_barrier(min(S_down, S_up), max(S_down, S_up))
+
+            use_forward = False
+            use_backward = False
+
+            if central_crosses:
+                # If lower barrier below S0 and S_down passes it, avoid S_down → forward
+                if self.lower_barrier is not None and self.lower_barrier < S0:
+                    if S_down <= self.lower_barrier:
+                        use_forward = True
+                # If upper barrier above S0 and S_up passes it, avoid S_up → backward
+                if self.upper_barrier is not None and self.upper_barrier > S0:
+                    if S_up >= self.upper_barrier:
+                        use_backward = True
+
+                # If both triggered (very tight double-barrier), give up and
+                # fall back to central (but you should probably reduce h)
+                if use_forward and use_backward:
+                    use_forward = False
+                    use_backward = False
+                    central_crosses = False
+
+            # ---- One-sided forward stencil: (S0, S0+h, S0+2h) ----
+            if use_forward:
+                S1 = S0 + h
+                S2 = S0 + 2.0 * h
+                if S2 <= s[-1]:
+                    V0 = self._interp_price_at_S(V_arr, S0)
+                    V1 = self._interp_price_at_S(V_arr, S1)
+                    V2 = self._interp_price_at_S(V_arr, S2)
+                    delta = (-3.0 * V0 + 4.0 * V1 - V2) / (2.0 * h)
+                    gamma = (V0 - 2.0 * V1 + V2) / (h * h)
+                    gamma = max(min(gamma, 1e5), -1e5)
+                    return float(delta), float(gamma)
+                else:
+                    # Out of grid; fall back to central
+                    central_crosses = False
+
+            # ---- One-sided backward stencil: (S0-2h, S0-h, S0) ----
+            if use_backward:
+                S_1 = S0 - h
+                S_2 = S0 - 2.0 * h
+                if S_2 >= s[0]:
+                    V_2 = self._interp_price_at_S(V_arr, S_2)
+                    V_1 = self._interp_price_at_S(V_arr, S_1)
+                    V0 = self._interp_price_at_S(V_arr, S0)
+                    delta = (3.0 * V0 - 4.0 * V_1 + V_2) / (2.0 * h)
+                    gamma = (V_2 - 2.0 * V_1 + V0) / (h * h)
+                    gamma = max(min(gamma, 1e5), -1e5)
+                    return float(delta), float(gamma)
+                else:
+                    central_crosses = False
+
+            # ---- Central stencil (S0-h, S0, S0+h) if safe ----
+            V0 = self._interp_price_at_S(V_arr, S0)
+            V_down = self._interp_price_at_S(V_arr, S_down)
+            V_up = self._interp_price_at_S(V_arr, S_up)
+            delta = (V_up - V_down) / (2.0 * h)
+            gamma = (V_up - 2.0 * V0 + V_down) / (h * h)
+            gamma = max(min(gamma, 1e5), -1e5)
+            return float(delta), float(gamma)
+
+        # ------------------------------------------------------------------
+        # 2) Grid-based non-uniform central stencil (with barrier awareness)
+        # ------------------------------------------------------------------
+        idx = min(range(1, N - 1), key=lambda i: abs(s[i] - S0))
+
+        # Identify barrier indices (if any)
+        barrier_indices: List[int] = []
+        if self.lower_barrier is not None:
+            i_low = min(range(N), key=lambda i: abs(s[i] - self.lower_barrier))
+            barrier_indices.append(i_low)
+        if self.upper_barrier is not None:
+            i_up = min(range(N), key=lambda i: abs(s[i] - self.upper_barrier))
+            barrier_indices.append(i_up)
+
+        near_barrier = False
+        is_lower_side = False  # True if nearest barrier lies below idx
+
+        if barrier_indices and self.use_one_sided_greeks_near_barrier:
+            i_bar = min(barrier_indices, key=lambda j: abs(j - idx))
+            dist = abs(idx - i_bar)
+            if dist <= self.mollify_band_nodes:
+                near_barrier = True
+                is_lower_side = i_bar < idx
+
+        # Choose stencil index
+        i = idx
+        if near_barrier:
+            if is_lower_side:
+                i = min(idx + 1, N - 2)
+            else:
+                i = max(idx - 1, 1)
+
+        S_im1, S_i, S_ip1 = s[i - 1], s[i], s[i + 1]
+        V_im1, V_i, V_ip1 = V_arr[i - 1], V_arr[i], V_arr[i + 1]
+
+        h1 = S_i - S_im1
+        h2 = S_ip1 - S_i
+
+        # Non-uniform central finite-difference coefficients
+        a_m1 = -h2 / (h1 * (h1 + h2))
+        a_0 = (h2 - h1) / (h1 * h2)
+        a_p1 = h1 / (h2 * (h1 + h2))
+
+        b_m1 = 2.0 / (h1 * (h1 + h2))
+        b_0 = -2.0 / (h1 * h2)
+        b_p1 = 2.0 / (h2 * (h1 + h2))
+
+        delta = a_m1 * V_im1 + a_0 * V_i + a_p1 * V_ip1
+        gamma = b_m1 * V_im1 + b_0 * V_i + b_p1 * V_ip1
+        gamma = max(min(gamma, 1e5), -1e5)
+        return float(delta), float(gamma)
+
+    def _delta_gamma_local_quad(self, V: List[float], S0: float) -> Tuple[float, float]:
+        """
+        Fit a local quadratic V(S) ≈ a0 + a1 S + a2 S^2 around S0 using
+        nearby interior nodes on the alive side of the barrier, then
+        return delta = dV/dS and gamma = d²V/dS² at S0.
+
+        This is a smoothing operator on top of the raw PDE solution.
+        """
+        s_arr = np.array(self.s_nodes, dtype=float)
+        V_arr = np.array(V, dtype=float)
+
+        # Alive side of the barrier for up/out or down/out
+        alive_mask = np.ones_like(s_arr, dtype=bool)
+        if self.upper_barrier is not None:
+            alive_mask &= (s_arr < self.upper_barrier - 1e-10)
+        if self.lower_barrier is not None:
+            alive_mask &= (s_arr > self.lower_barrier + 1e-10)
+
+        idx_alive = np.where(alive_mask)[0]
+        if len(idx_alive) < 5:
+            # Fallback to raw FD if not enough points
+            return self._delta_gamma_from_grid(V, spot_shift_rel=None)
+
+        # Sort alive indices by distance to S0
+        idx_sorted = idx_alive[np.argsort(np.abs(s_arr[idx_alive] - S0))]
+        use_idx = idx_sorted[:5]  # use 5 nearest nodes
+
+        S_loc = s_arr[use_idx]
+        V_loc = V_arr[use_idx]
+
+        # Design matrix for quadratic in S: [1, S, S^2]
+        A = np.column_stack([np.ones_like(S_loc), S_loc, S_loc**2])
+        coeffs, *_ = np.linalg.lstsq(A, V_loc, rcond=None)
+        a0, a1, a2 = coeffs
+
+        delta = a1 + 2.0 * a2 * S0
+        gamma = 2.0 * a2
+        gamma = max(min(gamma, 1e5), -1e5)
+        return float(delta), float(gamma)
+
+        # Numerical controls
+        self.num_space_nodes = int(num_space_nodes)
+        self.num_time_steps = int(num_time_steps)
+        self.rannacher_steps = int(rannacher_steps)
+        self.min_substeps = max(1, int(min_substeps_between_monitors))
+        self.lambda_diff_target = float(lambda_diff_target)
+        self.grid_type = grid_type
+        self.sinh_alpha = float(sinh_alpha)
+        self.s_max_mult = float(s_max_mult)
+        self.restart_on_monitoring = bool(restart_on_monitoring)
+        self.use_one_sided_greeks_near_barrier = bool(use_one_sided_greeks_near_barrier)
+        self.mollify_final = bool(mollify_final)
+        self.mollify_band_nodes = int(mollify_band_nodes)
+        self.price_extrapolation = bool(price_extrapolation)
+        self.day_count = day_count
+
+        # Controls for how model Greeks are computed / smoothed
+        # Relative perturbation size for spot when computing delta/gamma.
+        # If > 0, uses bump-based Greeks in spot; if 0, uses pure grid stencils.
+        self.spot_shift_rel_for_greeks: float = 0.01  # e.g. 1% default
+
+        # If True, override delta/gamma with a local quadratic fit in spot
+        # (Savitzky–Golay style smoothing) on the alive side of the barrier.
+        self.use_local_quad_greeks: bool = False
+
+        # Risk-function integration: base PDE runs compute Greeks, but
+        # risk-function full revaluations can set this to False so that
+        # only the price is computed.
+        self.calculate_greeks_in_pde: bool = True
+
