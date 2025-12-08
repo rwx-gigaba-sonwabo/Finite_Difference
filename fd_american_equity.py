@@ -2,6 +2,7 @@ import datetime as _dt
 from typing import List, Optional, Tuple, Literal, Dict
 import math
 
+import numpy as np
 import pandas as pd  # type: ignore
 from workalendar.africa import SouthAfrica
 
@@ -10,18 +11,40 @@ OptionType = Literal["call", "put"]
 
 class AmericanFDMPricer:
     """
-    American vanilla option pricer using a Crank–Nicolson finite-difference
-    scheme in log S with Rannacher smoothing, Ikonen–Toivanen compensation,
-    and local cubic interpolation for price and Greeks.
+    American vanilla option pricer using Crank–Nicolson FD in log S, with:
 
-    Designed to mirror the FIS finite-difference solver layout for American
-    options (Black–Scholes PDE in log S, IT splitting, 3rd-degree polynomial
-    interpolation, Richardson extrapolation).
+      - Ikonen–Toivanen (IT) operator splitting for early exercise
+      - Rannacher time stepping (Euler Backward + CN)
+      - Piecewise time grid split at *discrete dividend dates*
+      - Ex-dividend jump in the stock process
+      - Rannacher restarted at each dividend *for calls only*
+      - Optional Richardson extrapolation in time
+
+    Key alignment with FIS doc:
+      * American PUTs:
+            - no special smoothing at dividends (doc: not necessary)
+            - no Rannacher restart at dividends
+      * American CALLs with discrete dividends:
+            - dividend is an internal discontinuity (restart Rannacher)
+            - ex-div mapping: V(t_d-, S) = V(t_d+, S - D) with
+              possibility of immediate exercise: max(continuation, payoff)
+
+    Greeks:
+      - Price and Δ, Γ from a local cubic fit around spot (smooth grid → differentiate).
+      - Vega by symmetric volatility bump with optional Richardson extrapolation.
+      - Theta from the BS PDE relation at the spot.
+
+    Discrete dividends:
+      - `dividend_schedule` is a list of (date, cash_amount) at ex-div dates.
+      - Between dividends the underlying follows a BS process with
+        continuously compounded carry rate `b` and risk-free `r`.
+      - At each ex-div date t_d, S jumps down by D: S(t_d+) = S(t_d-) - D.
     """
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    #  Constructor / setup
+    # ------------------------------------------------------------------ #
+
     def __init__(
         self,
         spot: float,
@@ -33,15 +56,17 @@ class AmericanFDMPricer:
         discount_curve: pd.DataFrame,
         forward_curve: Optional[pd.DataFrame] = None,
         dividend_schedule: Optional[List[Tuple[_dt.date, float]]] = None,
+        # trade/meta
         trade_id: Optional[int] = None,
         direction: str = "long",
         quantity: int = 1,
         contract_multiplier: float = 1.0,
+        # settlement conventions
         underlying_spot_days: int = 0,
         option_days: int = 0,
         option_settlement_days: int = 0,
+        # numerical settings
         day_count: str = "ACT/365",
-        grid_type: str = "uniform",
         num_space_nodes: int = 400,
         num_time_steps: int = 400,
         rannacher_steps: int = 2,
@@ -52,7 +77,6 @@ class AmericanFDMPricer:
         if maturity_date <= valuation_date:
             raise ValueError("maturity_date must be after valuation_date.")
 
-        # Core economics
         self.spot = float(spot)
         self.strike = float(strike)
         self.valuation_date = valuation_date
@@ -63,18 +87,17 @@ class AmericanFDMPricer:
         if self.option_type not in ("call", "put"):
             raise ValueError("option_type must be 'call' or 'put'.")
 
-        # Curves / dividends
         self.discount_curve_df = discount_curve.copy()
         self.forward_curve_df = forward_curve.copy() if forward_curve is not None else None
         self.dividend_schedule = sorted(dividend_schedule or [], key=lambda x: x[0])
 
-        # Trade/meta
+        # meta
         self.trade_id = trade_id
         self.direction = direction
         self.quantity = int(quantity)
         self.contract_multiplier = float(contract_multiplier)
 
-        # Calendar / conventions
+        # calendar / settlement
         self.calendar = SouthAfrica()
         self.underlying_spot_days = int(underlying_spot_days)
         self.option_days = int(option_days)
@@ -83,7 +106,7 @@ class AmericanFDMPricer:
         self.day_count = day_count.upper().replace("F", "")
         self._year_denominator = self._infer_denominator(self.day_count)
 
-        # Carry / discount dates
+        # Dates for carry and discount
         self.carry_start_date = self.calendar.add_working_days(
             self.valuation_date, self.underlying_spot_days
         )
@@ -101,47 +124,54 @@ class AmericanFDMPricer:
         # Year fractions
         self.time_to_expiry = self._year_fraction(self.valuation_date, self.maturity_date)
         self.time_to_carry = self._year_fraction(self.carry_start_date, self.carry_end_date)
-        self.time_to_discount = self._year_fraction(self.discount_start_date, self.discount_end_date)
+        self.time_to_discount = self._year_fraction(
+            self.discount_start_date, self.discount_end_date
+        )
 
         if self.time_to_expiry <= 0.0:
             raise ValueError("time_to_expiry must be positive.")
 
-        # NACC rates from curves
+        # Rates (NACC)
         self.discount_rate_nacc = self.get_forward_nacc_rate(
             self.discount_start_date, self.discount_end_date
         )
-        self.carry_rate_nacc = self.get_forward_nacc_rate(
-            self.carry_start_date, self.carry_end_date
-        )
 
-        # Dividends -> PV and equivalent continuous yield
-        self.pv_divs = self.pv_dividends()
-        self.div_yield_nacc = self.dividend_yield_nacc()
-
-        # Forward (diagnostic only)
-        if self.time_to_carry > 0.0:
-            self.forward_price = self.spot * math.exp(
-                (self.carry_rate_nacc - self.div_yield_nacc) * self.time_to_carry
+        # If a separate forward curve is given, use that for carry; otherwise
+        # fall back to discount curve (as in your barrier pricer).
+        if self.forward_curve_df is not None:
+            self.carry_rate_nacc = self.get_forward_nacc_rate(
+                self.carry_start_date, self.carry_end_date
             )
         else:
-            self.forward_price = self.spot
+            self.carry_rate_nacc = self.discount_rate_nacc
 
-        # Grid controls
-        self.grid_type = grid_type
-        self.s_max_mult = float(s_max_mult)
+        # For discrete-div model we set q = 0 in PDE and use dividend cashflows explicitly.
+        self.div_yield_nacc = 0.0
+
+        # Grid parameters
         self.num_space_nodes = max(int(num_space_nodes), 3)
-        self.num_time_steps = max(int(num_time_steps), 3)
+        self.num_time_steps = max(int(num_time_steps), 4)  # need enough to split
         self.rannacher_steps = max(int(rannacher_steps), 0)
+        self.s_max_mult = float(s_max_mult)
+
+        # Spot/strike snapping
+        self.snap_spot_to_grid: bool = True
+        self.snap_strike_to_grid: bool = True
+        self.spot_grid_index: Optional[int] = None
+        self.spot_snapped: Optional[float] = None
+        self.strike_grid_index: Optional[int] = None
+        self.strike_snapped: Optional[float] = None
 
         # Grid state
-        self._S_min: float = 0.0
-        self._S_max: float = 0.0
         self.s_nodes: List[float] = []
         self.x_nodes: List[float] = []
+        self._S_min: float = 0.0
+        self._S_max: float = 0.0
 
-    # ------------------------------------------------------------------
-    # Day-count / curve helpers
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    #  Day count / curves
+    # ------------------------------------------------------------------ #
+
     def _infer_denominator(self, day_count: str) -> int:
         if day_count in ("ACT/365", "ACT/365F"):
             return 365
@@ -181,17 +211,14 @@ class AmericanFDMPricer:
         tau = self._year_fraction(start_date, end_date)
         return -math.log(df_far / df_near) / max(1e-12, tau)
 
-    # ------------------------------------------------------------------
-    # Dividends: PV and equivalent continuous yield
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    #  Dividends: only used to place the grid (escrowed S_eff).
+    #  The PDE itself uses q = 0 and handles discrete cash jumps explicitly.
+    # ------------------------------------------------------------------ #
+
     def pv_dividends(self) -> float:
-        """
-        PV of discrete dividends between valuation and maturity, discounted
-        using the curve and normalised by DF(carry_start).
-        """
         if not self.dividend_schedule:
             return 0.0
-
         pv = 0.0
         for pay_date, amount in self.dividend_schedule:
             if self.valuation_date < pay_date <= self.maturity_date:
@@ -201,36 +228,17 @@ class AmericanFDMPricer:
                 pv += float(amount) * df
         return pv
 
-    def dividend_yield_nacc(self) -> float:
-        """
-        Flat continuous dividend yield q such that
-            S0 - PV(divs) = S0 * exp(-q * T_carry)
-        (escrowed-dividend interpretation).
-        """
-        pv_divs = self.pv_dividends()
-        S = self.spot
-        tau = max(1e-12, self.time_to_carry)
+    # ------------------------------------------------------------------ #
+    #  Grid construction in log S
+    # ------------------------------------------------------------------ #
 
-        if pv_divs <= 0.0:
-            return 0.0
-        if pv_divs >= S:
-            raise ValueError("PV(dividend_schedule) >= spot.")
-        return -math.log((S - pv_divs) / S) / tau
-
-    # ------------------------------------------------------------------
-    # Grid construction
-    # ------------------------------------------------------------------
     def _configure_grid(self) -> None:
-        """
-        Configure S_min and S_max for the log-S grid.
-
-        Domain is chosen around an effective spot S_eff = S0 - PV(divs)
-        and the strike, with width proportional to sigma * sqrt(T).
-        """
         T = self.time_to_expiry
         sig = self.sigma
 
-        S_eff = self.spot - self.pv_divs
+        # Use an escrowed-spot purely for grid centring; we do NOT
+        # feed q into the PDE, so this is not double counting.
+        S_eff = self.spot - self.pv_dividends()
         if S_eff <= 0.0:
             S_eff = self.spot
 
@@ -253,15 +261,9 @@ class AmericanFDMPricer:
         self._S_max = S_max
 
     def _build_log_grid(self) -> float:
-        """
-        Build the log-S grid.
-        """
         self._configure_grid()
-        S_min = self._S_min
-        S_max = self._S_max
-
-        x_min = math.log(S_min)
-        x_max = math.log(S_max)
+        x_min = math.log(self._S_min)
+        x_max = math.log(self._S_max)
 
         n = self.num_space_nodes
         dx = (x_max - x_min) / float(n)
@@ -269,30 +271,59 @@ class AmericanFDMPricer:
         self.x_nodes = [x_min + i * dx for i in range(n + 1)]
         self.s_nodes = [math.exp(x) for x in self.x_nodes]
 
+        self._snap_critical_levels_to_grid()
         return dx
 
-    # ------------------------------------------------------------------
-    # Payoff and boundaries
-    # ------------------------------------------------------------------
+    def _snap_critical_levels_to_grid(self) -> None:
+        s = self.s_nodes
+        N = len(s)
+        if N == 0:
+            return
+
+        S_eff = self.spot - self.pv_dividends()
+        if S_eff <= 0.0:
+            S_eff = self.spot
+
+        if self.snap_spot_to_grid:
+            idx = min(range(N), key=lambda i: abs(s[i] - S_eff))
+            self.spot_grid_index = idx
+            self.spot_snapped = s[idx]
+        else:
+            self.spot_grid_index = None
+            self.spot_snapped = None
+
+        if self.snap_strike_to_grid:
+            idx = min(range(N), key=lambda i: abs(s[i] - self.strike))
+            self.strike_grid_index = idx
+            self.strike_snapped = s[idx]
+        else:
+            self.strike_grid_index = None
+            self.strike_snapped = None
+
+    # ------------------------------------------------------------------ #
+    #  Payoff & boundaries
+    # ------------------------------------------------------------------ #
+
+    def _strike_for_pde(self) -> float:
+        if self.snap_strike_to_grid and self.strike_snapped is not None:
+            return self.strike_snapped
+        return self.strike
+
     def _intrinsic_payoff(self, S: float) -> float:
+        k = self._strike_for_pde()
         if self.option_type == "call":
-            return max(S - self.strike, 0.0)
-        return max(self.strike - S, 0.0)
+            return max(S - k, 0.0)
+        return max(k - S, 0.0)
 
     def _terminal_payoff(self) -> List[float]:
         return [self._intrinsic_payoff(s) for s in self.s_nodes]
 
     def _boundary_values(self, tau: float) -> Tuple[float, float]:
-        """
-        European-style boundary conditions at time-to-maturity tau.
-        Early exercise is handled via Ikonen–Toivanen on the interior nodes.
-        """
-        S_min = self.s_nodes[0]
+        # tau = time-to-maturity at this step
         S_max = self.s_nodes[-1]
-
         r = self.discount_rate_nacc
         b = self.carry_rate_nacc
-        k = self.strike
+        k = self._strike_for_pde()
 
         if self.option_type == "call":
             V_min = 0.0
@@ -302,45 +333,75 @@ class AmericanFDMPricer:
             V_max = 0.0
         return V_min, V_max
 
-    # ------------------------------------------------------------------
-    # Core solver: CN + Rannacher + Ikonen–Toivanen
-    # ------------------------------------------------------------------
-    def _solve_grid(self, N_time: int, rannacher_steps: Optional[int] = None) -> List[float]:
+    # ------------------------------------------------------------------ #
+    #  Time grid splitting at discrete dividends
+    # ------------------------------------------------------------------ #
+
+    def _div_times_tau(self) -> List[Tuple[float, float]]:
         """
-        Solve the BS PDE on the log-S grid using a theta-scheme with
-        Rannacher smoothing and Ikonen–Toivanen splitting for the
-        American constraint.
+        Return list of (tau_div, D_cash) where tau_div is time-to-maturity at the
+        ex-div date t_div (tau = T - (t_div - t0)), sorted increasing in tau.
         """
-        dx = self._build_log_grid()
+        if not self.dividend_schedule:
+            return []
+
+        res: List[Tuple[float, float]] = []
+        for pay_date, amount in self.dividend_schedule:
+            if self.valuation_date < pay_date < self.maturity_date:
+                t_rel = self._year_fraction(self.valuation_date, pay_date)
+                if 0.0 < t_rel < self.time_to_expiry:
+                    tau_div = self.time_to_expiry - t_rel
+                    res.append((tau_div, float(amount)))
+
+        res = sorted(res, key=lambda x: x[0])
+        return res
+
+    # ------------------------------------------------------------------ #
+    #  Core segment solver (CN + Rannacher + IT) on [tau_start, tau_end]
+    # ------------------------------------------------------------------ #
+
+    def _solve_segment(
+        self,
+        V_init: List[float],
+        tau_start: float,
+        tau_end: float,
+        n_steps: int,
+        restart_rannacher: bool,
+    ) -> List[float]:
+        """
+        Solve the PDE backwards in time-on-tau from tau_start to tau_end,
+        using n_steps uniform increments, starting from V_init at tau_start.
+        tau increases backwards in calendar time (0 at expiry, T at valuation).
+
+        If restart_rannacher is True, the first self.rannacher_steps time steps
+        in this segment use implicit Euler; afterwards we use Crank–Nicolson.
+        """
+        if n_steps < 1:
+            return V_init
+
+        dx = self._build_log_grid()  # no-op if grid already built; cheap
 
         N = len(self.s_nodes) - 1
         if N < 2:
-            raise RuntimeError("Spatial grid too coarse; need at least 3 nodes.")
+            raise RuntimeError("Spatial grid too coarse.")
 
-        if N_time < 1:
-            raise RuntimeError("Need at least 1 time step.")
-        dt = self.time_to_expiry / float(N_time)
-
+        dt = (tau_end - tau_start) / float(n_steps)
         sig = self.sigma
         sig2 = sig * sig
-
         r = self.discount_rate_nacc
         b = self.carry_rate_nacc
-        q = self.div_yield_nacc
+        q = self.div_yield_nacc  # 0 in discrete-div model; kept for flexibility
 
-        # Drift in log S under risk-neutral measure with dividend yield q
         mu_x = (b - q) - 0.5 * sig2
 
         alpha = 0.5 * sig2 / (dx * dx)
         beta_adv = mu_x / (2.0 * dx)
 
-        # Semi-discrete operator coefficients: dV/dt = a V_{j-1} + bcoef V_j + c V_{j+1}
         a = alpha - beta_adv
         c = alpha + beta_adv
         bcoef = -2.0 * alpha - r
 
         def build_matrices(theta: float):
-            # (I - theta dt A) V^{n-1} = (I + (1-theta) dt A) V^n + dt lambda
             A_L = -theta * dt * a
             A_C = 1.0 - theta * dt * bcoef
             A_U = -theta * dt * c
@@ -352,46 +413,37 @@ class AmericanFDMPricer:
 
         def solve_tridiag(A_L: float, A_C: float, A_U: float, rhs: List[float]) -> List[float]:
             n = len(rhs)
-            if n == 0:
-                raise RuntimeError("Tridiagonal system has zero size.")
             c_prime = [0.0] * n
             d_prime = [0.0] * n
-
             denom = A_C
             c_prime[0] = A_U / denom
             d_prime[0] = rhs[0] / denom
-
             for i in range(1, n):
                 denom = A_C - A_L * c_prime[i - 1]
                 if i < n - 1:
                     c_prime[i] = A_U / denom
                 d_prime[i] = (rhs[i] - A_L * d_prime[i - 1]) / denom
-
             x = [0.0] * n
             x[-1] = d_prime[-1]
             for i in range(n - 2, -1, -1):
                 x[i] = d_prime[i] - c_prime[i] * x[i + 1]
             return x
 
-        # Terminal condition at maturity
-        V = self._terminal_payoff()
-        payoff_full = V.copy()
-
-        # Multiplier lambda for American constraint (interior nodes only)
-        lambda_int = [0.0] * (N - 1)
+        V = V_init[:]
+        payoff_full = [self._intrinsic_payoff(s) for s in self.s_nodes]
         payoff_int = payoff_full[1:-1]
 
-        ran_steps = self.rannacher_steps if rannacher_steps is None else int(rannacher_steps)
+        lambda_int = [0.0] * (N - 1)
+        base_ran = self.rannacher_steps if restart_rannacher else 0
 
-        for m in range(N_time):
-            theta = 1.0 if m < ran_steps else 0.5
+        tau = tau_start
+        for m in range(n_steps):
+            tau_next = tau + dt
+            theta = 1.0 if m < base_ran else 0.5
 
             A_L, A_C, A_U, B_L, B_C, B_U = build_matrices(theta)
-            tau_next = (m + 1) * dt
+            V_min, V_max = self._boundary_values(tau_next)
 
-            V_min_next, V_max_next = self._boundary_values(tau_next)
-
-            # Predictor: solve linear system for tilde V^{n-1}
             rhs = [0.0] * (N - 1)
             for j in range(1, N):
                 Vjm1, Vj, Vjp1 = V[j - 1], V[j], V[j + 1]
@@ -400,13 +452,11 @@ class AmericanFDMPricer:
                     + dt * lambda_int[j - 1]
                 )
 
-            # Boundary contributions
-            rhs[0] -= A_L * V_min_next
-            rhs[-1] -= A_U * V_max_next
+            rhs[0] -= A_L * V_min
+            rhs[-1] -= A_U * V_max
 
             tilde_int = solve_tridiag(A_L, A_C, A_U, rhs)
 
-            # Compensation: update V and lambda so that V >= payoff
             new_lambda_int = [0.0] * (N - 1)
             new_V_int = [0.0] * (N - 1)
 
@@ -415,13 +465,9 @@ class AmericanFDMPricer:
                 phi_k = payoff_int[k]
                 lam_old = lambda_int[k]
 
-                # Candidate value: tilde V - dt * lambda^{n-1}
                 v_candidate = tilde_vk - dt * lam_old
-
-                # Enforce inequality
                 v_new = phi_k if phi_k > v_candidate else v_candidate
 
-                # New lambda as in Ikonen–Toivanen
                 lam_new = lam_old + (phi_k - tilde_vk) / dt
                 if lam_new < 0.0:
                     lam_new = 0.0
@@ -429,90 +475,138 @@ class AmericanFDMPricer:
                 new_lambda_int[k] = lam_new
                 new_V_int[k] = v_new
 
-            # Assemble full grid including boundaries
-            V[0] = V_min_next
-            V[-1] = V_max_next
+            V[0] = V_min
+            V[-1] = V_max
             V[1:-1] = new_V_int
-
             lambda_int = new_lambda_int
+            tau = tau_next
 
         return V
 
-    # ------------------------------------------------------------------
-    # Cubic interpolation for price, delta, gamma
-    # ------------------------------------------------------------------
-    def _price_delta_gamma_cubic(self, V: List[float]) -> Tuple[float, float, float]:
-        """
-        Local 3rd-degree polynomial interpolation around the spot S0.
+    # ------------------------------------------------------------------ #
+    #  Dividend mapping at ex-div dates
+    # ------------------------------------------------------------------ #
 
-        We select 4 consecutive nodes surrounding S0, fit
-            p(S) = a S^3 + b S^2 + c S + d
-        and compute price, delta and gamma analytically as
-            p(S0), p'(S0), p''(S0).
+    def _apply_dividend_jump(self, V_after: List[float], cash_div: float) -> List[float]:
+        """
+        Map values just after the dividend (t_d+) to values just before (t_d-)
+        via S(t_d+) = S(t_d-) - D, i.e.:
+
+            V(t_d-, S) = V(t_d+, S - D)
+
+        with linear interpolation on the log-S grid. For American CALLs,
+        we also allow immediate exercise just before ex-div:
+
+            V(t_d-, S) = max( V(t_d+, S - D), payoff(S) )
+
+        This is where the American-call-with-dividend early-exercise feature
+        comes in, analogous (though simpler) to the FIS description.
         """
         s = self.s_nodes
-        S0 = self.spot
-        n = len(s)
-        if n < 4:
-            # Fallback: linear interpolation + FD Greeks
-            price = self._interp_price_linear(V)
-            delta, gamma = self._delta_gamma_fd(V)
-            return price, delta, gamma
+        V_new = [0.0] * len(V_after)
 
-        # Find interval containing S0
-        lo, hi = 0, n - 1
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if S0 < s[mid]:
-                hi = mid
+        def interp(x: float) -> float:
+            if x <= s[0]:
+                return V_after[0]
+            if x >= s[-1]:
+                return V_after[-1]
+            lo, hi = 0, len(s) - 1
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                if x < s[mid]:
+                    hi = mid
+                else:
+                    lo = mid
+            w = (x - s[lo]) / (s[hi] - s[lo])
+            return (1.0 - w) * V_after[lo] + w * V_after[hi]
+
+        for j, Sj in enumerate(s):
+            Sj_minus = Sj - cash_div
+            cont_val = interp(max(Sj_minus, s[0]))
+            if self.option_type == "call":
+                ex_val = self._intrinsic_payoff(Sj)
+                V_new[j] = max(cont_val, ex_val)
             else:
-                lo = mid
+                V_new[j] = cont_val
 
-        # Choose 4 consecutive points around S0
-        start = max(0, min(lo - 1, n - 4))
-        xs = [s[start + i] for i in range(4)]
-        ys = [V[start + i] for i in range(4)]
+        return V_new
 
-        # Solve for cubic coefficients via small Gaussian elimination
-        M = [[xs[i] ** 3, xs[i] ** 2, xs[i], 1.0] for i in range(4)]
-        A = [M[i] + [ys[i]] for i in range(4)]  # augmented matrix 4x5
+    # ------------------------------------------------------------------ #
+    #  Global solver with piecewise time grid
+    # ------------------------------------------------------------------ #
 
-        # Forward elimination
-        for i in range(4):
-            pivot = A[i][i]
-            if abs(pivot) < 1e-18:
-                pivot = 1e-18
-            inv_p = 1.0 / pivot
-            for j in range(i, 5):
-                A[i][j] *= inv_p
-            for k in range(i + 1, 4):
-                factor = A[k][i]
-                for j in range(i, 5):
-                    A[k][j] -= factor * A[i][j]
+    def _solve_grid(self, N_time: Optional[int] = None) -> List[float]:
+        self._build_log_grid()  # sets self.s_nodes, x_nodes
 
-        # Back substitution
-        coeffs = [0.0] * 4
-        for i in range(3, -1, -1):
-            val = A[i][4]
-            for j in range(i + 1, 4):
-                val -= A[i][j] * coeffs[j]
-            coeffs[i] = val
+        V = self._terminal_payoff()
+        T = self.time_to_expiry
 
-        a, b, c, d = coeffs
+        div_times = self._div_times_tau()  # list of (tau_div, D)
+        base_N = self.num_time_steps if N_time is None else int(N_time)
+        base_dt = T / float(base_N)
 
-        price = ((a * S0 + b) * S0 + c) * S0 + d
-        delta = (3.0 * a * S0 + 2.0 * b) * S0 + c
-        gamma = 6.0 * a * S0 + 2.0 * b
+        # Build tau partition: 0 = expiry, then each dividend, then T=valuation
+        tau_points = [0.0] + [tau for tau, _ in div_times] + [T]
+        n_segments = len(tau_points) - 1
 
-        return float(price), float(delta), float(gamma)
+        # Distribute time steps roughly proportionally to segment lengths
+        seg_lengths = [tau_points[i + 1] - tau_points[i] for i in range(n_segments)]
+        seg_steps = []
+        remaining_steps = base_N
+        for L in seg_lengths[:-1]:
+            n = max(1, int(round(L / base_dt)))
+            seg_steps.append(n)
+            remaining_steps -= n
+        seg_steps.append(max(1, remaining_steps))
 
-    def _interp_price_linear(self, V: List[float]) -> float:
+        tau = 0.0
+        for seg_idx in range(n_segments):
+            tau_start = tau_points[seg_idx]
+            tau_end = tau_points[seg_idx + 1]
+            n_steps = seg_steps[seg_idx]
+
+            restart_ran = (
+                (seg_idx == 0)  # always use Rannacher near expiry
+                or (
+                    # restart at dividends for CALLs only, per FIS doc
+                    seg_idx > 0 and self.option_type == "call"
+                )
+            )
+
+            V = self._solve_segment(
+                V_init=V,
+                tau_start=tau_start,
+                tau_end=tau_end,
+                n_steps=n_steps,
+                restart_rannacher=restart_ran,
+            )
+            tau = tau_end
+
+            # If this segment ends at a dividend, apply jump
+            if seg_idx < len(div_times):
+                _, D_cash = div_times[seg_idx]
+                V = self._apply_dividend_jump(V, D_cash)
+
+        return V
+
+    # ------------------------------------------------------------------ #
+    #  Interpolation at the spot & local cubic for Δ and Γ
+    # ------------------------------------------------------------------ #
+
+    def _spot_for_interp(self) -> float:
+        if self.snap_spot_to_grid and self.spot_snapped is not None:
+            return self.spot_snapped
+        return self.spot
+
+    def _interp_price(self, V: List[float]) -> float:
         s = self.s_nodes
-        S0 = self.spot
+        S0 = self._spot_for_interp()
+
         if S0 <= s[0]:
             return float(V[0])
         if S0 >= s[-1]:
             return float(V[-1])
+
         lo, hi = 0, len(s) - 1
         while hi - lo > 1:
             mid = (lo + hi) // 2
@@ -520,182 +614,120 @@ class AmericanFDMPricer:
                 hi = mid
             else:
                 lo = mid
-        S_lo, S_hi = s[lo], s[hi]
-        V_lo, V_hi = V[lo], V[hi]
-        w = (S0 - S_lo) / (S_hi - S_lo)
-        return float((1.0 - w) * V_lo + w * V_hi)
+        w = (S0 - s[lo]) / (s[hi] - s[lo])
+        return float((1.0 - w) * V[lo] + w * V[hi])
 
-    def _delta_gamma_fd(self, V: List[float]) -> Tuple[float, float]:
-        """
-        Backup finite-difference stencil for delta/gamma if the grid
-        is too coarse for a stable cubic fit.
-        """
+    def _local_cubic_delta_gamma(self, V: List[float]) -> Tuple[float, float]:
         s = self.s_nodes
-        N = len(s) - 1
-        if N < 2:
-            return 0.0, 0.0
-        S0 = self.spot
-        idx = min(range(N + 1), key=lambda k: abs(s[k] - S0))
-        idx = max(1, min(N - 1, idx))
-        S_im1, S_i, S_ip1 = s[idx - 1], s[idx], s[idx + 1]
-        V_im1, V_i, V_ip1 = V[idx - 1], V[idx], V[idx + 1]
-        h1 = S_i - S_im1
-        h2 = S_ip1 - S_i
-        delta = (
-            -h2 / (h1 * (h1 + h2)) * V_im1
-            + (h2 - h1) / (h1 * h2) * V_i
-            + h1 / (h2 * (h1 + h2)) * V_ip1
-        )
-        gamma = 2.0 * (
-            V_im1 / (h1 * (h1 + h2))
-            - V_i / (h1 * h2)
-            + V_ip1 / (h2 * (h1 + h2))
-        )
-        return float(delta), float(gamma)
+        Sx = self._spot_for_interp()
+        n = len(s) - 1
 
-    def _solve_and_cubic(self, N_time: int, ran_steps: int) -> Tuple[float, float, float]:
-        V = self._solve_grid(N_time, rannacher_steps=ran_steps)
-        price, delta, gamma = self._price_delta_gamma_cubic(V)
-        return price, delta, gamma
+        # choose 4 nodes around Sx
+        i_near = min(range(n + 1), key=lambda k: abs(s[k] - Sx))
+        if i_near < 1:
+            i_near = 1
+        elif i_near > n - 2:
+            i_near = n - 2
 
-    # ------------------------------------------------------------------
-    # Public: price with Richardson extrapolation
-    # ------------------------------------------------------------------
-    def price_log2(self, use_richardson: bool = True) -> float:
+        idx = [i_near - 1, i_near, i_near + 1, i_near + 2]
+        x = np.array([s[j] for j in idx], dtype=float)
+        y = np.array([V[j] for j in idx], dtype=float)
+
+        z = x - Sx
+        M = np.vstack([z ** 3, z ** 2, z, np.ones_like(z)]).T
+        a, b, c, d = np.linalg.solve(M, y)
+
+        delta = float(c)
+        gamma = float(2.0 * b)
+        return delta, gamma
+
+    # ------------------------------------------------------------------ #
+    #  Public pricing / Greeks
+    # ------------------------------------------------------------------ #
+
+    def price_log(self, N_time: Optional[int] = None) -> float:
+        V = self._solve_grid(N_time=N_time)
+        return self._interp_price(V)
+
+    def price_log2(self) -> float:
         """
-        American price from the CN+Rannacher+IT PDE solver.
-
-        With Richardson, we run with N and 2N time steps (and Rannacher
-        windows r and 2r) and combine via
-
-            V ≈ (4 V_{2N} - V_N) / 3.
+        Price with Richardson extrapolation in time: N vs 2N steps.
         """
-        N = self.num_time_steps
-        r = self.rannacher_steps
-
-        if not use_richardson:
-            price, _, _ = self._solve_and_cubic(N, r)
-            return price
-
-        pN, _, _ = self._solve_and_cubic(N, r)
-        p2N, _, _ = self._solve_and_cubic(2 * N, 2 * r)
-
+        pN = self.price_log(N_time=self.num_time_steps)
+        p2N = self.price_log(N_time=2 * self.num_time_steps)
         return (4.0 * p2N - pN) / 3.0
 
-    # ------------------------------------------------------------------
-    # Helper: bumped price for vega/theta
-    # ------------------------------------------------------------------
-    def _price_fd(
-        self,
-        spot: Optional[float] = None,
-        sigma: Optional[float] = None,
-        maturity_date: Optional[_dt.date] = None,
-        use_richardson: bool = True,
-    ) -> float:
-        new_spot = self.spot if spot is None else spot
-        new_sigma = self.sigma if sigma is None else sigma
-        new_maturity = self.maturity_date if maturity_date is None else maturity_date
+    def _price_for_sigma(self, sigma: float, N_time: Optional[int] = None) -> float:
+        orig_sigma = self.sigma
+        try:
+            self.sigma = sigma
+            return self.price_log(N_time=N_time)
+        finally:
+            self.sigma = orig_sigma
 
-        bumped = AmericanFDMPricer(
-            spot=new_spot,
-            strike=self.strike,
-            valuation_date=self.valuation_date,
-            maturity_date=new_maturity,
-            sigma=new_sigma,
-            option_type=self.option_type,  # type: ignore[arg-type]
-            discount_curve=self.discount_curve_df,
-            forward_curve=self.forward_curve_df,
-            dividend_schedule=self.dividend_schedule,
-            trade_id=self.trade_id,
-            direction=self.direction,
-            quantity=self.quantity,
-            contract_multiplier=self.contract_multiplier,
-            underlying_spot_days=self.underlying_spot_days,
-            option_days=self.option_days,
-            option_settlement_days=self.option_settlement_days,
-            day_count=self.day_count,
-            grid_type=self.grid_type,
-            num_space_nodes=self.num_space_nodes,
-            num_time_steps=self.num_time_steps,
-            rannacher_steps=self.rannacher_steps,
-            s_max_mult=self.s_max_mult,
-        )
-        return bumped.price_log2(use_richardson=use_richardson)
-
-    # ------------------------------------------------------------------
-    # Public: Greeks with Richardson extrapolation
-    # ------------------------------------------------------------------
     def greeks_log2(
         self,
-        dv_sigma: float = 0.0001,
+        dv_sigma: float = 0.01,  # 1 vol point
         use_richardson: bool = True,
     ) -> Dict[str, float]:
         """
-        Greeks for the American option:
+        Compute price and Greeks, broadly aligned with FIS guidelines:
 
-        - price : PDE price (with Richardson if enabled)
-        - delta : from cubic interpolation, with Richardson
-        - gamma : from cubic interpolation, with Richardson
-        - vega  : bump-and-revalue in sigma (per 1% vol)
-        - theta : bump in maturity date (calendar time)
+          - Price: PDE + CN/IT + time-segmenting, with Richardson in time.
+          - Delta/Gamma: from local cubic fit around S0.
+          - Vega: symmetric vol bump with optional Richardson extrapolation.
+          - Theta: from BS PDE identity at S0.
         """
-        N = self.num_time_steps
-        r = self.rannacher_steps
+        # Base grid (N steps)
+        V_N = self._solve_grid(N_time=self.num_time_steps)
+        price_N = self._interp_price(V_N)
+        delta_N, gamma_N = self._local_cubic_delta_gamma(V_N)
 
         if use_richardson:
-            pN, dN, gN = self._solve_and_cubic(N, r)
-            p2N, d2N, g2N = self._solve_and_cubic(2 * N, 2 * r)
-            price = (4.0 * p2N - pN) / 3.0
-            delta = (4.0 * d2N - dN) / 3.0
-            gamma = (4.0 * g2N - gN) / 3.0
-        else:
-            price, delta, gamma = self._solve_and_cubic(N, r)
+            V_2N = self._solve_grid(N_time=2 * self.num_time_steps)
+            price_2N = self._interp_price(V_2N)
+            delta_2N, gamma_2N = self._local_cubic_delta_gamma(V_2N)
 
-        # Vega: bump vol (per 1% absolute vol)
-        S0 = self.spot
+            price = (4.0 * price_2N - price_N) / 3.0
+            delta = (4.0 * delta_2N - delta_N) / 3.0
+            gamma = (4.0 * gamma_2N - gamma_N) / 3.0
+        else:
+            price = price_N
+            delta = delta_N
+            gamma = gamma_N
+
+        # Vega: symmetric bump in sigma (+/- dv_sigma)
         sigma0 = self.sigma
-        dSigma = dv_sigma
+        h = dv_sigma
 
-        p_up_v = self._price_fd(
-            spot=S0,
-            sigma=sigma0 + dSigma,
-            maturity_date=self.maturity_date,
-            use_richardson=use_richardson,
-        )
-        vega = (p_up_v - price) / (100.0 * dSigma)
+        if use_richardson:
+            p_up_h = self._price_for_sigma(sigma0 + h, N_time=self.num_time_steps)
+            p_dn_h = self._price_for_sigma(sigma0 - h, N_time=self.num_time_steps)
+            D_h = (p_up_h - p_dn_h) / (2.0 * h)
 
-        # Theta: symmetric bump in maturity where possible
-        T0 = self.time_to_expiry
-        dT = 0.0001  # ~0.0365 days
-        dt_days = max(1, int(round(dT * 365.0)))
+            p_up_2h = self._price_for_sigma(sigma0 + 2.0 * h, N_time=self.num_time_steps)
+            p_dn_2h = self._price_for_sigma(sigma0 - 2.0 * h, N_time=self.num_time_steps)
+            D_2h = (p_up_2h - p_dn_2h) / (4.0 * h)
 
-        if T0 > 2.0 * dT:
-            mat_up = self.maturity_date + _dt.timedelta(days=dt_days)
-            mat_dn = self.maturity_date - _dt.timedelta(days=dt_days)
-            p_up_T = self._price_fd(
-                spot=S0,
-                sigma=sigma0,
-                maturity_date=mat_up,
-                use_richardson=use_richardson,
-            )
-            p_dn_T = self._price_fd(
-                spot=S0,
-                sigma=sigma0,
-                maturity_date=mat_dn,
-                use_richardson=use_richardson,
-            )
-            dV_dT = (p_up_T - p_dn_T) / (2.0 * dT)
-            theta = -dV_dT
+            dV_dsigma = (4.0 * D_h - D_2h) / 3.0
         else:
-            mat_dn = self.maturity_date - _dt.timedelta(days=dt_days)
-            p_dn_T = self._price_fd(
-                spot=S0,
-                sigma=sigma0,
-                maturity_date=mat_dn,
-                use_richardson=use_richardson,
-            )
-            dV_dT = (price - p_dn_T) / dT
-            theta = -dV_dT
+            p_up = self._price_for_sigma(sigma0 + h, N_time=self.num_time_steps)
+            p_dn = self._price_for_sigma(sigma0 - h, N_time=self.num_time_steps)
+            dV_dsigma = (p_up - p_dn) / (2.0 * h)
+
+        vega = dV_dsigma / 100.0  # per 1% vol
+
+        # Theta from BS PDE at S0
+        r = self.discount_rate_nacc
+        b = self.carry_rate_nacc
+        q = self.div_yield_nacc  # 0 in discrete-div model
+        S0 = self.spot
+
+        theta = -(
+            0.5 * sigma0 * sigma0 * S0 * S0 * gamma
+            + (b - q) * S0 * delta
+            - r * price
+        )
 
         return {
             "price": float(price),
