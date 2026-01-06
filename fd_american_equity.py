@@ -1097,3 +1097,27 @@ def _delta_gamma_bump_from_surface(
     delta = (v_up - v_down) / (2.0 * h)
     gamma = (v_up - 2.0 * v_0 + v_down) / (h * h)
     return float(delta), float(gamma)
+
+def _interp_price_at_spot(
+    self,
+    v_values: List[float],
+    spot: float,
+) -> float:
+    """Interpolate the FD solution at an arbitrary spot."""
+    s_nodes = self.s_nodes
+
+    if spot <= s_nodes[0]:
+        return float(v_values[0])
+    if spot >= s_nodes[-1]:
+        return float(v_values[-1])
+
+    lo, hi = 0, len(s_nodes) - 1
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if spot < s_nodes[mid]:
+            hi = mid
+        else:
+            lo = mid
+
+    w = (spot - s_nodes[lo]) / (s_nodes[hi] - s_nodes[lo])
+    return float((1.0 - w) * v_values[lo] + w * v_values[hi])
