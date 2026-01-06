@@ -1066,3 +1066,34 @@ class AmericanFDMPricer:
             "vega": float(vega),
             "theta": float(theta),
         }
+
+def _delta_gamma_bump_from_surface(
+    self,
+    v_values: List[float],
+    rel_bump: float = 0.01,
+) -> Tuple[float, float]:
+    """
+    Compute delta and gamma by bump-and-revalue in spot using the
+    existing FD surface.
+
+    Parameters
+    ----------
+    v_values :
+        FD solution at valuation (size = len(self.s_nodes)).
+    rel_bump :
+        Relative bump size in spot, e.g. 0.01 for ±1% bumps.
+
+    Returns
+    -------
+    (delta, gamma)
+    """
+    s0 = self._spot_for_interp()
+    h = max(s0 * rel_bump, 1e-8)
+
+    v_down = self._interp_price_at_spot(v_values, s0 - h)
+    v_0 = self._interp_price_at_spot(v_values, s0)
+    v_up = self._interp_price_at_spot(v_values, s0 + h)
+
+    delta = (v_up - v_down) / (2.0 * h)
+    gamma = (v_up - 2.0 * v_0 + v_down) / (h * h)
+    return float(delta), float(gamma)
