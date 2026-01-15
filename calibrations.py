@@ -261,3 +261,156 @@ if __name__ == "__main__":
     print("\nStats head:\n", stats.head())
     print("\nCorrelation shape:", corr.shape)
     print("\nDelta head:\n", delta.head())
+
+from __future__ import annotations
+
+from typing import Tuple
+import numpy as np
+import pandas as pd
+
+
+def calculate_statistics_CS(
+    data: pd.DataFrame,
+    method: str = "log",
+    num_business_days: float = 252.0,
+    smooth: float = 0.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    RiskFlow-style OU/log statistics for a *curve panel* (multiple tenors).
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        Either:
+          - columns: ['date', <tenor1>, <tenor2>, ...]
+        or:
+          - index is datetime, columns are tenors
+    method : {"log", "diff"}
+        "log": work on log(level) and treat delta as log-returns-like changes
+        "diff": work on level differences
+    num_business_days : float
+        Annualization factor (default 252)
+    smooth : float
+        If > 0: remove outliers beyond smooth*std from median per tenor,
+        then interpolate.
+
+    Returns
+    -------
+    stats : pd.DataFrame
+        Indexed by tenor, with columns:
+        mean_reversion_speed, drift, mu, reversion_volatility,
+        long_run_mean, volatility
+    correlation : pd.DataFrame
+        Tenor-by-tenor correlation matrix of delta series (used in PCA step)
+    delta : pd.DataFrame
+        Delta series used for covariance/correlation (your `x`)
+    """
+    method = method.lower().strip()
+    if method not in {"log", "diff"}:
+        raise ValueError("method must be 'log' or 'diff'")
+
+    df = data.copy()
+
+    # Accept either a 'date' column or a datetime index
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date")
+
+    df = df.sort_index()
+    df = df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+
+    # All remaining columns are tenors (RiskFlow intuition: node-by-node stats)
+    tenor_cols = list(df.columns)
+    if len(tenor_cols) < 1:
+        raise ValueError("No tenor columns found (expected >0 after cleaning).")
+
+    # Optional outlier removal per tenor
+    if smooth > 0.0:
+        med = df.median(axis=0)
+        sd = df.std(axis=0, ddof=0)
+        mask = (df.sub(med, axis=1).abs()).le(smooth * sd, axis=1)
+        df = df.where(mask)
+
+        # interpolate through time; if index isn't datetime-like, fallback to index interpolation
+        try:
+            df = df.interpolate(method="time")
+        except (ValueError, TypeError):
+            df = df.interpolate(method="index")
+
+        df = df.ffill().bfill()
+
+    # Build the working series s(t) and delta x(t) = s(t+1)-s(t) (shifted to align with y=s(t))
+    if method == "diff":
+        s = df.astype(float)
+    else:
+        # log requires positivity; caller usually enforces via force_positive upstream
+        s = np.log(df.astype(float).clip(lower=1e-12))
+
+    # x corresponds to "delta" used for covariance/correlation and OU regression-like stats
+    delta = s.diff(1).shift(-1)          # x_t = s_{t+1} - s_t (aligned at time t)
+    y = s                                # y_t = s_t
+
+    # drop the last row (shift(-1) makes it NaN), keep panel shape
+    delta = delta.iloc[:-1]
+    y = y.iloc[:-1]
+
+    # Centered moments per tenor
+    x_mean = delta.mean(axis=0, skipna=True)
+    y_mean = y.mean(axis=0, skipna=True)
+
+    x_dev = delta.sub(x_mean, axis=1)
+    y_dev = y.sub(y_mean, axis=1)
+
+    cov_xy = (x_dev * y_dev).mean(axis=0, skipna=True)
+    var_y = (y_dev ** 2).mean(axis=0, skipna=True)
+
+    # Mean reversion speed (alpha) per tenor
+    eps = 1e-16
+    ratio = cov_xy / var_y.clip(lower=eps)
+
+    # RiskFlow-style transform: alpha = -N * ln(1 + cov/var)
+    alpha = (-num_business_days * np.log(1.0 + ratio.clip(lower=-0.999999999))).astype(float)
+    alpha = alpha.clip(lower=0.001, upper=4.0)  # same stabilisation you were doing
+
+    # Sigma^2 per tenor (OU-consistent)
+    exp_a = np.exp(-alpha / num_business_days)
+    var_x = (x_dev ** 2).mean(axis=0, skipna=True)
+
+    denom = (1.0 - np.exp(-2.0 * alpha / num_business_days)).clip(lower=1e-16)
+    sigma2 = (var_x - ((1.0 - exp_a) ** 2) * var_y) * (2.0 * alpha) / denom
+
+    sigma2 = sigma2.clip(lower=0.0)
+    sigma = np.sqrt(sigma2)
+
+    # Long-run level (theta) per tenor
+    one_minus_exp = (1.0 - exp_a).clip(lower=1e-16)
+    theta = y_mean + x_mean / one_minus_exp
+
+    if method == "log":
+        # RiskFlow-style adjustment for log-level mean
+        log_theta = np.exp(theta + sigma2 / (4.0 * alpha).clip(lower=1e-16))
+        long_run_mean = log_theta
+    else:
+        long_run_mean = theta
+
+    # Vol + drift per tenor (annualised)
+    volatility = delta.std(axis=0, ddof=0) * np.sqrt(num_business_days)
+    drift = x_mean * num_business_days
+    mu = drift + 0.5 * (volatility ** 2)
+
+    # Correlation across tenors (this is what your PCA wants)
+    correlation = delta.corr()
+
+    stats = pd.DataFrame(
+        {
+            "mean_reversion_speed": alpha,
+            "drift": drift,
+            "mu": mu,
+            "reversion_volatility": sigma,
+            "long_run_mean": long_run_mean,
+            "volatility": volatility,
+        }
+    )
+    stats.index.name = "tenor"
+
+    return stats, correlation, delta
