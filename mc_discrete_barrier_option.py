@@ -1,713 +1,491 @@
-"""Monte Carlo valuation for discretely monitored single-barrier options.
+"""
+mc_discrete_barrier_option.py
 
-This module is meant to mirror the *event-time* intuition in RiskFlow-style
-barrier implementations:
+Discrete (date-scheduled) single-barrier option valuation via Monte Carlo,
+aligned to the Riskworx / RiskFlow-style curve handling you showed:
 
-- Build a time grid that is the union of all relevant event times:
-  valuation (0), dividend times, barrier monitoring times, expiry.
-- Simulate the underlying only across this non-uniform grid.
-- Apply the barrier rule ONLY at the monitoring times.
+- Curves are DAILY NACA: DataFrame with columns ["Date", "NACA"] where Date is ISO "YYYY-MM-DD".
+- Discount factor:
+    DF(valuation, d) = (1 + NACA(d)) ** (-tau(valuation, d))
+- Forward NACC rate over [d0, d1]:
+    f_nacc(d0, d1) = -ln(DF(d1)/DF(d0)) / tau(d0, d1)
 
-Model
------
-Under risk-neutral pricing we assume a lognormal GBM with *carry* b(t)
-(and discount rate r(t)):
+- Dividends are [(pay_date, cash_amount), ...] and applied as cash drops on pay_date.
+- Monitoring times are dates (not year-fractions) and barrier is checked ONLY on those dates.
+- Non-uniform time steps come naturally from the union grid:
+    {valuation} ∪ {div_dates} ∪ {monitor_dates} ∪ {maturity}
 
-    dS_t = b(t) S_t dt + sigma(t) S_t dW_t
+Barrier breach "band" (your bp interval around barrier):
+- Down barrier: hit if S <= B + band
+- Up barrier:   hit if S >= B - band
+where band = max(abs_tol, B * tol_bps * 1e-4)
 
-Payoffs are discounted with the discount curve r(t):
+Supports:
+- barrier_type in:
+    "none",
+    "down-and-out", "up-and-out",
+    "down-and-in",  "up-and-in"
+- rebate for knock-out:
+    - paid at maturity (default) or paid at hit time (rebate_at_hit=True)
 
-    PV = E[ payoff * exp(-\int_0^T r(u) du) ]
+Notes:
+- Underlying is GBM with deterministic per-step carry extracted from the forward curve:
+    ln S_{i+1} = ln S_i + (carry_i - 0.5 σ^2) Δt + σ sqrt(Δt) Z
+  where carry_i = forward_curve.get_forward_nacc_rate(d_i, d_{i+1})
+- Discounting uses DF(valuation, maturity) for terminal payoffs.
+- If you need day-count conventions to match your FD code, set day_count consistently.
 
-Notes
------
-1) Separate carry and discount curves are supported. In the usual equity case
-   b(t) = r(t) - q(t) (continuous dividend yield), but we keep them separate
-   because RiskFlow frequently does.
-
-2) Discrete cash dividends can be modelled as *jumps* at specified times.
-   If a dividend time coincides with a monitoring time, we apply the dividend
-   first (default) and then test the barrier.
-
-3) Barrier "tolerance band" is implemented to match your requirement:
-   a barrier is considered breached inside a small band around the barrier.
-   For example, for a *down* barrier B, we treat it as breached when
-   S <= B * (1 + tol) (i.e., you knock out slightly *above* the barrier).
-
-4) This is a *discrete* barrier pricer. If you want *continuous* monitoring,
-   you would add a Brownian-bridge crossing correction inside each interval.
+Dependencies: numpy, pandas
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple, Union
-
+import datetime as dt
 import math
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# Curves (continuous compounding)
-# ---------------------------------------------------------------------------
+OptionType = Literal["call", "put"]
+BarrierType = Literal["none", "down-and-out", "up-and-out", "down-and-in", "up-and-in"]
 
 
-class RateCurve:
-    """Minimal interface for a continuously-compounded rate curve."""
-
-    def integral(self, t0: float, t1: float) -> float:
-        """Return \int_{t0}^{t1} r(u) du (continuous-compounding rate integral)."""
-
-        raise NotImplementedError
-
-    def df(self, t: float) -> float:
-        """Discount factor exp(-\int_0^t r(u) du)."""
-
-        return math.exp(-self.integral(0.0, t))
-
-
-@dataclass(frozen=True)
-class FlatRateCurve(RateCurve):
-    """Constant continuously-compounded rate curve."""
-
-    rate: float
-
-    def integral(self, t0: float, t1: float) -> float:
-        if t1 < t0:
-            raise ValueError("t1 must be >= t0")
-        return self.rate * (t1 - t0)
-
-
-@dataclass(frozen=True)
-class PiecewiseFlatRateCurve(RateCurve):
-    """Piecewise-flat continuously-compounded *instantaneous* rate curve.
-
-    Parameters
-    ----------
-    times : increasing sequence of knot times (> 0)
-    rates : instantaneous rate on [times[i-1], times[i]) for i>=1,
-            and on [0, times[0]) for i=0.
-
-    Example
-    -------
-    times=[0.5, 1.0, 2.0], rates=[0.06, 0.062, 0.065]
-    means:
-      r(t)=0.06 for t in [0,0.5)
-      r(t)=0.062 for t in [0.5,1.0)
-      r(t)=0.065 for t in [1.0,2.0) and for t>=2.0
-
-    (We extend the last rate beyond the final knot.)
+class NacaCurve:
     """
+    Daily NACA curve with exact-date lookup.
 
-    times: Tuple[float, ...]
-    rates: Tuple[float, ...]
-
-    def __post_init__(self) -> None:
-        if len(self.times) == 0:
-            raise ValueError("times must be non-empty")
-        if len(self.rates) != len(self.times):
-            raise ValueError("rates must have the same length as times")
-        if any(t <= 0.0 for t in self.times):
-            raise ValueError("all times must be > 0")
-        if any(self.times[i] <= self.times[i - 1] for i in range(1, len(self.times))):
-            raise ValueError("times must be strictly increasing")
-
-    def _rate_at(self, t: float) -> float:
-        for i, ti in enumerate(self.times):
-            if t < ti:
-                return self.rates[i]
-        return self.rates[-1]
-
-    def integral(self, t0: float, t1: float) -> float:
-        if t1 < t0:
-            raise ValueError("t1 must be >= t0")
-        if t1 == t0:
-            return 0.0
-
-        # Integrate piecewise across knot boundaries
-        total = 0.0
-        a = t0
-        for i, ti in enumerate(self.times):
-            b = min(t1, ti)
-            if b > a:
-                total += self.rates[i] * (b - a)
-                a = b
-            if a >= t1:
-                return total
-
-        # Beyond last knot
-        total += self.rates[-1] * (t1 - a)
-        return total
-
-
-def make_curve(curve: Union[float, RateCurve]) -> RateCurve:
-    """Helper: accept either a float (flat curve) or a RateCurve."""
-
-    if isinstance(curve, RateCurve):
-        return curve
-    return FlatRateCurve(rate=float(curve))
-
-
-# ---------------------------------------------------------------------------
-# Dividends
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class CashDividend:
-    time: float  # in years from valuation
-    amount: float
-
-
-# ---------------------------------------------------------------------------
-# Option specification
-# ---------------------------------------------------------------------------
-
-
-BarrierType = str  # "none", "down-and-out", "up-and-out", "down-and-in", "up-and-in"
-OptionType = str   # "call" or "put"
-
-
-@dataclass(frozen=True)
-class DiscreteBarrierOptionSpec:
-    """Contract specification for a discretely monitored single-barrier option."""
-
-    strike: float
-    expiry: float
-    option_type: OptionType
-
-    barrier_type: BarrierType
-    barrier_level: Optional[float] = None
-
-    # Discrete monitoring times (years). If None, defaults to [expiry].
-    monitoring_times: Optional[Sequence[float]] = None
-
-    # Rebate settings
-    rebate: float = 0.0
-    rebate_at_hit: bool = False  # True: paid at hit time; False: paid at expiry
-
-    # "Already hit" state at valuation time
-    already_hit: bool = False
-
-    # Barrier tolerance band: max( abs_tol, level * rel_tol_bp )
-    barrier_tol_bp: float = 0.0      # basis points (1bp = 0.0001) of barrier level
-    barrier_abs_tol: float = 0.0     # absolute tolerance in price units
-
-
-# ---------------------------------------------------------------------------
-# Monte Carlo pricer
-# ---------------------------------------------------------------------------
-
-
-class DiscreteBarrierMonteCarloPricer:
-    """Monte Carlo pricer for discretely monitored single-barrier options."""
+    Expected df columns:
+      - "Date" : "YYYY-MM-DD"
+      - "NACA" : numeric (e.g. 0.085 for 8.5% NACA)
+    """
 
     def __init__(
         self,
-        spot: float,
-        vol: float,
-        discount_curve: Union[float, RateCurve],
-        carry_curve: Union[float, RateCurve],
-        option: DiscreteBarrierOptionSpec,
-        dividends: Optional[Sequence[CashDividend]] = None,
-        dividend_before_monitor: bool = True,
-        seed: Optional[int] = None,
+        discount_curve_df: pd.DataFrame,
+        valuation_date: dt.date,
+        day_count: str = "ACT/365F",
+        date_col: str = "Date",
+        naca_col: str = "NACA",
     ) -> None:
-        if spot <= 0.0:
-            raise ValueError("spot must be positive")
-        if vol <= 0.0:
-            raise ValueError("vol must be positive")
-        if option.expiry <= 0.0:
-            raise ValueError("option.expiry must be positive")
-        if option.strike <= 0.0:
-            raise ValueError("option.strike must be positive")
+        self.valuation_date = valuation_date
+        self.day_count = day_count
+        self._year_denominator = self._infer_denominator(day_count)
 
-        self.spot = float(spot)
-        self.vol = float(vol)
-        self.discount_curve = make_curve(discount_curve)
-        self.carry_curve = make_curve(carry_curve)
-        self.option = option
-        self.dividends = list(dividends) if dividends else []
-        self.dividend_before_monitor = bool(dividend_before_monitor)
+        df = discount_curve_df.copy()
+        if date_col not in df.columns or naca_col not in df.columns:
+            raise ValueError(f"Curve df must have columns [{date_col}, {naca_col}].")
 
-        self._rng = np.random.default_rng(seed)
+        df[date_col] = pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d")
+        df[naca_col] = pd.to_numeric(df[naca_col], errors="coerce")
 
-        self._monitor_times = self._normalize_monitor_times(option)
-        self._div_times = sorted({d.time for d in self.dividends if 0.0 < d.time <= option.expiry})
+        if df[naca_col].isna().any():
+            bad = df[df[naca_col].isna()].head(5)
+            raise ValueError(f"Found non-numeric NACA values. Examples:\n{bad}")
 
-        # Pre-map dividend times to amounts (support multiple dividends at same time)
-        self._div_by_time = {}
-        for d in self.dividends:
-            if 0.0 < d.time <= option.expiry and d.amount != 0.0:
-                self._div_by_time[d.time] = self._div_by_time.get(d.time, 0.0) + float(d.amount)
+        self._df = df[[date_col, naca_col]].rename(columns={date_col: "Date", naca_col: "NACA"})
+        # For faster exact lookups
+        self._map: Dict[str, float] = dict(zip(self._df["Date"].values, self._df["NACA"].values))
 
-    @staticmethod
-    def _normalize_monitor_times(option: DiscreteBarrierOptionSpec) -> List[float]:
-        if option.monitoring_times is None:
-            return [float(option.expiry)]
-        out = sorted({float(t) for t in option.monitoring_times if 0.0 < float(t) <= option.expiry})
-        if not out or abs(out[-1] - option.expiry) > 1e-14:
-            out.append(float(option.expiry))
-        return out
+    @classmethod
+    def from_csv(
+        cls,
+        path: str,
+        valuation_date: dt.date,
+        day_count: str = "ACT/365F",
+        date_col: str = "Date",
+        naca_col: str = "NACA",
+        date_format: Optional[str] = None,
+    ) -> "NacaCurve":
+        df = pd.read_csv(path)
+        if date_format is not None:
+            df[date_col] = pd.to_datetime(df[date_col], format=date_format)
+        return cls(df, valuation_date=valuation_date, day_count=day_count, date_col=date_col, naca_col=naca_col)
 
-    def build_time_grid(
-        self,
-        extra_times: Optional[Iterable[float]] = None,
-        substeps_per_interval: int = 0,
-    ) -> List[float]:
-        """Build a non-uniform simulation grid.
+    def _infer_denominator(self, day_count: str) -> int:
+        if day_count in ("ACT/365", "ACT/365F"):
+            return 365
+        if day_count in ("ACT/360", "ACT/364"):
+            return 360 if day_count == "ACT/360" else 364
+        if day_count in ("30/360", "BOND", "US30/360"):
+            return 360
+        return 365
 
-        The grid is the union of:
-          - 0
-          - dividend times
-          - monitoring times
-          - expiry
-          - (optional) extra_times
-
-        Optionally split each interval into equal substeps (substeps_per_interval).
-        Barrier is still checked ONLY at monitoring times.
-        """
-
-        times = {0.0, float(self.option.expiry)}
-        times.update(self._monitor_times)
-        times.update(self._div_times)
-        if extra_times is not None:
-            for t in extra_times:
-                tt = float(t)
-                if 0.0 < tt < self.option.expiry:
-                    times.add(tt)
-
-        grid = sorted(times)
-
-        if substeps_per_interval <= 0:
-            return grid
-
-        refined: List[float] = [grid[0]]
-        k = int(substeps_per_interval)
-        for i in range(len(grid) - 1):
-            t0, t1 = grid[i], grid[i + 1]
-            dt = (t1 - t0) / float(k)
-            for j in range(1, k + 1):
-                refined.append(t0 + j * dt)
-        return refined
-
-    # -----------------------------
-    # Barrier logic with tolerance
-    # -----------------------------
-
-    def _barrier_band(self) -> float:
-        opt = self.option
-        if opt.barrier_level is None:
+    def year_fraction(self, start_date: dt.date, end_date: dt.date) -> float:
+        if end_date <= start_date:
             return 0.0
-        rel = (opt.barrier_tol_bp / 10000.0) * abs(opt.barrier_level)
-        return max(float(opt.barrier_abs_tol), float(rel))
+        if self.day_count in ("ACT/365", "ACT/365F", "ACT/360", "ACT/364"):
+            return (end_date - start_date).days / float(self._year_denominator)
 
-    def _is_barrier_hit(self, s: np.ndarray) -> np.ndarray:
-        """Vectorized hit test at a monitoring time."""
+        if self.day_count in ("30/360", "BOND", "US30/360"):
+            y1, m1, d1 = start_date.year, start_date.month, start_date.day
+            y2, m2, d2 = end_date.year, end_date.month, end_date.day
+            d1 = min(d1, 30)
+            if d1 == 30:
+                d2 = min(d2, 30)
+            days = (y2 - y1) * 360 + (m2 - m1) * 30 + (d2 - d1)
+            return days / 360.0
 
-        bt = self.option.barrier_type.lower()
-        if bt == "none":
-            return np.zeros_like(s, dtype=bool)
+        return (end_date - start_date).days / 365.0
 
-        B = self.option.barrier_level
-        if B is None:
-            raise ValueError("barrier_level must be provided for barrier options")
+    def get_naca(self, lookup_date: dt.date) -> float:
+        iso = lookup_date.isoformat()
+        if iso not in self._map:
+            raise ValueError(f"NACA not found for date: {iso}")
+        return float(self._map[iso])
 
-        band = self._barrier_band()
+    def get_discount_factor(self, lookup_date: dt.date) -> float:
+        """
+        DF(valuation, lookup_date) using the curve's DAILY NACA at lookup_date:
+            DF = (1 + NACA(lookup_date)) ** (-tau(valuation, lookup_date))
+        """
+        naca = self.get_naca(lookup_date)
+        tau = self.year_fraction(self.valuation_date, lookup_date)
+        return (1.0 + naca) ** (-tau)
 
+    def get_forward_nacc_rate(self, start_date: dt.date, end_date: dt.date) -> float:
+        """
+        Forward NACC rate (continuous) implied by curve DFs:
+            f = -ln(DF(end)/DF(start)) / tau(start,end)
+        """
+        df_far = self.get_discount_factor(end_date)
+        df_near = self.get_discount_factor(start_date)
+        tau = self.year_fraction(start_date, end_date)
+        return -math.log(df_far / df_near) / max(1e-12, tau)
+
+
+@dataclass(frozen=True)
+class BarrierSpec:
+    barrier_type: BarrierType
+    level: Optional[float] = None
+    tol_bps: float = 0.0       # e.g. 1.0 means 1bp band
+    abs_tol: float = 0.0       # absolute band (added via max)
+
+
+@dataclass(frozen=True)
+class RebateSpec:
+    amount: float = 0.0
+    rebate_at_hit: bool = False   # if True, PV rebate at hit date; else pay at maturity
+
+
+@dataclass(frozen=True)
+class MCConfig:
+    n_paths: int = 200_000
+    seed: int = 42
+    antithetic: bool = True
+    chunk_size: int = 50_000
+    dividend_before_monitor: bool = True
+    spot_floor: float = 1e-12     # prevent negative/zero after dividend
+
+
+def _vanilla_payoff(sT: np.ndarray, strike: float, option_type: OptionType) -> np.ndarray:
+    if option_type == "call":
+        return np.maximum(sT - strike, 0.0)
+    return np.maximum(strike - sT, 0.0)
+
+
+def _barrier_band(level: float, tol_bps: float, abs_tol: float) -> float:
+    return max(abs_tol, abs(level) * (tol_bps * 1e-4))
+
+
+def _build_event_grid(
+    valuation: dt.date,
+    maturity: dt.date,
+    dividends: Sequence[Tuple[dt.date, float]],
+    monitor_dates: Sequence[dt.date],
+    include_maturity_monitor: bool = True,
+) -> Tuple[List[dt.date], Dict[dt.date, float], set]:
+    """
+    Returns:
+      - grid dates (sorted unique), including valuation and maturity
+      - div_map: date -> total cash dividend
+      - monitor_set: set of monitoring dates
+    """
+    if maturity <= valuation:
+        raise ValueError("maturity must be after valuation.")
+
+    div_map: Dict[dt.date, float] = {}
+    for d, amt in dividends:
+        if valuation < d <= maturity and float(amt) != 0.0:
+            div_map[d] = div_map.get(d, 0.0) + float(amt)
+
+    monitor_set = {d for d in monitor_dates if valuation < d <= maturity}
+    if include_maturity_monitor:
+        monitor_set.add(maturity)
+
+    grid = sorted({valuation, maturity, *div_map.keys(), *monitor_set})
+    if grid[0] != valuation:
+        grid = [valuation] + grid
+
+    return grid, div_map, monitor_set
+
+
+def price_discrete_barrier_mc(
+    *,
+    spot: float,
+    strike: float,
+    vol: float,
+    option_type: OptionType,
+    valuation: dt.date,
+    maturity: dt.date,
+    discount_curve: NacaCurve,
+    forward_curve: Optional[NacaCurve] = None,
+    dividends: Sequence[Tuple[dt.date, float]] = (),
+    monitor_dates: Sequence[dt.date] = (),
+    barrier: BarrierSpec = BarrierSpec("none"),
+    rebate: RebateSpec = RebateSpec(),
+    cfg: MCConfig = MCConfig(),
+    include_maturity_monitor: bool = True,
+) -> Dict[str, object]:
+    """
+    Monte Carlo pricer for discretely monitored single-barrier options (single underlying).
+
+    Parameters mirror your FD workflow:
+      - Curves extracted like your get_discount_factor / get_forward_nacc_rate methods
+      - Dividends and monitoring dates are calendar dates (dt.date)
+    """
+    if spot <= 0.0 or strike <= 0.0:
+        raise ValueError("spot and strike must be positive.")
+    if vol < 0.0:
+        raise ValueError("vol must be non-negative.")
+
+    fwd_curve = forward_curve or discount_curve
+
+    grid, div_map, monitor_set = _build_event_grid(
+        valuation=valuation,
+        maturity=maturity,
+        dividends=dividends,
+        monitor_dates=monitor_dates,
+        include_maturity_monitor=include_maturity_monitor,
+    )
+
+    n_steps = len(grid) - 1
+    if n_steps <= 0:
+        raise ValueError("Event grid has no steps.")
+
+    # Precompute per-step dt, drift, diffusion.
+    # Drift uses the forward curve implied continuous forward over each interval.
+    dt_arr = np.empty(n_steps, dtype=float)
+    drift = np.empty(n_steps, dtype=float)
+    diff = np.empty(n_steps, dtype=float)
+
+    for i in range(n_steps):
+        d0, d1 = grid[i], grid[i + 1]
+        tau = discount_curve.year_fraction(d0, d1)
+        dt_arr[i] = tau
+
+        carry = fwd_curve.get_forward_nacc_rate(d0, d1)
+        drift[i] = (carry - 0.5 * vol * vol) * tau
+        diff[i] = vol * math.sqrt(max(tau, 0.0))
+
+    # Discount factor to maturity
+    df_T = discount_curve.get_discount_factor(maturity)
+
+    # Barrier settings
+    bt = barrier.barrier_type
+    if bt != "none":
+        if barrier.level is None or barrier.level <= 0.0:
+            raise ValueError("barrier.level must be provided and positive for barrier options.")
+        band = _barrier_band(barrier.level, barrier.tol_bps, barrier.abs_tol)
+    else:
+        band = 0.0
+
+    # RNG and path count
+    rng = np.random.default_rng(cfg.seed)
+    n_paths = int(cfg.n_paths)
+    if n_paths <= 0:
+        raise ValueError("cfg.n_paths must be positive.")
+    use_anti = bool(cfg.antithetic)
+    n_obs = n_paths // 2 if use_anti else n_paths
+    if use_anti and n_obs <= 0:
+        raise ValueError("With antithetic=True, set n_paths >= 2.")
+
+    chunk = max(1, int(cfg.chunk_size))
+
+    def barrier_breached(s: np.ndarray) -> np.ndarray:
         if bt in ("down-and-out", "down-and-in"):
-            # Conservative band: treat as hit slightly ABOVE the barrier
-            return s <= (B + band)
-
+            return s <= (barrier.level + band)
         if bt in ("up-and-out", "up-and-in"):
-            # Conservative band: treat as hit slightly BELOW the barrier
-            return s >= (B - band)
+            return s >= (barrier.level - band)
+        return np.zeros_like(s, dtype=bool)
 
-        raise ValueError(f"Unsupported barrier_type: {self.option.barrier_type}")
-
-    # -----------------------------
-    # Payoff
-    # -----------------------------
-
-    def _vanilla_payoff(self, s_T: np.ndarray) -> np.ndarray:
-        k = self.option.strike
-        if self.option.option_type.lower() == "call":
-            return np.maximum(s_T - k, 0.0)
-        if self.option.option_type.lower() == "put":
-            return np.maximum(k - s_T, 0.0)
-        raise ValueError(f"Unsupported option_type: {self.option.option_type}")
-
-    # -----------------------------
-    # Core MC
-    # -----------------------------
-
-    def price(
-        self,
-        n_paths: int = 200_000,
-        batch_size: int = 50_000,
-        antithetic: bool = True,
-        substeps_per_interval: int = 0,
-        return_std_error: bool = True,
-        use_in_out_parity_for_in: bool = False,
-    ) -> dict:
-        """Price the option.
-
-        Parameters
-        ----------
-        n_paths : number of Monte Carlo paths
-        batch_size : paths simulated per batch (controls memory)
-        antithetic : whether to use antithetic variates
-        substeps_per_interval : optional refinement of the event-time grid
-        return_std_error : include standard error and 95% CI
-        use_in_out_parity_for_in : if True, compute KI as vanilla - KO
-                                 (only correct under the same rebate convention
-                                  that your FDM code assumes).
-
-        Returns
-        -------
-        dict with at least: price
-        optionally: std_error, ci95_low, ci95_high
+    def simulate_payoffs(Z: np.ndarray) -> np.ndarray:
         """
+        Z shape: (n_sim, n_steps)
+        Returns discounted payoff array of length n_sim.
+        """
+        n_sim = Z.shape[0]
+        s = np.full(n_sim, float(spot), dtype=float)
 
-        bt = self.option.barrier_type.lower()
-
-        # Handle "already hit" state
-        if bt in ("down-and-out", "up-and-out") and self.option.already_hit:
-            pv = self._rebate_pv(hit_time=0.0)
-            return {"price": pv, "std_error": 0.0, "ci95_low": pv, "ci95_high": pv}
-        if bt in ("down-and-in", "up-and-in") and self.option.already_hit:
-            # already-in -> becomes vanilla
-            vanilla = self._price_vanilla_mc(
-                n_paths=n_paths,
-                batch_size=batch_size,
-                antithetic=antithetic,
-                substeps_per_interval=substeps_per_interval,
-                return_std_error=return_std_error,
-            )
-            return vanilla
-
-        if bt in ("down-and-in", "up-and-in") and use_in_out_parity_for_in:
-            # KI = Vanilla - KO, assuming same rebate convention.
-            vanilla = self._price_vanilla_mc(
-                n_paths=n_paths,
-                batch_size=batch_size,
-                antithetic=antithetic,
-                substeps_per_interval=substeps_per_interval,
-                return_std_error=True,
-            )
-            ko_spec = DiscreteBarrierOptionSpec(
-                strike=self.option.strike,
-                expiry=self.option.expiry,
-                option_type=self.option.option_type,
-                barrier_type=("down-and-out" if bt == "down-and-in" else "up-and-out"),
-                barrier_level=self.option.barrier_level,
-                monitoring_times=self.option.monitoring_times,
-                rebate=self.option.rebate,
-                rebate_at_hit=self.option.rebate_at_hit,
-                already_hit=self.option.already_hit,
-                barrier_tol_bp=self.option.barrier_tol_bp,
-                barrier_abs_tol=self.option.barrier_abs_tol,
-            )
-            ko_pricer = DiscreteBarrierMonteCarloPricer(
-                spot=self.spot,
-                vol=self.vol,
-                discount_curve=self.discount_curve,
-                carry_curve=self.carry_curve,
-                option=ko_spec,
-                dividends=self.dividends,
-                dividend_before_monitor=self.dividend_before_monitor,
-                seed=None,
-            )
-            ko = ko_pricer.price(
-                n_paths=n_paths,
-                batch_size=batch_size,
-                antithetic=antithetic,
-                substeps_per_interval=substeps_per_interval,
-                return_std_error=True,
-            )
-
-            price = vanilla["price"] - ko["price"]
-
-            if not return_std_error:
-                return {"price": price}
-
-            # Conservative CI: add standard errors (upper bound). If you want
-            # tighter bounds, use common random numbers and estimate covariance.
-            se = math.sqrt(vanilla["std_error"] ** 2 + ko["std_error"] ** 2)
-            ci_lo = price - 1.96 * se
-            ci_hi = price + 1.96 * se
-            return {"price": price, "std_error": se, "ci95_low": ci_lo, "ci95_high": ci_hi}
-
-        # Otherwise: direct simulation for the actual barrier type.
-        return self._price_barrier_mc(
-            n_paths=n_paths,
-            batch_size=batch_size,
-            antithetic=antithetic,
-            substeps_per_interval=substeps_per_interval,
-            return_std_error=return_std_error,
-        )
-
-    def _rebate_pv(self, hit_time: float) -> float:
-        if self.option.rebate <= 0.0:
-            return 0.0
-        if self.option.rebate_at_hit:
-            return self.option.rebate * self.discount_curve.df(hit_time)
-        return self.option.rebate * self.discount_curve.df(self.option.expiry)
-
-    def _price_vanilla_mc(
-        self,
-        n_paths: int,
-        batch_size: int,
-        antithetic: bool,
-        substeps_per_interval: int,
-        return_std_error: bool,
-    ) -> dict:
-        # Vanilla = barrier_type "none" on the same dynamics.
-        vanilla_spec = DiscreteBarrierOptionSpec(
-            strike=self.option.strike,
-            expiry=self.option.expiry,
-            option_type=self.option.option_type,
-            barrier_type="none",
-            monitoring_times=[self.option.expiry],
-        )
-        pricer = DiscreteBarrierMonteCarloPricer(
-            spot=self.spot,
-            vol=self.vol,
-            discount_curve=self.discount_curve,
-            carry_curve=self.carry_curve,
-            option=vanilla_spec,
-            dividends=self.dividends,
-            dividend_before_monitor=self.dividend_before_monitor,
-            seed=None,
-        )
-        return pricer._price_barrier_mc(
-            n_paths=n_paths,
-            batch_size=batch_size,
-            antithetic=antithetic,
-            substeps_per_interval=substeps_per_interval,
-            return_std_error=return_std_error,
-        )
-
-    def _price_barrier_mc(
-        self,
-        n_paths: int,
-        batch_size: int,
-        antithetic: bool,
-        substeps_per_interval: int,
-        return_std_error: bool,
-    ) -> dict:
-        grid = self.build_time_grid(substeps_per_interval=substeps_per_interval)
-        monitors = set(self._monitor_times)
-        divs = set(self._div_times)
-
-        # Precompute integrals per time-step (deterministic)
-        dt = np.diff(np.array(grid))
-        if np.any(dt <= 0.0):
-            raise ValueError("Time grid must be strictly increasing")
-
-        r_int = np.array([self.discount_curve.integral(grid[i], grid[i + 1]) for i in range(len(grid) - 1)])
-        b_int = np.array([self.carry_curve.integral(grid[i], grid[i + 1]) for i in range(len(grid) - 1)])
-
-        var_int = (self.vol ** 2) * dt
-        if np.any(var_int < 0.0):
-            raise ValueError("Negative integrated variance")
-
-        drift = b_int - 0.5 * var_int
-        diff_scale = np.sqrt(var_int)
-
-        # Monte Carlo
-        n_paths = int(n_paths)
-        if n_paths <= 0:
-            raise ValueError("n_paths must be positive")
-
-        batch_size = int(batch_size)
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-
-        # Online aggregation for mean + variance (memory bounded)
-        total_sum = 0.0
-        total_sumsq = 0.0
-        total_n = 0
-
-        # We compute discounting using curve df at hit/expiry; note that with
-        # time-dependent rates this is path-independent.
-        df_T = self.discount_curve.df(self.option.expiry)
-
-        remaining = n_paths
-        while remaining > 0:
-            m = min(batch_size, remaining)
-            remaining -= m
-
-            use_antithetic = antithetic
-            if use_antithetic and m < 2:
-                # If we're down to a tiny tail batch, fall back to plain MC.
-                use_antithetic = False
-
-            if use_antithetic:
-                # enforce even batch for pairing
-                if m % 2 == 1:
-                    # keep the batch even; leave the final odd path for a later batch
-                    m -= 1
-                    remaining += 1
-                if m == 0:
-                    continue
-                half = m // 2
-
-            s = np.full(m, self.spot, dtype=float)
-
-            bt = self.option.barrier_type.lower()
-            is_ko = bt in ("down-and-out", "up-and-out")
-            is_ki = bt in ("down-and-in", "up-and-in")
-
-            knocked = np.zeros(m, dtype=bool)
-            hit = np.zeros(m, dtype=bool)
-            pv_if_hit = np.zeros(m, dtype=float)  # used when rebate_at_hit
-
-            alive = np.ones(m, dtype=bool)
-
-            for i in range(len(grid) - 1):
-                if not np.any(alive):
-                    break
-
-                # Generate shocks
-                if use_antithetic:
-                    z_half = self._rng.standard_normal(half)
-                    z = np.concatenate([z_half, -z_half])
-                else:
-                    z = self._rng.standard_normal(m)
-
-                # Update only alive paths
-                inc = drift[i] + diff_scale[i] * z
-                s[alive] *= np.exp(inc[alive])
-
-                t_next = grid[i + 1]
-                is_div = t_next in divs
-                is_mon = t_next in monitors
-
-                # If dividend and monitor coincide, you may want the barrier to
-                # be checked on the pre-div or post-div level. Default is
-                # post-div (dividend_before_monitor=True).
-
-                if is_mon and (not self.dividend_before_monitor):
-                    hit_now = self._is_barrier_hit(s)
-                    if is_ko:
-                        newly_ko = alive & (~knocked) & hit_now
-                        if np.any(newly_ko):
-                            knocked[newly_ko] = True
-                            if self.option.rebate_at_hit:
-                                pv = self.option.rebate * self.discount_curve.df(t_next)
-                                pv_if_hit[newly_ko] = pv
-                            alive[newly_ko] = False
-                    elif is_ki:
-                        hit |= (alive & hit_now)
-
-                if is_div:
-                    div_amt = self._div_by_time.get(t_next, 0.0)
-                    if div_amt != 0.0:
-                        s[alive] = np.maximum(s[alive] - div_amt, 1e-12)
-
-                if is_mon and self.dividend_before_monitor:
-                    hit_now = self._is_barrier_hit(s)
-                    if is_ko:
-                        newly_ko = alive & (~knocked) & hit_now
-                        if np.any(newly_ko):
-                            knocked[newly_ko] = True
-                            if self.option.rebate_at_hit:
-                                pv = self.option.rebate * self.discount_curve.df(t_next)
-                                pv_if_hit[newly_ko] = pv
-                            alive[newly_ko] = False
-                    elif is_ki:
-                        hit |= (alive & hit_now)
-
-                # vanilla: nothing
-
-            # Terminal payoff on paths that survived to expiry
-            if bt == "none":
-                payoff = df_T * self._vanilla_payoff(s)
-            elif is_ko:
-                if self.option.rebate_at_hit:
-                    payoff = pv_if_hit
-                    # for paths never knocked out
-                    alive_to_T = ~knocked
-                    payoff[alive_to_T] = df_T * self._vanilla_payoff(s[alive_to_T])
-                else:
-                    payoff = np.zeros(m, dtype=float)
-                    alive_to_T = ~knocked
-                    payoff[alive_to_T] = df_T * self._vanilla_payoff(s[alive_to_T])
-                    payoff[~alive_to_T] = self.option.rebate * df_T
-            elif is_ki:
-                payoff = np.zeros(m, dtype=float)
-                payoff[hit] = df_T * self._vanilla_payoff(s[hit])
-                # If you want a "no-hit" rebate, add it here.
-            else:
-                raise ValueError(f"Unsupported barrier_type: {self.option.barrier_type}")
-
-            # Online aggregation for mean/variance
-            total_sum += float(np.sum(payoff))
-            total_sumsq += float(np.sum(payoff * payoff))
-            total_n += int(payoff.size)
-
-        if total_n <= 0:
-            raise RuntimeError("No paths were simulated (check n_paths/batch_size)")
-
-        est = total_sum / float(total_n)
-
-        if not return_std_error:
-            return {"price": est}
-
-        # Unbiased sample variance and standard error
-        if total_n <= 1:
-            se = 0.0
+        # State
+        if bt in ("down-and-out", "up-and-out"):
+            alive = np.ones(n_sim, dtype=bool)
+            hit_step = np.full(n_sim, -1, dtype=int)  # step index (1..n_steps)
+        elif bt in ("down-and-in", "up-and-in"):
+            hit = np.zeros(n_sim, dtype=bool)
         else:
-            var = (total_sumsq - (total_sum * total_sum) / float(total_n)) / float(total_n - 1)
-            var = max(var, 0.0)
-            se = math.sqrt(var / float(total_n))
+            alive = None
+            hit = None
 
-        ci_lo = est - 1.96 * se
-        ci_hi = est + 1.96 * se
-        return {"price": est, "std_error": se, "ci95_low": ci_lo, "ci95_high": ci_hi}
+        for i in range(n_steps):
+            # Evolve GBM to grid[i+1]
+            s *= np.exp(drift[i] + diff[i] * Z[:, i])
+
+            d1 = grid[i + 1]
+
+            # Dividend/monitor ordering at same date matters.
+            if cfg.dividend_before_monitor:
+                if d1 in div_map:
+                    s = np.maximum(s - div_map[d1], cfg.spot_floor)
+
+            if d1 in monitor_set and bt != "none":
+                breached = barrier_breached(s)
+
+                if bt in ("down-and-out", "up-and-out"):
+                    if rebate.rebate_at_hit and rebate.amount != 0.0:
+                        newly = alive & breached
+                        # record first hit time as step index (1-based)
+                        hit_step[newly] = i + 1
+                    alive &= ~breached
+                else:
+                    hit |= breached
+
+            if not cfg.dividend_before_monitor:
+                if d1 in div_map:
+                    s = np.maximum(s - div_map[d1], cfg.spot_floor)
+
+        sT = s
+        vanilla = _vanilla_payoff(sT, strike, option_type)
+
+        if bt == "none":
+            return df_T * vanilla
+
+        if bt in ("down-and-out", "up-and-out"):
+            payoff = np.zeros_like(vanilla)
+
+            # survivors get vanilla at maturity
+            payoff[alive] = df_T * vanilla[alive]
+
+            if rebate.amount != 0.0:
+                knocked = ~alive
+                if rebate.rebate_at_hit:
+                    # PV rebate at first hit date (requires recorded hit_step).
+                    # If a path was knocked out but hit_step not recorded (e.g. rebate_at_hit False),
+                    # it won't happen here; but for safety:
+                    idx = np.where(hit_step >= 1)[0]
+                    for j in idx:
+                        hit_date = grid[hit_step[j]]
+                        payoff[j] = rebate.amount * discount_curve.get_discount_factor(hit_date)
+                else:
+                    payoff[knocked] = rebate.amount * df_T
+
+            return payoff
+
+        # knock-in
+        return df_T * vanilla * hit
+
+    # Streaming estimation (avoid holding all payoffs)
+    sum_p = 0.0
+    sum_p2 = 0.0
+    obs_done = 0
+
+    while obs_done < n_obs:
+        m = min(chunk, n_obs - obs_done)
+        Z = rng.standard_normal(size=(m, n_steps))
+
+        if use_anti:
+            p = 0.5 * (simulate_payoffs(Z) + simulate_payoffs(-Z))
+        else:
+            p = simulate_payoffs(Z)
+
+        sum_p += float(np.sum(p))
+        sum_p2 += float(np.sum(p * p))
+        obs_done += m
+
+    n = float(n_obs)
+    price = sum_p / n
+    var = max(0.0, (sum_p2 / n) - price * price)
+    stderr = math.sqrt(var / n)
+
+    return {
+        "price": float(price),
+        "stderr": float(stderr),
+        "ci_95": (float(price - 1.96 * stderr), float(price + 1.96 * stderr)),
+        "n_observations": int(n_obs),
+        "antithetic": bool(use_anti),
+        "grid_points": int(len(grid)),
+        "steps": int(n_steps),
+        "barrier_type": bt,
+        "barrier_level": barrier.level,
+        "barrier_band": float(band),
+        "dividend_before_monitor": bool(cfg.dividend_before_monitor),
+    }
 
 
-# ---------------------------------------------------------------------------
-# Example
-# ---------------------------------------------------------------------------
-
-
+# -------------------------
+# Example main script usage
+# -------------------------
 if __name__ == "__main__":
-    # Example: Down-and-out call with monthly monitoring, 1bp tolerance band.
-    spot = 100.0
-    vol = 0.25
+    # ---- Load curves (daily NACA) ----
+    # Example path; replace with yours
+    discount_curve_df = pd.read_csv(r"C:\Finite Difference (Equity Americans)\Finite_Difference-main\ZAR-SWAP-28072025.csv")
+    discount_curve_df["Date"] = pd.to_datetime(discount_curve_df["Date"], format="%Y/%m/%d").dt.strftime("%Y-%m-%d")
 
-    r = FlatRateCurve(0.08)
-    b = FlatRateCurve(0.08 - 0.02)  # e.g. r - q
+    # Optional separate forward curve; otherwise discount_curve used
+    forward_curve_df = discount_curve_df.copy()
 
-    T = 1.0
-    monitors = [i / 12.0 for i in range(1, 13)]
+    # ---- Dates ----
+    valuation = dt.date(2025, 7, 28)
+    maturity = dt.date(2026, 7, 28)
 
-    opt = DiscreteBarrierOptionSpec(
-        strike=100.0,
-        expiry=T,
-        option_type="call",
+    # ---- Wrap curves ----
+    discount_curve = NacaCurve(discount_curve_df, valuation_date=valuation, day_count="ACT/365F")
+    forward_curve = NacaCurve(forward_curve_df, valuation_date=valuation, day_count="ACT/365F")
+
+    # ---- Dividends (pay_date, amount) ----
+    divs = [
+        (dt.date(2025, 9, 12), 7.63),
+        (dt.date(2026, 4, 10), 8.0115),
+    ]
+
+    # ---- Monitoring dates (weekly example) ----
+    monitor_dates = [valuation + dt.timedelta(days=7 * i) for i in range(1, 27)]
+
+    # ---- Barrier spec (example) ----
+    barrier = BarrierSpec(
         barrier_type="down-and-out",
-        barrier_level=80.0,
-        monitoring_times=monitors,
-        rebate=0.0,
-        rebate_at_hit=False,
-        barrier_tol_bp=1.0,
+        level=95.0,
+        tol_bps=1.0,   # 1bp band around barrier
+        abs_tol=0.0,
     )
 
-    divs = [CashDividend(time=0.5, amount=1.0)]
+    rebate = RebateSpec(amount=0.0, rebate_at_hit=False)
 
-    pricer = DiscreteBarrierMonteCarloPricer(
-        spot=spot,
-        vol=vol,
-        discount_curve=r,
-        carry_curve=b,
-        option=opt,
+    cfg = MCConfig(
+        n_paths=200_000,
+        seed=42,
+        antithetic=True,
+        chunk_size=50_000,
+        dividend_before_monitor=True,  # flip if RiskFlow checks barrier before dividend on same date
+    )
+
+    out = price_discrete_barrier_mc(
+        spot=100.0,
+        strike=100.0,
+        vol=0.25,
+        option_type="call",
+        valuation=valuation,
+        maturity=maturity,
+        discount_curve=discount_curve,
+        forward_curve=forward_curve,
         dividends=divs,
-        seed=123,
+        monitor_dates=monitor_dates,
+        barrier=barrier,
+        rebate=rebate,
+        cfg=cfg,
+        include_maturity_monitor=True,  # set False if maturity is NOT a monitoring observation in your definition
     )
 
-    res = pricer.price(n_paths=200_000, batch_size=50_000, antithetic=True)
-    print(res)
+    print(out)
