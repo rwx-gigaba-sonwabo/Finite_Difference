@@ -1,103 +1,106 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
+from typing import Optional
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 from xva_engine.config import CounterpartyConfig
+from xva_engine.utils.dates import add_days
 
 
 @dataclass(frozen=True)
 class ExposureProfile:
-    """
-    Exposure profile on a grid of times:
-    - ee: Expected positive exposure at each time (discounted-to-0 or not, depending on convention)
-    - pfe: q-quantile exposure at each time
-    """
     times_days: np.ndarray
+    times_dates: Optional[list[date]]
     ee: np.ndarray
     pfe: np.ndarray
+    ee_star: Optional[np.ndarray] = None
+    pfe_star: Optional[np.ndarray] = None
 
 
 class XvaCalculator:
-    """
-    Minimal CVA/PFE engine for a single counterparty.
-
-    - exposure(t) per scenario = max(MTM(t), 0)
-    - EE(t) = average across scenarios
-    - PFE_q(t) = quantile across scenarios
-    - CVA = LGD * sum( 0.5*(EE*(t_i)+EE*(t_{i-1})) * (S(t_{i-1})-S(t_i)) )
-      where EE* is discounted-to-0 exposure if you choose that convention.
-
-    This matches the discrete estimator described in the RiskFlow Credit_Monte_Carlo docs.
-    """
     def __init__(
         self,
+        *,
         counterparty: CounterpartyConfig,
-        days_in_year: float,
-        pfe_quantile: float = 0.95,
-        discount_to_zero: bool = True,
-        flat_discount_rate: float = 0.0,
+        days_in_year: float = 365.0,
+        discount_rate: float = 0.0,
     ) -> None:
         self.cp = counterparty
         self.days_in_year = float(days_in_year)
-        self.q = float(pfe_quantile)
-        self.discount_to_zero = bool(discount_to_zero)
-        self.flat_discount_rate = float(flat_discount_rate)
+        self.discount_rate = float(discount_rate)
 
     def _survival(self, t_years: np.ndarray) -> np.ndarray:
-        h = self.cp.hazard_rate
-        return np.exp(-h * t_years)
+        return np.exp(-float(self.cp.hazard_rate) * t_years)
 
-    def _df0(self, t_years: np.ndarray) -> np.ndarray:
-        r = self.flat_discount_rate
-        return np.exp(-r * t_years)
+    def _df0t(self, t_years: np.ndarray) -> np.ndarray:
+        return np.exp(-float(self.discount_rate) * t_years)
 
     def build_exposure_profile(
         self,
+        *,
+        base_date: date,
         times_days: np.ndarray,
-        mtm_paths: torch.Tensor,
+        mtm_paths: torch.Tensor,   # (n_times, n_sims)
+        pfe_q: float = 0.95,
+        discount_to_zero: bool = True,
     ) -> ExposureProfile:
-        """
-        Parameters
-        ----------
-        times_days : np.ndarray
-            scenario grid in days, shape (n_steps,)
-        mtm_paths : torch.Tensor
-            MTM(t) per time and scenario, shape (n_steps, n_sims)
+        times_days = np.asarray(times_days, dtype=float)
+        if mtm_paths.ndim != 2 or mtm_paths.shape[0] != times_days.size:
+            raise ValueError("mtm_paths must be (n_times, n_sims) and match times_days length.")
 
-        Returns
-        -------
-        ExposureProfile
-        """
-        times_years = times_days / self.days_in_year
-        mtm = mtm_paths.detach().cpu().numpy()  # (n_steps, n_sims)
+        e = torch.clamp(mtm_paths, min=0.0)
+        ee = e.mean(dim=1).cpu().numpy()
+        pfe = torch.quantile(e, q=float(pfe_q), dim=1).cpu().numpy()
 
-        exposure = np.maximum(mtm, 0.0)  # positive exposure only
+        ee_star = None
+        pfe_star = None
+        if discount_to_zero:
+            t_years = times_days / self.days_in_year
+            df = self._df0t(t_years)
+            ee_star = ee * df
+            pfe_star = pfe * df
 
-        if self.discount_to_zero:
-            df0 = self._df0(times_years).reshape(-1, 1)
-            exposure = exposure * df0  # discounted exposure (E*)
+        times_dates = [add_days(base_date, d) for d in times_days]
+        return ExposureProfile(times_days, times_dates, ee, pfe, ee_star, pfe_star)
 
-        ee = exposure.mean(axis=1)
-        pfe = np.quantile(exposure, self.q, axis=1)
+    def cva_from_ee(self, *, times_days: np.ndarray, ee_star: np.ndarray) -> float:
+        times_days = np.asarray(times_days, dtype=float)
+        ee_star = np.asarray(ee_star, dtype=float)
+        if times_days.size != ee_star.size:
+            raise ValueError("times_days and ee_star must have same length.")
 
-        return ExposureProfile(times_days=times_days, ee=ee, pfe=pfe)
-
-    def cva_from_ee(self, times_days: np.ndarray, ee_star: np.ndarray) -> float:
-        """
-        Discrete CVA integral with deterministic hazard:
-            CVA = LGD * sum_i 0.5*(EE_{i-1}+EE_i) * (S_{i-1}-S_i)
-        """
-        times_years = times_days / self.days_in_year
-        S = self._survival(times_years)
-        lgd = 1.0 - self.cp.recovery
+        t_years = times_days / self.days_in_year
+        S = self._survival(t_years)
+        lgd = 1.0 - float(self.cp.recovery)
 
         cva = 0.0
-        for i in range(1, len(times_days)):
+        for i in range(1, times_days.size):
             avg_ee = 0.5 * (ee_star[i - 1] + ee_star[i])
             dp = S[i - 1] - S[i]
             cva += lgd * avg_ee * dp
-
         return float(cva)
+
+    @staticmethod
+    def plot_exposure(profile: ExposureProfile, *, title: str = "Exposure profile", discounted: bool = False) -> None:
+        x = profile.times_dates if profile.times_dates is not None else profile.times_days
+
+        if discounted:
+            if profile.ee_star is None or profile.pfe_star is None:
+                raise ValueError("Discounted series not available.")
+            ee, pfe = profile.ee_star, profile.pfe_star
+            suffix = " (discounted)"
+        else:
+            ee, pfe = profile.ee, profile.pfe
+            suffix = ""
+
+        plt.figure()
+        plt.plot(x, ee, label="EE" + suffix)
+        plt.plot(x, pfe, label="PFE" + suffix)
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()

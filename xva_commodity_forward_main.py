@@ -87,6 +87,17 @@ def main() -> None:
     # For CVA pricing, you will typically want risk_neutral=True (mu=0).
     # For historical PFE-style risk metrics, risk_neutral=False uses your fitted mu.
     result = engine.run_forward_cva(trade=trade, risk_neutral=True)
+    
+    # plot fixing schedule (shows fixing points + start/end + value date)
+    trade.reference_price.plot_schedule(value_date=trade.value_date)
+
+    # plot exposure profile (undiscounted)
+    from xva_engine.xva.cva import XvaCalculator
+    XvaCalculator.plot_exposure(result.exposure_profile, title="EE/PFE (raw)", discounted=False)
+
+    # plot exposure profile (discounted-to-0, used for CVA integral)
+    XvaCalculator.plot_exposure(result.exposure_profile, title="EE*/PFE* (discounted)", discounted=True)
+
 
     print(f"CVA (discounted EE*, flat hazard): {result.cva:,.2f}")
     print("EE* first 5 points:", result.exposure_profile.ee[:5])

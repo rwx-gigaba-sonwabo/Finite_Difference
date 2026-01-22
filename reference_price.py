@@ -1,147 +1,121 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional
+from datetime import date
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 
 from xva_engine.config import SamplingConvention
+from xva_engine.utils.dates import to_date, day_offset, ensure_dates
 
 
 @dataclass(frozen=True)
 class FixingSchedule:
-    """
-    Defines a fixing (sampling) period [start_day, end_day] in days from base date,
-    plus a sampling convention.
-
-    Example:
-        monthly averaging over a month -> DAILY samples inside [start, end]
-        futures-settlement style -> BULLET sample at end_day only
-    """
-    start_day: int
-    end_day: int
+    start_date: date
+    end_date: date
     convention: SamplingConvention = SamplingConvention.DAILY
-    offset_days: int = 0  # optional sample-date shift
+    offset_days: int = 0
 
-    def sample_days(self) -> np.ndarray:
-        start = int(self.start_day) + int(self.offset_days)
-        end = int(self.end_day) + int(self.offset_days)
+    def sample_dates(self) -> list[date]:
+        start = self.start_date
+        end = self.end_date
         if end < start:
-            raise ValueError("FixingSchedule end_day must be >= start_day (after offset).")
+            raise ValueError("FixingSchedule end_date must be >= start_date.")
 
         if self.convention == SamplingConvention.BULLET:
-            return np.array([end], dtype=float)
+            return [end]
 
         if self.convention == SamplingConvention.DAILY:
-            return np.arange(start, end + 1, 1, dtype=float)
+            step = 1
+        elif self.convention == SamplingConvention.WEEKLY:
+            step = 7
+        elif self.convention == SamplingConvention.MONTHLY:
+            step = 30  # lightweight approximation
+        else:
+            raise ValueError(f"Unsupported convention: {self.convention}")
 
-        if self.convention == SamplingConvention.WEEKLY:
-            return np.arange(start, end + 1, 7, dtype=float)
+        out = []
+        d = start
+        while d <= end:
+            out.append(d)
+            d = d.fromordinal(d.toordinal() + step)
+        return out
 
-        if self.convention == SamplingConvention.MONTHLY:
-            # Approximate monthly as 30-day step for a lightweight mimic.
-            return np.arange(start, end + 1, 30, dtype=float)
-
-        raise ValueError(f"Unsupported convention: {self.convention}")
+    def sample_days(self, base_date: date) -> np.ndarray:
+        return np.asarray(
+            [day_offset(base_date, d) + int(self.offset_days) for d in self.sample_dates()],
+            dtype=float,
+        )
 
 
 class ReferencePrice:
-    """
-    Reference price = deterministic functional of the simulated forward curve.
-
-    RiskFlow notion:
-    - you do NOT simulate reference prices directly.
-    - you simulate ForwardPrice curves, then compute reference prices by sampling
-      the curve at specific "reference/delivery dates" per sample date.
-
-    This simplified implementation:
-    - maps each sample day t_i to a delivery tenor day T'(t_i) using:
-        T'(t_i) = min{delivery_day >= t_i}
-      (flat-left / closest delivery proxy in spirit)
-    - computes arithmetic average over samples, mixing realised fixings if provided.
-    """
     def __init__(
         self,
+        *,
         fixing_schedule: FixingSchedule,
-        delivery_days: np.ndarray,
-        realised_fixings: Optional[Dict[int, float]] = None,
+        delivery_dates: Sequence[date],
+        realised_fixings: Optional[Dict[date, float]] = None,
     ) -> None:
         self.fixing_schedule = fixing_schedule
-        self.delivery_days = np.asarray(delivery_days, dtype=float)
-        if self.delivery_days.ndim != 1:
-            raise ValueError("delivery_days must be 1D.")
-        self.realised_fixings = realised_fixings or {}
+        self.delivery_dates = ensure_dates(delivery_dates)
+        if not self.delivery_dates:
+            raise ValueError("delivery_dates must be non-empty.")
+        self.realised_fixings = {to_date(k): float(v) for k, v in (realised_fixings or {}).items()}
 
-    def _map_sample_to_delivery(self, sample_day: float) -> float:
-        idx = np.searchsorted(self.delivery_days, sample_day, side="left")
-        if idx >= self.delivery_days.size:
-            # If sample beyond last delivery node, clamp to last node (flat extrapolation style).
-            return float(self.delivery_days[-1])
-        return float(self.delivery_days[idx])
+    def _map_sample_to_delivery(self, sample_date: date) -> date:
+        for d in self.delivery_dates:
+            if d >= sample_date:
+                return d
+        return self.delivery_dates[-1]
 
     def compute(
         self,
-        scen_index: int,
-        scen_day: float,
-        scen_curve: torch.Tensor,
-        tenor_days: np.ndarray,
+        *,
+        base_date: date,
+        scen_date: date,
+        scen_curve: torch.Tensor,     # (n_tenors, n_sims)
+        tenor_dates: Sequence[date],  # curve node dates T_j
     ) -> torch.Tensor:
-        """
-        Compute the reference price at scenario time t = scen_day for all simulations.
+        scen_date = to_date(scen_date)
+        tenor_dates = ensure_dates(tenor_dates)
 
-        Parameters
-        ----------
-        scen_index : int
-            index into scenario grid (0..n_steps-1)
-        scen_day : float
-            scenario day in days-from-base
-        scen_curve : torch.Tensor
-            simulated forward curve at this scenario index:
-            shape (n_tenors, n_sims)  (this is F(t, T_j) across nodes)
-        tenor_days : np.ndarray
-            curve node tenors (days-from-base), aligned to scen_curve
+        if scen_curve.ndim != 2:
+            raise ValueError("scen_curve must have shape (n_tenors, n_sims).")
+        if len(tenor_dates) != scen_curve.shape[0]:
+            raise ValueError("tenor_dates length must match scen_curve first dimension.")
 
-        Returns
-        -------
-        torch.Tensor
-            reference price per simulation: shape (n_sims,)
-        """
-        sample_days = self.fixing_schedule.sample_days()
-        # Split samples into "already realised" and "future" relative to scen_day
-        realised = [d for d in sample_days if d <= scen_day and int(d) in self.realised_fixings]
-        future = [d for d in sample_days if d > scen_day or int(d) not in self.realised_fixings]
+        sample_dates = self.fixing_schedule.sample_dates()
 
-        values = []
+        realised = [d for d in sample_dates if (d <= scen_date) and (d in self.realised_fixings)]
+        future = [d for d in sample_dates if (d > scen_date) or (d not in self.realised_fixings)]
 
-        # Add realised fixings as constants (broadcast)
+        values: list[torch.Tensor] = []
+
         if realised:
-            # Use the provided realised fixing values (already "fact")
             realised_vals = torch.as_tensor(
-                [self.realised_fixings[int(d)] for d in realised],
+                [self.realised_fixings[d] for d in realised],
                 dtype=scen_curve.dtype,
                 device=scen_curve.device,
             )
-            # mean over realised samples (same for every scenario path)
             values.append(realised_vals.mean().expand(scen_curve.shape[1]))
 
-        # Add future samples by sampling the simulated curve
         if future:
             mapped_delivery = [self._map_sample_to_delivery(d) for d in future]
-            # For each mapped delivery day, find nearest curve node index
-            # (in a full implementation, you might interpolate; we snap to nearest node for simplicity)
-            tenor_days_arr = np.asarray(tenor_days, dtype=float)
-            idxs = [int(np.argmin(np.abs(tenor_days_arr - md))) for md in mapped_delivery]
+            tenor_days_arr = np.asarray([day_offset(base_date, d) for d in tenor_dates], dtype=float)
+            mapped_days = np.asarray([day_offset(base_date, d) for d in mapped_delivery], dtype=float)
+
+            # snap (replace with interpolation in production)
+            idxs = [int(np.argmin(np.abs(tenor_days_arr - md))) for md in mapped_days]
             sampled = scen_curve[idxs, :]  # (n_future, n_sims)
             values.append(sampled.mean(dim=0))
 
         if not values:
-            # No samples? return zeros
             return torch.zeros(scen_curve.shape[1], dtype=scen_curve.dtype, device=scen_curve.device)
 
-        # If both realised and future exist, average them with correct weights
-        # (RiskFlow uses prorating by number of samples; we do the same)
-        n_total = len(sample_days)
+        n_total = len(sample_dates)
         out = torch.zeros(scen_curve.shape[1], dtype=scen_curve.dtype, device=scen_curve.device)
 
         if realised:
@@ -149,6 +123,21 @@ class ReferencePrice:
             if future:
                 out += values[1] * (len(future) / n_total)
         else:
-            out += values[0]  # only future samples
+            out += values[0]
 
         return out
+
+    def plot_schedule(self, *, value_date: Optional[date] = None, title: str = "Fixing schedule") -> None:
+        fix_dates = self.fixing_schedule.sample_dates()
+        y = np.zeros(len(fix_dates))
+
+        plt.figure()
+        plt.plot(fix_dates, y, marker="o", linestyle="None")
+        plt.axvline(self.fixing_schedule.start_date, linestyle="--", label="fix start")
+        plt.axvline(self.fixing_schedule.end_date, linestyle="--", label="fix end")
+        if value_date is not None:
+            plt.axvline(value_date, linestyle=":", label="value date")
+        plt.yticks([])
+        plt.title(title)
+        plt.legend()
+        plt.tight_layout()
