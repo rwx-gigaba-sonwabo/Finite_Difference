@@ -1,17 +1,13 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-
 import torch
 
 
 def norm_icdf(u: torch.Tensor) -> torch.Tensor:
     """
-    RiskFlow equivalent:
-        return sqrt(2) * erfinv(2u - 1)
-
-    This matches RiskFlow's utils.norm_icdf.
+    RiskFlow-style inverse normal:
+        sqrt(2) * erfinv(2u - 1)
     """
     return 1.4142135623730951 * torch.erfinv(2.0 * u - 1.0)
 
@@ -20,7 +16,7 @@ def norm_icdf(u: torch.Tensor) -> torch.Tensor:
 class SobolNormalRng:
     """
     Scrambled Sobol -> U(0,1) -> Normal(0,1) via inverse CDF.
-    Mirrors RiskFlow's pattern (SobolEngine + (0.5 + (1-eps)*(x-0.5)) + norm_icdf).
+    Mirrors RiskFlow's epsilon-shift away from {0,1}.
     """
     seed: int
     fast_forward: int = 0
@@ -40,7 +36,7 @@ class SobolNormalRng:
             engine.fast_forward(self.fast_forward)
 
         sobol = engine.draw(n, dtype=self.dtype).to(self.device)
-        # Avoid exact 0/1 boundaries (RiskFlow does a symmetric epsilon-shift around 0.5)
+
         eps = torch.finfo(sobol.dtype).eps
         u = (0.5 + (1.0 - eps) * (sobol - 0.5)).to(self.device)
 

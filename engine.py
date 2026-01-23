@@ -1,14 +1,18 @@
-# xva_engine/engine.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-
 import numpy as np
 import torch
 
 from xva_engine.config import SimulationConfig, CounterpartyConfig, DiscountingConfig
 from xva_engine.rng import SobolNormalRng
-from xva_engine.timegrid import TimeGrid
+
+# robust import in case you had timegrid.py historically
+try:
+    from xva_engine.time_grid import TimeGrid
+except Exception:  # pragma: no cover
+    from xva_engine.timegrid import TimeGrid  # type: ignore
+
 from xva_engine.models.clewlow_strickland import CSForwardCurveSimulator, CSParams
 from xva_engine.products.commodity_forward import CommodityForward
 from xva_engine.xva.cva import XvaCalculator, ExposureProfile
@@ -24,12 +28,13 @@ class RunResult:
 
 class CommodityXvaEngine:
     """
-    A minimal RiskFlow-like XVA engine slice for commodities:
+    Minimal RiskFlow-like engine:
     - simulate CS forward curve (one factor)
     - compute reference prices
     - value forward contract on each profile date
     - compute EE/PFE and CVA
     """
+
     def __init__(
         self,
         sim_cfg: SimulationConfig,
@@ -51,7 +56,7 @@ class CommodityXvaEngine:
         self.device = torch.device(device)
         self.dtype = dtype
 
-        self.time_grid = TimeGrid.regular(sim_cfg.dt_days, sim_cfg.horizon_days)
+        self.time_grid = TimeGrid.regular(dt_days=sim_cfg.dt_days, horizon_days=sim_cfg.horizon_days)
 
         self.rng = SobolNormalRng(
             seed=sim_cfg.seed,
@@ -59,6 +64,7 @@ class CommodityXvaEngine:
             device=self.device,
             dtype=self.dtype,
         )
+
         self.simulator = CSForwardCurveSimulator(
             params=cs_params,
             days_in_year=sim_cfg.days_in_year,
@@ -66,7 +72,7 @@ class CommodityXvaEngine:
             dtype=self.dtype,
         )
 
-        # In RiskFlow, exposure is often handled in deflated terms; we provide the same option.
+        # Default: discount-to-0 exposure for CVA integration
         self.xva = XvaCalculator(
             counterparty=counterparty,
             days_in_year=sim_cfg.days_in_year,
@@ -75,30 +81,24 @@ class CommodityXvaEngine:
             flat_discount_rate=discounting.rate,
         )
 
-    def run_forward_cva(
-        self,
-        trade: CommodityForward,
-        risk_neutral: bool = False,
-    ) -> RunResult:
+    def run_forward_cva(self, trade: CommodityForward, risk_neutral: bool = True) -> RunResult:
         times_days = self.time_grid.scen_days
-        n_steps = times_days.size
-        n_sims = self.sim_cfg.num_sims
+        n_steps = int(times_days.size)
+        n_sims = int(self.sim_cfg.num_sims)
 
-        # RiskFlow: one factor for CSForwardPriceModel
+        # One factor: z shape (n_steps, n_sims)
         z = self.rng.draw_normals(dimension=1, n=n_steps * n_sims).view(1, n_steps, n_sims)[0]
-        # z shape: (n_steps, n_sims)
 
         curves = self.simulator.simulate(
             initial_curve=self.initial_curve,
             tenor_days=self.tenor_days,
             scen_days=times_days,
             z=z,
-            risk_neutral=risk_neutral,
-        )
-        # curves shape: (n_steps, n_tenors, n_sims)
+            risk_neutral=bool(risk_neutral),
+        )  # (n_steps, n_tenors, n_sims)
 
-        # Revalue the trade at each time step
-        mtm_paths = torch.zeros((n_steps, n_sims), dtype=self.dtype, device=self.device)
+        mtm_paths = torch.empty((n_steps, n_sims), dtype=self.dtype, device=self.device)
+
         for i, t_day in enumerate(times_days):
             scen_curve = curves[i, :, :]  # (n_tenors, n_sims)
             mtm_paths[i, :] = trade.mtm(
@@ -116,5 +116,5 @@ class CommodityXvaEngine:
             times_days=times_days,
             mtm_paths=mtm_paths,
             exposure_profile=profile,
-            cva=cva,
+            cva=float(cva),
         )
