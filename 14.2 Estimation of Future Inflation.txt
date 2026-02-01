@@ -1,0 +1,506 @@
+14.2 Estimation of Future Inflation Index Values
+
+Inflation-linked instruments reference an inflation index level (for example, CPI). Unlike interest rates or FX spot, an inflation index is not observed continuously—it is published at discrete intervals (typically monthly). As a result, valuing cashflows that depend on future index levels requires two steps:
+
+Identify the latest index fixing that is already known at the valuation date, and
+
+Project index levels beyond that fixing using the market-implied inflation curve.
+
+This section explains the date conventions involved and the projection formula used in the model.
+
+14.2.1 Why there are multiple “dates” for one CPI fixing
+
+For each published CPI index value, there are three distinct dates that matter:
+
+Publication (release) date, 
+𝑇
+pub
+T
+pub
+	​
+
+: the calendar date when the statistical agency publishes the number.
+
+Index (reference) date, 
+𝑇
+T: the date the fixing is treated as applying to in the index time series (for monthly CPI this is typically the first calendar day of the month).
+
+Valuation date, 
+𝑡
+0
+t
+0
+	​
+
+: the “as-of” date for pricing and risk.
+
+A key practical point: the publication date is not used directly in valuation formulas. Its role is governance/operational—at valuation date 
+𝑡
+0
+t
+0
+	​
+
+, it determines whether a given monthly fixing is known (already published) or must be forecast.
+
+To ensure consistency with standard inflation market conventions and interpolation rules, monthly index fixings are recorded in the index schedule at the index date (usually the first day of the month). This matches the assumption behind common interpolation approaches: monthly CPI values are taken to be applicable to that month’s anchor date, with interpolation applied between anchors when an index level is needed on an “in-between” day.
+
+14.2.2 Latest published index fixing
+
+Because CPI is published with a lag, the latest available index level at valuation is usually a historical value.
+
+Let:
+
+𝑇
+latest
+T
+latest
+	​
+
+ be the index date of the latest published fixing available at 
+𝑡
+0
+t
+0
+	​
+
+ (typically the first day of the most recently published CPI month), and
+
+𝐼
+(
+𝑇
+latest
+)
+I(T
+latest
+	​
+
+) be the corresponding index level.
+
+Future index levels are then obtained by “rolling forward” this last known index level using the inflation curve.
+
+14.2.3 Forecast dates used for projection
+
+For monthly CPI, it is convenient to work with month-start anchor dates. For a future index date 
+𝑇
+𝑖
+T
+i
+	​
+
+ (also assumed to be the first calendar day of a month), define:
+
+𝑡
+1
+forecast
+t
+1
+forecast
+	​
+
+: the first day of the month following the valuation date 
+𝑡
+0
+t
+0
+	​
+
+.
+
+𝑇
+𝑖
+forecast
+T
+i
+forecast
+	​
+
+: the first day of the month following the future index date 
+𝑇
+𝑖
+T
+i
+	​
+
+.
+
+These “forecast boundary” dates are used so that the projection aligns with the discrete monthly structure of the published index.
+
+14.2.4 Forecasting future index levels from the inflation curve
+
+For a future index date 
+𝑇
+𝑖
+>
+𝑡
+0
+T
+i
+	​
+
+>t
+0
+	​
+
+, the expected future index level is obtained by capitalising the latest known index level using the market-implied inflation term structure.
+
+𝐸
+ ⁣
+[
+𝐼
+(
+𝑇
+𝑖
+)
+∣
+𝐼
+(
+𝑇
+latest
+)
+]
+=
+𝐼
+(
+𝑇
+latest
+)
+𝐷
+infl
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+E[I(T
+i
+	​
+
+)∣I(T
+latest
+	​
+
+)]=
+D
+infl
+	​
+
+(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+)
+I(T
+latest
+	​
+
+)
+	​
+
+
+Where:
+
+𝐷
+infl
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+D
+infl
+	​
+
+(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+) is the inflation discount factor over the period 
+(
+𝑡
+1
+forecast
+,
+𝑇
+𝑖
+forecast
+)
+(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+), implied by the inflation curve. Intuitively, it plays the same role as a discount factor in rates—except here it is tied to inflation growth rather than interest-rate discounting.
+
+Equivalently, defining the market-implied (zero) inflation rate over the same horizon as 
+𝑟
+infl
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+r
+infl
+	​
+
+(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+), with year fraction 
+Δ
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+Δ(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+), we can write:
+
+𝐷
+infl
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+=
+𝑒
+−
+ 
+𝑟
+infl
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+ 
+Δ
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+D
+infl
+	​
+
+(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+)=e
+−r
+infl
+	​
+
+(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+)Δ(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+)
+
+and therefore:
+
+𝐸
+ ⁣
+[
+𝐼
+(
+𝑇
+𝑖
+)
+∣
+𝐼
+(
+𝑇
+latest
+)
+]
+=
+𝐼
+(
+𝑇
+latest
+)
+ 
+𝑒
+ 
+𝑟
+infl
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+ 
+Δ
+ ⁣
+(
+𝑡
+1
+forecast
+,
+ 
+𝑇
+𝑖
+forecast
+)
+E[I(T
+i
+	​
+
+)∣I(T
+latest
+	​
+
+)]=I(T
+latest
+	​
+
+)e
+r
+infl
+	​
+
+(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+)Δ(t
+1
+forecast
+	​
+
+,T
+i
+forecast
+	​
+
+)
+
+Interpretation (plain English):
+
+The inflation curve implies an average inflation rate over the horizon.
+
+That implied inflation rate is applied over the appropriate year fraction to obtain the expected cumulative inflation growth factor.
+
+Multiplying the last known index level by this growth factor produces the forecast index level.
+
+14.2.5 Using forecasted monthly anchors in valuation
+
+Once the set of monthly anchor index levels has been constructed (historical fixings plus forecasted future anchors), the model can compute the applicable inflation index level required by the instrument payoff—typically via the interpolation / lag conventions described earlier (e.g., in Section 14.1). In other words:
+
+Section 14.2 produces a consistent monthly index path (anchors).
+
+The valuation then uses the instrument’s conventions to map cashflow dates to the appropriate index levels derived from those anchors.
