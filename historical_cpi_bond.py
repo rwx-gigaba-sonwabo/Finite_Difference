@@ -8,7 +8,7 @@ from dateutil.relativedelta import relativedelta
 from curves.discount_curve import DiscountYieldCurveHandler
 
 
-class HistoricalCPI:
+class BondHistoricalCPI:
     """
     Holds a history of headline CPI figures (first-of-month) and computes the
     "published" CPI for any date via BESA's 4/3-month rule with linear interpolation.
@@ -165,30 +165,23 @@ class HistoricalCPI:
         prev_date = self._first_of_month(prev_date)
         prev_cpi = float(fixings[prev_date])
 
-        num_ext_yrs, rem = divmod(self.extend_cpi, 12)
-        
-        first_prev_reset = self._shift_months(self.curve_anchor_date, -13)
-        prev_date_resets = []
-        
-        for i in range(num_ext_yrs):
-            prev_resets = first_prev_reset + relativedelta(years=i)
-            prev_date_resets.append(prev_resets)
-            
+        reset_date = self._shift_months(self.curve_anchor_date, -1)
+
         fixing_df = 1
         fixing_reset_cpi = 1
         value_date = self.value_date
 
-        for i in range(1,months+1):
+        for i in range(1, months+1):
             next_date = self._shift_months(prev_date, i)
 
-            if next_date in prev_date_resets:
+            if next_date == reset_date:
                 value_date = next_date
                 next_carry_date = self._shift_months(self.value_date, i)
                 fixing_df = self._discount_factor_for_date(value_date)
                 next_df = self._discount_factor_for_date(next_carry_date)
                 prev_cpi = fixing_reset_cpi
-            elif value_date in prev_date_resets:
-                next_carry_date = self._shift_months(self.value_date,i)
+            elif fixing_df < 1:
+                next_carry_date = self._shift_months(self.value_date, i)
                 next_df = self._discount_factor_for_date(next_carry_date)
             else:
                 next_carry_date = value_date + relativedelta(months=i)
@@ -203,7 +196,7 @@ class HistoricalCPI:
 
         return fixings
 
-    def cpi_value(self, d: date) -> float:
+    def published_cpi(self, d: date) -> float:
         j, j1 = self._bracket(d)
         
         latest = max(self._monthly_cpi.keys())
