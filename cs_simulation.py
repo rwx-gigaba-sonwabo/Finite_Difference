@@ -218,74 +218,186 @@ def _parse_offset(s):
 # JSON MARKET DATA LOADER — replicating riskflow/config.py parse_json()
 # =============================================================================
 
+def _as_internal(dct):
+    """
+    JSON object_hook that converts RiskFlow's custom types.
+
+    Replicates config.py line 704-729 — handles ALL custom types so that
+    the JSON dict hierarchy is preserved correctly. The object_hook is
+    called bottom-up on every dict in the JSON. If we don't handle a
+    custom type (like .ModelParams), its dict passes through raw and can
+    break the parent structure.
+    """
+    if '.Curve' in dct:
+        # riskflow/utils.py Curve class (line 288)
+        meta = dct['.Curve']['meta']
+        data = dct['.Curve']['data']
+        return {'_type': 'Curve', 'meta': meta, 'array': np.array(sorted(data))}
+    elif '.Percent' in dct:
+        return dct['.Percent'] / 100.0
+    elif '.Basis' in dct:
+        return dct['.Basis']
+    elif '.Descriptor' in dct:
+        return dct['.Descriptor']
+    elif '.DateList' in dct:
+        from collections import OrderedDict
+        return OrderedDict([(pd.Timestamp(date), val) for date, val in dct['.DateList']])
+    elif '.DateEqualList' in dct:
+        return [[pd.Timestamp(values[0])] + values[1:] for values in dct['.DateEqualList']]
+    elif '.CreditSupportList' in dct:
+        return dct['.CreditSupportList']
+    elif '.DateOffset' in dct:
+        return pd.DateOffset(**dct['.DateOffset'])
+    elif '.Offsets' in dct:
+        return dct['.Offsets']
+    elif '.Timestamp' in dct:
+        return pd.Timestamp(dct['.Timestamp'])
+    elif '.ModelParams' in dct:
+        mp = dct['.ModelParams']
+        return {'_type': 'ModelParams',
+                'modeldefaults': mp.get('modeldefaults', {}),
+                'modelfilters': mp.get('modelfilters', {})}
+    elif '.Deal' in dct:
+        return dct['.Deal']
+    return dct
+
+
+def _process_correlations(market_data):
+    """Convert correlations from nested dict to (name1, name2) → rho format."""
+    if 'Correlations' in market_data and isinstance(market_data['Correlations'], dict):
+        correlations = {}
+        for rate1, rate_list in market_data['Correlations'].items():
+            if isinstance(rate_list, dict):
+                for rate2, rho in rate_list.items():
+                    correlations[(rate1, rate2)] = rho
+        market_data['Correlations'] = correlations
+
+
 def load_market_data(json_path):
     """
-    Load a RiskFlow CVAMarketData JSON file and extract the relevant sections.
+    Load market data from a RiskFlow JSON file.
 
-    Replicates riskflow/config.py Context.parse_json() (line 702).
+    Handles TWO different JSON formats:
 
-    The JSON structure for forward prices is:
+    FORMAT 1 — Standalone market data file (CVAMarketData.json):
         {
             "MarketData": {
-                "Price Factors": {
-                    "ForwardPrice.BRENT.OIL": {
-                        "Currency": "USD",
-                        "Curve": {".Curve": {"meta": [], "data": [[excel_date, price], ...]}}
-                    }
-                },
-                "Price Models": {
-                    "CSForwardPriceModel.BRENT.OIL": {
-                        "Sigma": 0.35,
-                        "Alpha": 1.0,
-                        "Drift": 0.02
-                    }
-                },
-                "Model Configuration": "..."
+                "Price Factors": { ... },
+                "Price Models": { ... },
+                "Model Configuration": { ... },
+                "Correlations": { ... }
             }
         }
 
-    The .Curve object stores tenors as EXCEL SERIAL DAY NUMBERS and values as
-    forward prices. See riskflow/utils.py Curve class (line 288).
+    FORMAT 2 — Deal/job file with embedded or referenced market data:
+        {
+            "Calc": {
+                "MergeMarketData": {
+                    "MarketDataFile": "path/to/base_market_data.json",
+                    "ExplicitMarketData": {
+                        "Price Factors": { ... },
+                        "Price Models": { ... },
+                        ...
+                    }
+                }
+            }
+        }
+
+        In this format, ExplicitMarketData contains overrides that RiskFlow
+        merges on top of a base market data file (MarketDataFile).
+        See riskflow/__init__.py Context.load_json() line 302-331.
+
+        This function loads the base file first, then applies the overrides,
+        exactly as RiskFlow does.
 
     Parameters
     ----------
     json_path : str
-        Path to the CVAMarketData JSON file.
+        Path to either a standalone market data JSON or a deal/job JSON.
 
     Returns
     -------
     dict with keys: 'Price Factors', 'Price Models', 'Model Configuration',
-                    'Correlations', 'Valuation Configuration'
+                    'Correlations', 'Valuation Configuration', etc.
     """
-
-    def as_internal(dct):
-        """
-        JSON object_hook that converts RiskFlow's custom types.
-
-        Replicates config.py line 704-729.
-        We only handle .Curve here since that's what ForwardPrice uses.
-        The .Curve data is a list of [excel_date, value] pairs.
-        """
-        if '.Curve' in dct:
-            meta = dct['.Curve']['meta']
-            data = dct['.Curve']['data']
-            # Sort by tenor (first column) and convert to numpy array
-            # This is what utils.Curve.__init__() does
-            return {'_type': 'Curve', 'meta': meta, 'array': np.array(sorted(data))}
-        elif '.Percent' in dct:
-            return dct['.Percent'] / 100.0
-        elif '.Timestamp' in dct:
-            return pd.Timestamp(dct['.Timestamp'])
-        elif '.DateOffset' in dct:
-            return pd.DateOffset(**dct['.DateOffset'])
-        return dct
+    import os
 
     with open(json_path, 'rt') as f:
-        data = json.load(f, object_hook=as_internal)
+        data = json.load(f, object_hook=_as_internal)
 
+    # ---- FORMAT 1: Standalone market data file ----
     if 'MarketData' in data:
-        return data['MarketData']
-    return data
+        market_data = data['MarketData']
+        _process_correlations(market_data)
+        return market_data
+
+    # ---- FORMAT 2: Deal/job file with Calc → MergeMarketData ----
+    if 'Calc' in data and 'MergeMarketData' in data.get('Calc', {}):
+        merge_section = data['Calc']['MergeMarketData']
+
+        # Step 1: Load the base market data file (if referenced)
+        # Replicates __init__.py line 315-316
+        base_market_data_file = merge_section.get('MarketDataFile')
+        base_params = {
+            'Price Factors': {},
+            'Price Models': {},
+            'Model Configuration': {},
+            'Correlations': {},
+            'Valuation Configuration': {},
+            'System Parameters': {},
+            'Price Factor Interpolation': {},
+        }
+
+        if base_market_data_file:
+            # Resolve relative path from the deal file's directory
+            base_dir = os.path.dirname(os.path.abspath(json_path))
+            base_path = os.path.join(base_dir, base_market_data_file)
+
+            if os.path.exists(base_path):
+                print(f"  Loading base market data: {base_path}")
+                with open(base_path, 'rt') as f:
+                    base_data = json.load(f, object_hook=_as_internal)
+                if 'MarketData' in base_data:
+                    base_params = base_data['MarketData']
+                    _process_correlations(base_params)
+            else:
+                print(f"  WARNING: Base market data file not found: {base_path}")
+                print(f"           Using only ExplicitMarketData overrides")
+
+        # Step 2: Apply ExplicitMarketData overrides on top of the base
+        # Replicates __init__.py line 330-331:
+        #   for section, section_data in market_data['ExplicitMarketData'].items():
+        #       cfg.params[section].update(section_data)
+        explicit = merge_section.get('ExplicitMarketData', {})
+        for section, section_data in explicit.items():
+            if isinstance(section_data, dict):
+                if section not in base_params:
+                    base_params[section] = {}
+                if isinstance(base_params[section], dict):
+                    base_params[section].update(section_data)
+                else:
+                    base_params[section] = section_data
+            else:
+                base_params[section] = section_data
+
+        # Step 3: Also grab valuation params from the Calc level if present
+        for key in ['Valuation Configuration', 'System Parameters']:
+            if key in data['Calc'] and isinstance(data['Calc'][key], dict):
+                if key not in base_params:
+                    base_params[key] = {}
+                if isinstance(base_params[key], dict):
+                    base_params[key].update(data['Calc'][key])
+
+        return base_params
+
+    # ---- Fallback: Price Factors at top level ----
+    if 'Price Factors' in data:
+        return data
+
+    raise KeyError(
+        f"Cannot find market data in JSON. "
+        f"Top-level keys are: {list(data.keys())}"
+    )
 
 
 def extract_forward_curve(market_data, factor_name):
