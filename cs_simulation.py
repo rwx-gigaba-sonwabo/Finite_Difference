@@ -764,6 +764,10 @@ def generate_paths(precalc, random_numbers, factor_index=0):
         3. Scale by volatility: vol[t, tenor, 1] * Z[t, 1, scenario] → [t, tenor, scenario]
         4. Cumulative sum over time → stochastic integral
         5. F(t,T) = F(0,T) * exp(drift + cumsum(vol * Z))
+
+    Handles both numpy (historical) and torch (implied) precalc tensors.
+    When torch tensors are present (implied model), uses torch operations
+    exactly as RiskFlow does, then detaches to numpy for the final output.
     """
     initial_curve = precalc['initial_curve']
     vol = precalc['vol']
@@ -771,14 +775,30 @@ def generate_paths(precalc, random_numbers, factor_index=0):
 
     num_timesteps = vol.shape[0]
 
-    Z = random_numbers[factor_index, :num_timesteps, :]
-    Z = np.expand_dims(Z, axis=1)
+    use_torch = isinstance(vol, torch.Tensor)
 
-    z_portion = vol * Z
-    stoch_integral = np.cumsum(z_portion, axis=0)
+    if use_torch:
+        # Implied branch: vol/drift are torch tensors (possibly with requires_grad)
+        # Replicate RiskFlow's generate() using all-torch operations
+        Z = torch.tensor(random_numbers[factor_index, :num_timesteps, :],
+                         dtype=torch.float64)
+        Z = torch.unsqueeze(Z, dim=1)
 
-    simulated = initial_curve * np.exp(drift + stoch_integral)
-    return simulated
+        z_portion = vol * Z
+        stoch_integral = torch.cumsum(z_portion, dim=0)
+
+        simulated = initial_curve * torch.exp(drift + stoch_integral)
+        return simulated.detach().numpy()
+    else:
+        # Historical branch: everything is numpy
+        Z = random_numbers[factor_index, :num_timesteps, :]
+        Z = np.expand_dims(Z, axis=1)
+
+        z_portion = vol * Z
+        stoch_integral = np.cumsum(z_portion, axis=0)
+
+        simulated = initial_curve * np.exp(drift + stoch_integral)
+        return simulated
 
 
 # =============================================================================
@@ -787,51 +807,66 @@ def generate_paths(precalc, random_numbers, factor_index=0):
 
 def run_simulation_from_json(json_path, factor_name,
                              time_grid_string=None, max_date=None,
-                             num_scenarios=4096, num_batches=1,
+                             batch_size=1024, simulation_batches=4,
                              use_antithetic=True, random_seed=42):
     """
     Run a complete CS simulation using data loaded from a RiskFlow JSON file.
 
-    This is the main entry point that ties everything together, replicating:
-        1. config.parse_json()                    → load market data
-        2. riskfactors.ForwardPrice.__init__()     → extract curve
-        3. config.parse_grid()                     → build time grid
-        4. TimeGrid.set_base_date()                → convert to day offsets
-        5. CSForwardPriceModel.precalculate()       → pre-compute vol/drift
-        6. CMC_State.reset()                        → generate random numbers
-        7. CSForwardPriceModel.generate()            → simulate paths
+    Replicates the EXACT RiskFlow Credit_Monte_Carlo batch loop:
+        1. config.parse_json()                          → load market data
+        2. riskfactors.ForwardPrice.__init__()           → extract curve
+        3. config.parse_grid()                           → build time grid
+        4. TimeGrid.set_base_date()                      → convert to day offsets
+        5. CSForwardPriceModel.precalculate()             → pre-compute vol/drift
+        6. FOR each batch in Simulation_Batches:          (calculation.py line 1053)
+             CMC_State.reset()                            → fresh random numbers
+             CSForwardPriceModel.generate()                → simulate batch_size paths
+             append to scenario buffer
+        7. np.concatenate(batches, axis=-1)               → join on scenario axis
+        8. Build DataFrame with MultiIndex (tenor, scenario)
 
     Parameters
     ----------
     json_path : str
         Path to CVAMarketData JSON file.
     factor_name : str
-        ForwardPrice factor name, e.g. 'ForwardPrice.BRENT.OIL'.
+        ForwardPrice factor name, e.g. 'ForwardPrice.GOLD'.
     time_grid_string : str, optional
-        RiskFlow time grid string. If None, uses the one from
-        Valuation Configuration in the JSON.
+        RiskFlow time grid string. If None, uses the one from the JSON.
     max_date : pd.Timestamp, optional
         Last simulation date. If None, uses last tenor delivery date.
-    num_scenarios : int
-        Number of MC scenarios per batch.
-    num_batches : int
-        Number of simulation batches.
+    batch_size : int
+        Number of MC scenarios per batch (RiskFlow: params['Batch_Size']).
+    simulation_batches : int
+        Number of batches (RiskFlow: params['Simulation_Batches']).
+        Total scenarios = batch_size * simulation_batches.
     use_antithetic : bool
         Whether to use antithetic sampling.
     random_seed : int
-        For reproducibility.
+        For reproducibility. Corresponds to params['Random_Seed'].
 
     Returns
     -------
-    simulated : np.ndarray, shape [timesteps, tenors, total_scenarios]
-    precalc : dict
+    all_simulated : np.ndarray, shape [timesteps, tenors, total_scenarios]
+        Raw simulation array. total_scenarios = batch_size * simulation_batches.
+    scenario_df : pd.DataFrame
+        RiskFlow-format output:
+            - rows = MultiIndex (tenor, scenario)
+              where tenor = excel day numbers of delivery dates,
+              scenario = 0..total_scenarios-1
+            - columns = scenario dates (pd.DatetimeIndex)
+            - Transposed so .T gives dates-as-rows (CSV export format)
     metadata : dict with run info
     """
     np.random.seed(random_seed)
+    total_scenarios = batch_size * simulation_batches
 
     print("=" * 70)
     print("CS SIMULATION — LOADING FROM RISKFLOW JSON")
     print("=" * 70)
+    print(f"  Batch_Size: {batch_size}")
+    print(f"  Simulation_Batches: {simulation_batches}")
+    print(f"  Total scenarios: {total_scenarios}")
 
     # ---- 1. Load market data from JSON ----
     print(f"\n  Loading: {json_path}")
@@ -851,7 +886,6 @@ def run_simulation_from_json(json_path, factor_name,
     print(f"  Drift = {params['Drift']}")
 
     # ---- 4. Determine base date ----
-    # In RiskFlow this comes from Valuation Configuration -> Run_Date
     val_config = market_data.get('Valuation Configuration', {})
     if isinstance(val_config, dict):
         base_date = val_config.get('Run_Date')
@@ -861,7 +895,6 @@ def run_simulation_from_json(json_path, factor_name,
         base_date = None
 
     if base_date is None:
-        # Fall back: infer from the first tenor (assume it's in the future)
         base_date = excel_days_to_timestamp(tenors_excel[0] - 90)
         print(f"\n  WARNING: No Run_Date found in JSON, inferring base_date = {base_date.date()}")
     elif isinstance(base_date, str):
@@ -872,7 +905,6 @@ def run_simulation_from_json(json_path, factor_name,
 
     # ---- 5. Parse the time grid ----
     if time_grid_string is None:
-        # Try to get from Valuation Configuration
         if isinstance(val_config, dict):
             time_grid_string = val_config.get('Time_grid', val_config.get('Tenor'))
         if time_grid_string is None:
@@ -889,7 +921,7 @@ def run_simulation_from_json(json_path, factor_name,
     print(f"    First 10 day offsets: {scen_time_grid[:10]}")
     print(f"    Last 5 day offsets:   {scen_time_grid[-5:]}")
 
-    # Show the forward curve with delivery dates
+    # Show the forward curve
     print(f"\n  Initial forward curve:")
     print(f"    {'Excel Date':>12s}  {'Calendar Date':>14s}  {'Days Fwd':>10s}  {'Years Fwd':>10s}  {'Price':>10s}")
     print("    " + "-" * 64)
@@ -913,25 +945,62 @@ def run_simulation_from_json(json_path, factor_name,
     factor_names = [factor_name]
     L = build_cholesky({}, factor_names)
 
-    # ---- 8. Simulation loop ----
-    num_timesteps = len(scen_time_grid)
-    all_results = []
+    # ---- 8. Batch simulation loop ----
+    # Replicates calculation.py line 1053-1061:
+    #   for run in range(params['Simulation_Batches']):
+    #       shared_mem.reset(...)        → fresh random numbers per batch
+    #       for key, value in stoch_factors.items():
+    #           shared_mem.t_Scenario_Buffer[key] = value.generate(shared_mem)
+    #       output['scenarios'][key].append(buffer.numpy())
+    #   values = np.concatenate(factor_values, axis=-1)  → join on scenario axis
 
-    for batch in range(num_batches):
+    num_timesteps = len(scen_time_grid)
+    batch_results = []
+
+    for batch in range(simulation_batches):
+        # Each batch gets FRESH random numbers (like CMC_State.reset())
         random_numbers = generate_random_numbers(
-            L, num_timesteps, num_scenarios, use_antithetic=use_antithetic)
+            L, num_timesteps, batch_size, use_antithetic=use_antithetic)
         simulated = generate_paths(precalc, random_numbers, factor_index=0)
-        all_results.append(simulated)
+        batch_results.append(simulated)
 
         if batch == 0:
             print(f"\n  Batch 0: shape = {simulated.shape} "
-                  f"[{num_timesteps} times, {len(prices)} tenors, {num_scenarios} scenarios]")
+                  f"[{num_timesteps} times, {len(prices)} tenors, {batch_size} scenarios]")
 
-    all_simulated = np.concatenate(all_results, axis=2)
-    total_scenarios = all_simulated.shape[2]
-    print(f"\n  Total scenarios: {total_scenarios}")
+    # Concatenate batches on the scenario axis (axis=-1)
+    # Replicates: values = np.concatenate(v, axis=-1)  (calculation.py line 951)
+    all_simulated = np.concatenate(batch_results, axis=-1)
+    print(f"\n  Concatenated: {all_simulated.shape} "
+          f"[{num_timesteps} times, {len(prices)} tenors, {total_scenarios} scenarios]")
 
-    # ---- 9. Validation output ----
+    # ---- 9. Build RiskFlow-format DataFrame ----
+    # Replicates calculation.py report() lines 957-963:
+    #   tenors = self.all_tenors[k][0].tenor               → excel day numbers
+    #   columns = MultiIndex.from_product([tenors, range(N)], names=['tenor','scenario'])
+    #   df = DataFrame(values.reshape(T, -1), index=scenario_date_index, columns=columns).T
+    scenario_dates = pd.DatetimeIndex(
+        sorted([base_date + pd.Timedelta(days=int(d)) for d in scen_time_grid]))
+
+    columns = pd.MultiIndex.from_product(
+        [tenors_excel, np.arange(total_scenarios)],
+        names=['tenor', 'scenario'])
+
+    # Reshape from [timesteps, tenors, scenarios] to [timesteps, tenors*scenarios]
+    flat_values = all_simulated.reshape(num_timesteps, -1)
+
+    scenario_df = pd.DataFrame(
+        flat_values,
+        index=scenario_dates[:num_timesteps],
+        columns=columns
+    ).T  # Transpose: rows = (tenor, scenario), columns = dates
+
+    print(f"\n  DataFrame shape: {scenario_df.shape}")
+    print(f"    Rows (tenor x scenario): {scenario_df.shape[0]}  "
+          f"({len(tenors_excel)} tenors x {total_scenarios} scenarios)")
+    print(f"    Columns (dates): {scenario_df.shape[1]}")
+
+    # ---- 10. Quick validation ----
     print(f"\n  VALIDATION: Simulated vs Theoretical moments at final timestep")
     t_final = scen_time_grid[-1] / DAYS_IN_YEAR
     print(f"  (t_final = {t_final:.3f} years = day {scen_time_grid[-1]})")
@@ -945,7 +1014,6 @@ def run_simulation_from_json(json_path, factor_name,
         sim_mean = np.mean(sim_F)
         sim_std = np.std(sim_F)
 
-        # Theoretical: Tmt = remaining time-to-delivery at t_final
         Tmt = max((tenors_excel[tenor_idx] - base_date_excel) / DAYS_IN_YEAR - t_final, 0.0)
         ln_var = params['Sigma'] ** 2 * np.exp(-2.0 * params['Alpha'] * Tmt) * \
                  (1.0 - np.exp(-2.0 * params['Alpha'] * t_final)) / (2.0 * params['Alpha'])
@@ -969,9 +1037,128 @@ def run_simulation_from_json(json_path, factor_name,
         'tenors_excel': tenors_excel,
         'prices': prices,
         'currency': currency,
+        'batch_size': batch_size,
+        'simulation_batches': simulation_batches,
+        'total_scenarios': total_scenarios,
+        'scenario_dates': scenario_dates,
     }
 
-    return all_simulated, precalc, metadata
+    return all_simulated, scenario_df, metadata
+
+
+# =============================================================================
+# RISKFLOW-FORMAT DATAFRAME UTILITIES
+# =============================================================================
+
+def to_riskflow_dataframe(simulated, metadata):
+    """
+    Convert a raw simulation array to a RiskFlow-format DataFrame.
+
+    Replicates calculation.py report() lines 957-963:
+        tenors = self.all_tenors[k][0].tenor
+        columns = MultiIndex.from_product([tenors, range(N)], names=['tenor','scenario'])
+        scen[factor_name] = DataFrame(
+            values.reshape(T, -1), index=scenario_date_index, columns=columns).T
+
+    The result has:
+        - rows = MultiIndex (tenor, scenario)
+            tenor = excel day number of each delivery date
+            scenario = 0, 1, ..., total_scenarios-1
+        - columns = scenario dates (DatetimeIndex)
+
+    Parameters
+    ----------
+    simulated : np.ndarray, shape [timesteps, tenors, scenarios]
+    metadata : dict — must contain tenors_excel, base_date, scen_time_grid
+
+    Returns
+    -------
+    pd.DataFrame in RiskFlow scenario format
+    """
+    tenors_excel = metadata['tenors_excel']
+    base_date = metadata['base_date']
+    scen_time_grid = metadata['scen_time_grid']
+    n_timesteps, _, n_scenarios = simulated.shape
+
+    scenario_dates = pd.DatetimeIndex(
+        sorted([base_date + pd.Timedelta(days=int(d)) for d in scen_time_grid]))
+
+    columns = pd.MultiIndex.from_product(
+        [tenors_excel, np.arange(n_scenarios)],
+        names=['tenor', 'scenario'])
+
+    flat_values = simulated.reshape(n_timesteps, -1)
+
+    return pd.DataFrame(
+        flat_values,
+        index=scenario_dates[:n_timesteps],
+        columns=columns
+    ).T
+
+
+def from_riskflow_dataframe(scenario_df, metadata=None):
+    """
+    Convert a RiskFlow-format scenario DataFrame back to a numpy array.
+
+    Parameters
+    ----------
+    scenario_df : pd.DataFrame
+        Rows = MultiIndex (tenor, scenario), columns = dates.
+    metadata : dict, optional
+        If provided, updates it with extracted info.
+
+    Returns
+    -------
+    simulated : np.ndarray, shape [timesteps, tenors, scenarios]
+    tenors : np.ndarray of tenor values
+    scenario_dates : pd.DatetimeIndex
+    """
+    # Extract structure from MultiIndex
+    tenors = scenario_df.index.get_level_values('tenor').unique().values
+    scenarios = scenario_df.index.get_level_values('scenario').unique().values
+    scenario_dates = scenario_df.columns
+
+    n_tenors = len(tenors)
+    n_scenarios = len(scenarios)
+    n_timesteps = len(scenario_dates)
+
+    # Transpose back: dates as rows, (tenor, scenario) as columns
+    df_T = scenario_df.T  # shape: [timesteps, tenors*scenarios]
+
+    # Reshape to [timesteps, tenors, scenarios]
+    simulated = df_T.values.reshape(n_timesteps, n_tenors, n_scenarios)
+
+    if metadata is not None:
+        metadata['tenors_excel'] = tenors
+        metadata['total_scenarios'] = n_scenarios
+        metadata['scenario_dates'] = scenario_dates
+
+    return simulated, tenors, scenario_dates
+
+
+def export_scenarios_csv(scenario_df, filepath, factor_name=None):
+    """
+    Export scenario DataFrame to CSV in the same format RiskFlow produces.
+
+    The CSV has:
+        - First two columns: 'tenor' and 'scenario' (from the MultiIndex)
+        - Remaining columns: dates
+        - Each row: the forward price path for one (tenor, scenario) pair
+
+    Parameters
+    ----------
+    scenario_df : pd.DataFrame — RiskFlow-format
+    filepath : str
+    factor_name : str, optional — added as header comment
+    """
+    df_out = scenario_df.copy()
+    df_out.columns = [str(d.date()) for d in df_out.columns]
+
+    if factor_name:
+        print(f"  Exporting {factor_name}: {df_out.shape} to {filepath}")
+
+    df_out.to_csv(filepath)
+    print(f"  Saved: {filepath} ({df_out.shape[0]} rows x {df_out.shape[1]} columns)")
 
 
 # =============================================================================
@@ -983,10 +1170,17 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
                               time_grid_string='0d 2d 1w(1w) 1m(1m) 3m(3m)',
                               max_date_str=None,
                               model_type='historical',
-                              num_scenarios=4096, use_antithetic=True, random_seed=42):
+                              batch_size=1024, simulation_batches=4,
+                              use_antithetic=True, random_seed=42):
     """
     Run a simulation with manually specified parameters, still using RiskFlow's
-    exact time grid parsing and date handling.
+    exact time grid parsing, date handling, and batch loop.
+
+    Replicates the same batch structure as run_simulation_from_json():
+        - batch_size scenarios per batch
+        - simulation_batches batches with fresh random numbers each
+        - Concatenates on scenario axis (axis=-1)
+        - Returns RiskFlow-format DataFrame
 
     Parameters
     ----------
@@ -1004,8 +1198,23 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
         Max simulation date. Defaults to last delivery date.
     model_type : str
         'historical' or 'implied'.
+    batch_size : int
+        Number of MC scenarios per batch (RiskFlow: params['Batch_Size']).
+    simulation_batches : int
+        Number of batches (RiskFlow: params['Simulation_Batches']).
+    use_antithetic : bool
+        Whether to use antithetic sampling.
+    random_seed : int
+        For reproducibility.
+
+    Returns
+    -------
+    all_simulated : np.ndarray, shape [timesteps, tenors, total_scenarios]
+    scenario_df : pd.DataFrame — RiskFlow-format
+    metadata : dict
     """
     np.random.seed(random_seed)
+    total_scenarios = batch_size * simulation_batches
 
     base_date = pd.Timestamp(base_date_str)
     base_date_excel = timestamp_to_excel_days(base_date)
@@ -1024,6 +1233,9 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
     print("=" * 70)
     print(f"\n  Base date:  {base_date.date()} (excel: {base_date_excel})")
     print(f"  Sigma={sigma}, Alpha={alpha}, Drift={drift_mu}")
+    print(f"  Batch_Size: {batch_size}")
+    print(f"  Simulation_Batches: {simulation_batches}")
+    print(f"  Total scenarios: {total_scenarios}")
 
     # Parse time grid using RiskFlow's exact logic
     scen_time_grid = parse_time_grid(base_date, max_date, time_grid_string)
@@ -1041,15 +1253,44 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
     # Precalculate
     precalc = precalculate(
         prices, tenors_excel, scen_time_grid,
-        sigma, alpha, drift_mu, base_date_excel, use_implied=False)
+        sigma, alpha, drift_mu, base_date_excel, use_implied=(model_type == 'implied'))
 
-    # Simulate
+    # Batch simulation loop (matching RiskFlow's CMC_State pattern)
     L = build_cholesky({}, ['factor'])
     num_timesteps = len(scen_time_grid)
-    random_numbers = generate_random_numbers(L, num_timesteps, num_scenarios, use_antithetic)
-    simulated = generate_paths(precalc, random_numbers, factor_index=0)
+    batch_results = []
 
-    print(f"\n  Simulated: {simulated.shape} [timesteps, tenors, scenarios]")
+    for batch in range(simulation_batches):
+        random_numbers = generate_random_numbers(
+            L, num_timesteps, batch_size, use_antithetic=use_antithetic)
+        simulated = generate_paths(precalc, random_numbers, factor_index=0)
+        batch_results.append(simulated)
+
+        if batch == 0:
+            print(f"\n  Batch 0: shape = {simulated.shape} "
+                  f"[{num_timesteps} times, {len(prices)} tenors, {batch_size} scenarios]")
+
+    # Concatenate batches on scenario axis
+    all_simulated = np.concatenate(batch_results, axis=-1)
+    print(f"\n  Concatenated: {all_simulated.shape} "
+          f"[{num_timesteps} times, {len(prices)} tenors, {total_scenarios} scenarios]")
+
+    # Build RiskFlow-format DataFrame
+    scenario_dates = pd.DatetimeIndex(
+        sorted([base_date + pd.Timedelta(days=int(d)) for d in scen_time_grid]))
+
+    columns = pd.MultiIndex.from_product(
+        [tenors_excel, np.arange(total_scenarios)],
+        names=['tenor', 'scenario'])
+
+    flat_values = all_simulated.reshape(num_timesteps, -1)
+    scenario_df = pd.DataFrame(
+        flat_values,
+        index=scenario_dates[:num_timesteps],
+        columns=columns
+    ).T
+
+    print(f"\n  DataFrame shape: {scenario_df.shape}")
 
     # Validation
     t_final = scen_time_grid[-1] / DAYS_IN_YEAR
@@ -1060,7 +1301,7 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
 
     for idx in range(len(prices)):
         F0 = prices[idx]
-        sim_F = simulated[-1, idx, :]
+        sim_F = all_simulated[-1, idx, :]
         Tmt = max((tenors_excel[idx] - base_date_excel) / DAYS_IN_YEAR - t_final, 0.0)
         ln_var = sigma**2 * np.exp(-2.0 * alpha * Tmt) * \
                  (1.0 - np.exp(-2.0 * alpha * t_final)) / (2.0 * alpha)
@@ -1071,7 +1312,25 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
               f"{np.std(sim_F):10.4f}  {theo_mean:10.4f}  {theo_std:10.4f}")
 
     print("=" * 70)
-    return simulated, precalc, scen_time_grid
+
+    metadata = {
+        'factor_name': f'Standalone.{model_type}',
+        'model_type': model_type,
+        'params': {'Sigma': sigma, 'Alpha': alpha, 'Drift': drift_mu},
+        'base_date': base_date,
+        'base_date_excel': base_date_excel,
+        'time_grid_string': time_grid_string,
+        'scen_time_grid': scen_time_grid,
+        'tenors_excel': tenors_excel,
+        'prices': prices,
+        'currency': 'USD',
+        'batch_size': batch_size,
+        'simulation_batches': simulation_batches,
+        'total_scenarios': total_scenarios,
+        'scenario_dates': scenario_dates,
+    }
+
+    return all_simulated, scenario_df, metadata
 
 
 # =============================================================================
@@ -1131,8 +1390,8 @@ def plot_results(simulated, scen_time_grid, tenors_excel, prices, base_date_exce
 
 def run_multi_factor_simulation_from_json(json_path, factor_names,
                                           time_grid_string=None, max_date=None,
-                                          num_scenarios=4096, use_antithetic=True,
-                                          random_seed=42):
+                                          batch_size=1024, simulation_batches=4,
+                                          use_antithetic=True, random_seed=42):
     """
     Simulate multiple correlated commodity forward prices from a JSON file.
 
@@ -1140,6 +1399,7 @@ def run_multi_factor_simulation_from_json(json_path, factor_names,
         - Each factor gets its own precalculate() call
         - They share the same correlated random number block
         - Correlations come from the JSON's 'Correlations' section
+        - Uses the batch loop pattern (CMC_State.reset() per batch)
 
     Parameters
     ----------
@@ -1147,12 +1407,26 @@ def run_multi_factor_simulation_from_json(json_path, factor_names,
         Path to CVAMarketData JSON file.
     factor_names : list of str
         ForwardPrice factor names, e.g. ['ForwardPrice.BRENT.OIL', 'ForwardPrice.WTI.OIL'].
+    batch_size : int
+        Number of MC scenarios per batch.
+    simulation_batches : int
+        Number of batches. Total scenarios = batch_size * simulation_batches.
+
+    Returns
+    -------
+    results : dict of {factor_name: np.ndarray} — shape [timesteps, tenors, total_scenarios]
+    scenario_dfs : dict of {factor_name: pd.DataFrame} — RiskFlow-format DataFrames
+    metadata_dict : dict of {factor_name: metadata}
     """
     np.random.seed(random_seed)
+    total_scenarios = batch_size * simulation_batches
 
     print("=" * 70)
     print("MULTI-FACTOR CS SIMULATION FROM JSON")
     print("=" * 70)
+    print(f"  Batch_Size: {batch_size}")
+    print(f"  Simulation_Batches: {simulation_batches}")
+    print(f"  Total scenarios: {total_scenarios}")
 
     market_data = load_market_data(json_path)
 
@@ -1201,20 +1475,64 @@ def run_multi_factor_simulation_from_json(json_path, factor_names,
         precalcs[fname] = precalculate(
             fd['prices'], fd['tenors'], scen_time_grid,
             fd['params']['Sigma'], fd['params']['Alpha'], fd['params']['Drift'],
-            base_date_excel, use_implied=False)
+            base_date_excel, use_implied=(fd['model_type'] == 'implied'))
 
     # Build correlation matrix
     correlations = extract_correlations(market_data)
     L = build_cholesky(correlations, factor_names)
     print(f"\n  Cholesky L:\n{L}")
 
-    # Simulate
-    random_numbers = generate_random_numbers(L, num_timesteps, num_scenarios, use_antithetic)
+    # Batch simulation loop
+    batch_results = {fname: [] for fname in factor_names}
 
+    for _ in range(simulation_batches):
+        random_numbers = generate_random_numbers(
+            L, num_timesteps, batch_size, use_antithetic=use_antithetic)
+
+        for idx, fname in enumerate(factor_names):
+            simulated = generate_paths(precalcs[fname], random_numbers, factor_index=idx)
+            batch_results[fname].append(simulated)
+
+    # Concatenate batches on scenario axis
     results = {}
-    for idx, fname in enumerate(factor_names):
-        results[fname] = generate_paths(precalcs[fname], random_numbers, factor_index=idx)
-        print(f"  {fname}: simulated shape = {results[fname].shape}")
+    for fname in factor_names:
+        results[fname] = np.concatenate(batch_results[fname], axis=-1)
+        print(f"  {fname}: shape = {results[fname].shape}")
+
+    # Build RiskFlow-format DataFrames and metadata for each factor
+    scenario_dates = pd.DatetimeIndex(
+        sorted([base_date + pd.Timedelta(days=int(d)) for d in scen_time_grid]))
+
+    scenario_dfs = {}
+    metadata_dict = {}
+    for fname, fd in factor_data.items():
+        sim = results[fname]
+        columns = pd.MultiIndex.from_product(
+            [fd['tenors'], np.arange(total_scenarios)],
+            names=['tenor', 'scenario'])
+        flat_values = sim.reshape(num_timesteps, -1)
+        scenario_dfs[fname] = pd.DataFrame(
+            flat_values,
+            index=scenario_dates[:num_timesteps],
+            columns=columns
+        ).T
+
+        metadata_dict[fname] = {
+            'factor_name': fname,
+            'model_type': fd['model_type'],
+            'params': fd['params'],
+            'base_date': base_date,
+            'base_date_excel': base_date_excel,
+            'time_grid_string': time_grid_string,
+            'scen_time_grid': scen_time_grid,
+            'tenors_excel': fd['tenors'],
+            'prices': fd['prices'],
+            'currency': fd['currency'],
+            'batch_size': batch_size,
+            'simulation_batches': simulation_batches,
+            'total_scenarios': total_scenarios,
+            'scenario_dates': scenario_dates,
+        }
 
     # Check cross-correlations
     if len(factor_names) >= 2:
@@ -1230,7 +1548,7 @@ def run_multi_factor_simulation_from_json(json_path, factor_names,
         print(f"    Realized: {rho_realized:.4f}")
 
     print("=" * 70)
-    return results, precalcs
+    return results, scenario_dfs, metadata_dict
 
 
 # =============================================================================
@@ -1243,17 +1561,21 @@ if __name__ == '__main__':
     # ------------------------------------------------------------------
     # Uncomment and modify the path/factor to match your data:
     #
-    # simulated, precalc, meta = run_simulation_from_json(
+    # simulated, scenario_df, meta = run_simulation_from_json(
     #     json_path=r'path\to\CVAMarketData.json',
     #     factor_name='ForwardPrice.BRENT.OIL',
     #     time_grid_string=None,   # reads from JSON, or override here
-    #     num_scenarios=4096,
+    #     batch_size=1024,
+    #     simulation_batches=4,
     #     use_antithetic=True,
     # )
     #
     # plot_results(simulated, meta['scen_time_grid'], meta['tenors_excel'],
     #              meta['prices'], meta['base_date_excel'], meta['model_type'],
     #              save_path='cs_simulation_from_json.png')
+    #
+    # # Export to CSV (matches RiskFlow's format)
+    # export_scenarios_csv(scenario_df, 'cs_scenarios.csv', meta['factor_name'])
 
     # ------------------------------------------------------------------
     # OPTION B: Run standalone with manual parameters
@@ -1262,7 +1584,7 @@ if __name__ == '__main__':
     print("EXAMPLE: Standalone simulation with RiskFlow time grid parsing")
     print("=" * 70)
 
-    simulated, precalc, scen_grid = run_simulation_standalone(
+    simulated, scenario_df, meta = run_simulation_standalone(
         base_date_str='2024-01-15',
         delivery_dates_str=[
             '2024-04-15',   # ~3 months
@@ -1278,21 +1600,16 @@ if __name__ == '__main__':
         drift_mu=0.02,
         time_grid_string='0d 2d 1w(1w) 1m(1m) 3m(3m)',
         model_type='historical',
-        num_scenarios=4096,
+        batch_size=1024,
+        simulation_batches=4,
         use_antithetic=True,
         random_seed=42,
     )
 
-    # Plot
-    base_date = pd.Timestamp('2024-01-15')
-    base_excel = timestamp_to_excel_days(base_date)
-    delivery_dates = ['2024-04-15', '2024-07-15', '2024-10-15',
-                      '2025-01-15', '2025-07-15', '2026-01-15']
-    tenors_excel = np.array([timestamp_to_excel_days(pd.Timestamp(d)) for d in delivery_dates])
-    prices = np.array([85.0, 83.0, 81.5, 80.0, 78.0, 76.0])
-
-    plot_results(simulated, scen_grid, tenors_excel, prices, base_excel,
-                 model_type='historical', save_path='cs_standalone_simulation.png')
+    # Plot using metadata
+    plot_results(simulated, meta['scen_time_grid'], meta['tenors_excel'],
+                 meta['prices'], meta['base_date_excel'], meta['model_type'],
+                 save_path='cs_standalone_simulation.png')
 
     # ------------------------------------------------------------------
     # Show how the time grid parser works

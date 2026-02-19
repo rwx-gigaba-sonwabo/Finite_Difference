@@ -18,14 +18,16 @@ DIAGNOSTICS:
     7. Cross-Simulation Comparison — RiskFlow vs validation output
 
 USAGE:
-    from cs_simulation import run_simulation_from_json
+    from cs_simulation import run_simulation_from_json, from_riskflow_dataframe
     from cs_diagnostics import run_full_diagnostics
 
-    simulated, precalc, metadata = run_simulation_from_json(...)
+    simulated, scenario_df, metadata = run_simulation_from_json(...)
     results = run_full_diagnostics(simulated, metadata)
 
-    # Compare with RiskFlow output:
-    results = run_full_diagnostics(simulated, metadata, sim_benchmark=rf_output)
+    # Compare with RiskFlow output (loaded from CSV):
+    rf_df = pd.read_csv('riskflow_scenarios.csv', index_col=[0, 1], parse_dates=True)
+    rf_simulated, _, _ = from_riskflow_dataframe(rf_df)
+    results = run_full_diagnostics(simulated, metadata, sim_benchmark=rf_simulated)
 
 THE CS MODEL (recap):
     F(t,T) = F(0,T) * exp( drift(t,T) + cumsum(vol(t,T) * Z(t)) )
@@ -1453,32 +1455,23 @@ def run_full_diagnostics(simulated, metadata, sim_benchmark=None,
 # =============================================================================
 
 if __name__ == '__main__':
-    from cs_simulation import (run_simulation_standalone,
-                               timestamp_to_excel_days)
+    from cs_simulation import run_simulation_standalone
 
     print("Running example simulation for diagnostics demo...\n")
 
     # Run a simulation with known parameters
-    simulated, precalc, scen_time_grid = run_simulation_standalone(
+    # Returns (all_simulated, scenario_df, metadata) — matching RiskFlow's format
+    simulated, scenario_df, metadata = run_simulation_standalone(
         base_date_str='2024-01-15',
         delivery_dates_str=['2024-07-15', '2025-01-15', '2025-07-15', '2026-01-15'],
         forward_prices=[85.0, 83.0, 81.0, 80.0],
         sigma=0.35, alpha=1.2, drift_mu=0.02,
-        num_scenarios=8192, use_antithetic=True,
+        batch_size=2048, simulation_batches=4,
+        use_antithetic=True,
     )
 
-    # Build metadata dict (same structure as run_simulation_from_json returns)
-    base_date = pd.Timestamp('2024-01-15')
-    delivery_dates = [pd.Timestamp(d) for d in
-                      ['2024-07-15', '2025-01-15', '2025-07-15', '2026-01-15']]
-
-    metadata = {
-        'params': {'Sigma': 0.35, 'Alpha': 1.2, 'Drift': 0.02},
-        'scen_time_grid': scen_time_grid,
-        'tenors_excel': np.array([timestamp_to_excel_days(d) for d in delivery_dates]),
-        'base_date_excel': timestamp_to_excel_days(base_date),
-        'prices': np.array([85.0, 83.0, 81.0, 80.0]),
-    }
+    # metadata already contains all needed keys (params, scen_time_grid,
+    # tenors_excel, base_date_excel, prices, etc.)
 
     # Run all diagnostics
     results = run_full_diagnostics(simulated, metadata, plot=True)
