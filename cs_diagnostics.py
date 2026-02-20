@@ -139,6 +139,76 @@ def cs_theoretical_price_moments(F0, sigma, alpha, drift, T_years, t_years):
 # HELPERS
 # =============================================================================
 
+def _to_3d_array(simulated, metadata=None):
+    """
+    Ensure `simulated` is a 3D numpy array with shape [timesteps, tenors, scenarios].
+
+    Accepts either:
+        1. np.ndarray with shape [timesteps, tenors, scenarios] — returned as-is
+        2. pd.DataFrame in RiskFlow format:
+             - rows = MultiIndex (tenor, scenario)
+             - columns = dates (DatetimeIndex)
+           This is the format produced by run_simulation_from_json(),
+           RiskFlow's report(), and scenario CSV exports.
+
+    When a DataFrame is passed, the function:
+        - Extracts the number of tenors and scenarios from the MultiIndex
+        - Transposes and reshapes to [timesteps, tenors, scenarios]
+        - Optionally updates metadata with tenors_excel and scenario info
+
+    Parameters
+    ----------
+    simulated : np.ndarray or pd.DataFrame
+    metadata : dict, optional — updated in-place if DataFrame is converted
+
+    Returns
+    -------
+    np.ndarray, shape [timesteps, tenors, scenarios]
+    """
+    if isinstance(simulated, np.ndarray):
+        if simulated.ndim == 3:
+            return simulated
+        raise ValueError(
+            f"Expected 3D array [timesteps, tenors, scenarios], "
+            f"got shape {simulated.shape}")
+
+    if isinstance(simulated, pd.DataFrame):
+        df = simulated
+
+        # Detect MultiIndex (tenor, scenario) rows
+        if isinstance(df.index, pd.MultiIndex):
+            tenors = df.index.get_level_values(0).unique().values
+            scenarios = df.index.get_level_values(1).unique().values
+            n_tenors = len(tenors)
+            n_scenarios = len(scenarios)
+            n_timesteps = df.shape[1]  # columns = dates
+
+            # Transpose: dates as rows, (tenor, scenario) as columns
+            arr = df.T.values  # shape: [timesteps, tenors * scenarios]
+            result = arr.reshape(n_timesteps, n_tenors, n_scenarios)
+
+            if metadata is not None:
+                # Update metadata with info extracted from the DataFrame
+                if 'tenors_excel' not in metadata:
+                    metadata['tenors_excel'] = tenors.astype(np.float64)
+                if 'total_scenarios' not in metadata:
+                    metadata['total_scenarios'] = n_scenarios
+
+            print(f"  [Converted DataFrame {df.shape} → "
+                  f"array {result.shape} "
+                  f"({n_timesteps} times, {n_tenors} tenors, {n_scenarios} scenarios)]")
+            return result
+
+        # Non-MultiIndex DataFrame: assume rows=dates, columns=scenarios
+        # (simple single-tenor case or already transposed)
+        raise ValueError(
+            f"DataFrame must have a MultiIndex (tenor, scenario) as rows. "
+            f"Got index type: {type(df.index).__name__}")
+
+    raise TypeError(
+        f"Expected np.ndarray or pd.DataFrame, got {type(simulated).__name__}")
+
+
 def _get_time_tenor_arrays(metadata):
     """Extract simulation times (years) and delivery times (years) from metadata."""
     scen_time_grid = metadata['scen_time_grid']
@@ -180,7 +250,8 @@ def martingale_test(simulated, metadata, timestep_indices=None,
 
     Parameters
     ----------
-    simulated : np.ndarray, shape [timesteps, tenors, scenarios]
+    simulated : np.ndarray or pd.DataFrame
+        3D array [timesteps, tenors, scenarios] or RiskFlow-format DataFrame.
     metadata : dict — from run_simulation_from_json() or equivalent
     timestep_indices : list of int, optional
     confidence : float
@@ -190,6 +261,7 @@ def martingale_test(simulated, metadata, timestep_indices=None,
     -------
     results_df : pd.DataFrame
     """
+    simulated = _to_3d_array(simulated, metadata)
     t_years, T_years = _get_time_tenor_arrays(metadata)
     params = metadata['params']
     drift = params['Drift']
@@ -322,6 +394,7 @@ def moment_matching(simulated, metadata, timestep_indices=None, plot=True):
     log_df : pd.DataFrame — log-return moment comparison
     price_df : pd.DataFrame — price-level moment comparison
     """
+    simulated = _to_3d_array(simulated, metadata)
     t_years, T_years = _get_time_tenor_arrays(metadata)
     params = metadata['params']
     F0 = metadata['prices']
@@ -456,7 +529,8 @@ def tail_analysis(simulated, metadata, tenor_idx=0, timestep_idx=-1, plot=True):
 
     Parameters
     ----------
-    simulated : np.ndarray, shape [timesteps, tenors, scenarios]
+    simulated : np.ndarray or pd.DataFrame
+        3D array [timesteps, tenors, scenarios] or RiskFlow-format DataFrame.
     metadata : dict
     tenor_idx : int
     timestep_idx : int — use -1 for final timestep
@@ -466,6 +540,7 @@ def tail_analysis(simulated, metadata, tenor_idx=0, timestep_idx=-1, plot=True):
     -------
     results : dict
     """
+    simulated = _to_3d_array(simulated, metadata)
     t_years, T_years = _get_time_tenor_arrays(metadata)
     params = metadata['params']
     F0 = metadata['prices']
@@ -652,13 +727,15 @@ def parameter_recovery(simulated, metadata, plot=True):
 
     Parameters
     ----------
-    simulated : np.ndarray, shape [timesteps, tenors, scenarios]
+    simulated : np.ndarray or pd.DataFrame
+        3D array [timesteps, tenors, scenarios] or RiskFlow-format DataFrame.
     metadata : dict
 
     Returns
     -------
     recovered : dict with keys sigma, alpha, drift, plus diagnostics
     """
+    simulated = _to_3d_array(simulated, metadata)
     t_years, T_years = _get_time_tenor_arrays(metadata)
     params = metadata['params']
     F0 = metadata['prices']
@@ -967,7 +1044,8 @@ def convergence_analysis(simulated, metadata, tenor_idx=0, timestep_idx=-1,
 
     Parameters
     ----------
-    simulated : np.ndarray
+    simulated : np.ndarray or pd.DataFrame
+        3D array [timesteps, tenors, scenarios] or RiskFlow-format DataFrame.
     metadata : dict
     tenor_idx : int
     timestep_idx : int (-1 for final)
@@ -978,6 +1056,7 @@ def convergence_analysis(simulated, metadata, tenor_idx=0, timestep_idx=-1,
     -------
     conv_df : pd.DataFrame
     """
+    simulated = _to_3d_array(simulated, metadata)
     t_years, T_years = _get_time_tenor_arrays(metadata)
     params = metadata['params']
     F0 = metadata['prices']
@@ -1085,7 +1164,8 @@ def standard_error_analysis(simulated, metadata, tenor_idx=0, timestep_idx=-1,
 
     Parameters
     ----------
-    simulated : np.ndarray
+    simulated : np.ndarray or pd.DataFrame
+        3D array [timesteps, tenors, scenarios] or RiskFlow-format DataFrame.
     metadata : dict
     tenor_idx, timestep_idx : int
     scenario_counts : list of int
@@ -1096,6 +1176,7 @@ def standard_error_analysis(simulated, metadata, tenor_idx=0, timestep_idx=-1,
     -------
     se_df : pd.DataFrame
     """
+    simulated = _to_3d_array(simulated, metadata)
     t_years, T_years = _get_time_tenor_arrays(metadata)
 
     if timestep_idx < 0:
@@ -1216,7 +1297,8 @@ def compare_simulations(sim_a, sim_b, metadata,
 
     Parameters
     ----------
-    sim_a, sim_b : np.ndarray, shape [timesteps, tenors, scenarios]
+    sim_a, sim_b : np.ndarray or pd.DataFrame
+        3D arrays [timesteps, tenors, scenarios] or RiskFlow-format DataFrames.
     metadata : dict
     labels : tuple of str
     tenor_idx, timestep_idx : int
@@ -1226,6 +1308,8 @@ def compare_simulations(sim_a, sim_b, metadata,
     -------
     comparison : dict
     """
+    sim_a = _to_3d_array(sim_a, metadata)
+    sim_b = _to_3d_array(sim_b, metadata)
     t_years, T_years = _get_time_tenor_arrays(metadata)
     F0 = metadata['prices']
 
@@ -1368,12 +1452,13 @@ def run_full_diagnostics(simulated, metadata, sim_benchmark=None,
 
     Parameters
     ----------
-    simulated : np.ndarray, shape [timesteps, tenors, scenarios]
-        Output from cs_simulation.run_simulation_from_json() or equivalent.
+    simulated : np.ndarray or pd.DataFrame
+        3D array [timesteps, tenors, scenarios] or RiskFlow-format DataFrame
+        (rows = MultiIndex(tenor, scenario), columns = dates).
     metadata : dict
         Must contain keys: params, scen_time_grid, tenors_excel,
                           base_date_excel, prices.
-    sim_benchmark : np.ndarray, optional
+    sim_benchmark : np.ndarray or pd.DataFrame, optional
         A second simulation (e.g. RiskFlow output) for comparison.
     benchmark_label : str
         Label for the benchmark simulation.
@@ -1384,6 +1469,9 @@ def run_full_diagnostics(simulated, metadata, sim_benchmark=None,
     -------
     results : dict with all diagnostic outputs
     """
+    simulated = _to_3d_array(simulated, metadata)
+    if sim_benchmark is not None:
+        sim_benchmark = _to_3d_array(sim_benchmark, metadata)
     results = {}
     n_tenors = simulated.shape[1]
 
