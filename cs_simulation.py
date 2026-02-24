@@ -722,28 +722,47 @@ def build_cholesky(correlation_dict, factor_names):
 # RANDOM NUMBER GENERATION — replicating calculation.py CMC_State.reset() (line 405)
 # =============================================================================
 
-def generate_random_numbers(cholesky_L, num_timesteps, batch_size, use_antithetic=False):
+def generate_random_numbers(cholesky_L, num_timesteps, batch_size,
+                            use_antithetic=False, dtype=torch.float64):
     """
     Replicates riskflow/calculation.py CMC_State.reset() (line 405).
 
-    1. Draw independent standard normals Z ~ N(0, I)
-    2. Correlate them: X = L @ Z
-    3. Reshape to [num_factors, num_timesteps, batch_size]
+    IMPORTANT: Uses torch.randn() (not np.random.randn) to match RiskFlow's
+    exact random number sequence. RiskFlow generates all random numbers via
+    PyTorch's RNG engine, so we must do the same for scenario-level reproducibility.
 
-    If antithetic sampling is enabled, generates batch_size/2 draws
-    and mirrors them: X_full = [X, -X].
+    Steps (matching reset() exactly):
+        1. Draw independent standard normals: torch.randn(num_factors, N, dtype=dtype)
+        2. Correlate: torch.matmul(cholesky, Z)
+        3. Reshape to [num_factors, num_timesteps, batch_size]
+        4. If antithetic: concat [X, -X] on scenario axis
+
+    The caller must have set torch.manual_seed() before calling this function,
+    exactly as RiskFlow does in CMC_State.__init__().
+
+    Parameters
+    ----------
+    dtype : torch.dtype
+        Precision for random number generation. RiskFlow defaults to torch.float32
+        (see calculation.py Calculation.__init__ line 202: prec=torch.float32).
+        Use torch.float32 for exact scenario-level matching with default RiskFlow.
+        Use torch.float64 for higher-precision standalone validation.
     """
     num_factors = cholesky_L.shape[0]
     sample_size = batch_size // 2 if use_antithetic else batch_size
 
-    Z = np.random.randn(num_factors, num_timesteps * sample_size)
-    X = cholesky_L @ Z
-    X = X.reshape(num_factors, num_timesteps, sample_size)
+    # Convert Cholesky to torch tensor (matches RiskFlow's self.t_cholesky)
+    t_cholesky = torch.tensor(cholesky_L, dtype=dtype)
+
+    # Draw and correlate — exactly as CMC_State.reset() lines 408-412
+    Z = torch.randn(num_factors, sample_size * num_timesteps, dtype=dtype)
+    correlated = torch.matmul(t_cholesky, Z).reshape(num_factors, num_timesteps, -1)
 
     if use_antithetic:
-        X = np.concatenate([X, -X], axis=2)
+        correlated = torch.concat([correlated, -correlated], dim=-1)
 
-    return X
+    # Return as numpy (float64) for downstream consumption
+    return correlated.numpy().astype(np.float64)
 
 
 # =============================================================================
@@ -808,7 +827,8 @@ def generate_paths(precalc, random_numbers, factor_index=0):
 def run_simulation_from_json(json_path, factor_name,
                              time_grid_string=None, max_date=None,
                              batch_size=1024, simulation_batches=4,
-                             use_antithetic=True, random_seed=42):
+                             use_antithetic=True, random_seed=42,
+                             precision=torch.float64):
     """
     Run a complete CS simulation using data loaded from a RiskFlow JSON file.
 
@@ -858,7 +878,10 @@ def run_simulation_from_json(json_path, factor_name,
             - Transposed so .T gives dates-as-rows (CSV export format)
     metadata : dict with run info
     """
-    np.random.seed(random_seed)
+    # Seed PyTorch's RNG exactly as RiskFlow does in CMC_State.__init__() (line 352):
+    #   torch.manual_seed(seed + job_id)
+    # For single-job runs, job_id = 0, so this matches directly.
+    torch.manual_seed(random_seed)
     total_scenarios = batch_size * simulation_batches
 
     print("=" * 70)
@@ -960,7 +983,8 @@ def run_simulation_from_json(json_path, factor_name,
     for batch in range(simulation_batches):
         # Each batch gets FRESH random numbers (like CMC_State.reset())
         random_numbers = generate_random_numbers(
-            L, num_timesteps, batch_size, use_antithetic=use_antithetic)
+            L, num_timesteps, batch_size, use_antithetic=use_antithetic,
+            dtype=precision)
         simulated = generate_paths(precalc, random_numbers, factor_index=0)
         batch_results.append(simulated)
 
@@ -1017,7 +1041,9 @@ def run_simulation_from_json(json_path, factor_name,
         Tmt = max((tenors_excel[tenor_idx] - base_date_excel) / DAYS_IN_YEAR - t_final, 0.0)
         ln_var = params['Sigma'] ** 2 * np.exp(-2.0 * params['Alpha'] * Tmt) * \
                  (1.0 - np.exp(-2.0 * params['Alpha'] * t_final)) / (2.0 * params['Alpha'])
-        theo_mean = F0 * np.exp(params['Drift'] * t_final + 0.5 * ln_var)
+        # E[F(t,T)] = F(0,T) * exp(mu*t) — the -0.5V in the drift cancels with +0.5V
+        # from the MGF of the lognormal (eq 1.116 in FIS Theory Guide)
+        theo_mean = F0 * np.exp(params['Drift'] * t_final)
         theo_std = theo_mean * np.sqrt(max(np.exp(ln_var) - 1.0, 0.0))
 
         delivery_years = (tenors_excel[tenor_idx] - base_date_excel) / DAYS_IN_YEAR
@@ -1171,7 +1197,8 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
                               max_date_str=None,
                               model_type='historical',
                               batch_size=1024, simulation_batches=4,
-                              use_antithetic=True, random_seed=42):
+                              use_antithetic=True, random_seed=42,
+                              precision=torch.float64):
     """
     Run a simulation with manually specified parameters, still using RiskFlow's
     exact time grid parsing, date handling, and batch loop.
@@ -1213,7 +1240,8 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
     scenario_df : pd.DataFrame — RiskFlow-format
     metadata : dict
     """
-    np.random.seed(random_seed)
+    # Seed PyTorch's RNG exactly as RiskFlow does (CMC_State.__init__ line 352)
+    torch.manual_seed(random_seed)
     total_scenarios = batch_size * simulation_batches
 
     base_date = pd.Timestamp(base_date_str)
@@ -1262,7 +1290,8 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
 
     for batch in range(simulation_batches):
         random_numbers = generate_random_numbers(
-            L, num_timesteps, batch_size, use_antithetic=use_antithetic)
+            L, num_timesteps, batch_size, use_antithetic=use_antithetic,
+            dtype=precision)
         simulated = generate_paths(precalc, random_numbers, factor_index=0)
         batch_results.append(simulated)
 
@@ -1305,7 +1334,8 @@ def run_simulation_standalone(base_date_str, delivery_dates_str, forward_prices,
         Tmt = max((tenors_excel[idx] - base_date_excel) / DAYS_IN_YEAR - t_final, 0.0)
         ln_var = sigma**2 * np.exp(-2.0 * alpha * Tmt) * \
                  (1.0 - np.exp(-2.0 * alpha * t_final)) / (2.0 * alpha)
-        theo_mean = F0 * np.exp(drift_mu * t_final + 0.5 * ln_var)
+        # E[F(t,T)] = F(0,T) * exp(mu*t) — Jensen correction cancels (eq 1.116)
+        theo_mean = F0 * np.exp(drift_mu * t_final)
         theo_std = theo_mean * np.sqrt(max(np.exp(ln_var) - 1.0, 0.0))
 
         print(f"  {str(delivery_dates[idx].date()):>12s}  {F0:8.2f}  {np.mean(sim_F):10.4f}  "
@@ -1391,7 +1421,8 @@ def plot_results(simulated, scen_time_grid, tenors_excel, prices, base_date_exce
 def run_multi_factor_simulation_from_json(json_path, factor_names,
                                           time_grid_string=None, max_date=None,
                                           batch_size=1024, simulation_batches=4,
-                                          use_antithetic=True, random_seed=42):
+                                          use_antithetic=True, random_seed=42,
+                                          precision=torch.float64):
     """
     Simulate multiple correlated commodity forward prices from a JSON file.
 
@@ -1418,7 +1449,8 @@ def run_multi_factor_simulation_from_json(json_path, factor_names,
     scenario_dfs : dict of {factor_name: pd.DataFrame} — RiskFlow-format DataFrames
     metadata_dict : dict of {factor_name: metadata}
     """
-    np.random.seed(random_seed)
+    # Seed PyTorch's RNG exactly as RiskFlow does (CMC_State.__init__ line 352)
+    torch.manual_seed(random_seed)
     total_scenarios = batch_size * simulation_batches
 
     print("=" * 70)
@@ -1487,7 +1519,8 @@ def run_multi_factor_simulation_from_json(json_path, factor_names,
 
     for _ in range(simulation_batches):
         random_numbers = generate_random_numbers(
-            L, num_timesteps, batch_size, use_antithetic=use_antithetic)
+            L, num_timesteps, batch_size, use_antithetic=use_antithetic,
+            dtype=precision)
 
         for idx, fname in enumerate(factor_names):
             simulated = generate_paths(precalcs[fname], random_numbers, factor_index=idx)
