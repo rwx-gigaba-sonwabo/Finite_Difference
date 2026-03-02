@@ -1188,6 +1188,326 @@ def export_scenarios_csv(scenario_df, filepath, factor_name=None):
 
 
 # =============================================================================
+# RISKFLOW OUTPUT LOADING & COMPARISON
+# =============================================================================
+
+def load_riskflow_scenarios(riskflow_output, factor_name):
+    """
+    Extract the scenario DataFrame for a given factor from RiskFlow's calculation output.
+
+    Usage:
+        # After running RiskFlow:
+        #   out = calculation.execute(params)
+        # Extract scenarios:
+        rf_df = load_riskflow_scenarios(out, 'ForwardPrice.BRENT.OIL')
+
+    Handles the nested dict structure:
+        out['Results']['scenarios'][factor_name] → pd.DataFrame
+
+    Parameters
+    ----------
+    riskflow_output : dict
+        The output dict returned by Credit_Monte_Carlo.execute().
+        Can also be the inner 'Results' dict, or the 'scenarios' dict directly.
+    factor_name : str
+        Factor name, e.g. 'ForwardPrice.BRENT.OIL'.
+
+    Returns
+    -------
+    pd.DataFrame in RiskFlow scenario format:
+        rows = MultiIndex (tenor, scenario), columns = dates.
+    """
+    # Navigate the nested output structure
+    if isinstance(riskflow_output, pd.DataFrame):
+        return riskflow_output
+
+    scenarios = None
+    if 'Results' in riskflow_output:
+        scenarios = riskflow_output['Results'].get('scenarios', {})
+    elif 'scenarios' in riskflow_output:
+        scenarios = riskflow_output['scenarios']
+    else:
+        scenarios = riskflow_output
+
+    # Try exact match first
+    if factor_name in scenarios:
+        return scenarios[factor_name]
+
+    # Try partial match (factor_name might be stored with/without prefix)
+    for key, df in scenarios.items():
+        if factor_name in str(key) or str(key) in factor_name:
+            print(f"  Matched '{factor_name}' to key '{key}'")
+            return df
+
+    available = list(scenarios.keys())
+    raise KeyError(
+        f"No scenarios found for '{factor_name}'. "
+        f"Available factors: {available}")
+
+
+def compare_scenario_outputs(df_validation, df_riskflow,
+                             metadata=None,
+                             labels=('Validation', 'RiskFlow'),
+                             plot=True):
+    """
+    Comprehensive side-by-side comparison of two simulation outputs.
+
+    Both inputs must be in RiskFlow's scenario DataFrame format:
+        rows = MultiIndex (tenor, scenario)
+        columns = DatetimeIndex (scenario dates)
+
+    This replicates the kind of comparison RiskFlow would perform internally:
+        1. Shape and structure verification
+        2. Per-tenor summary statistics at each scenario date
+        3. Path-by-path differences (if same scenario count → same-seed comparison)
+        4. Distributional comparison (moments and quantiles)
+
+    Parameters
+    ----------
+    df_validation : pd.DataFrame
+        Output from cs_simulation (or any RiskFlow-format DataFrame).
+    df_riskflow : pd.DataFrame
+        Output from RiskFlow's calculation (loaded via load_riskflow_scenarios).
+    metadata : dict, optional
+        Metadata from cs_simulation with params, base_date_excel, etc.
+    labels : tuple of str
+        Names for the two outputs.
+    plot : bool
+        Whether to generate comparison plots.
+
+    Returns
+    -------
+    dict with comparison results.
+    """
+    from scipy import stats as sp_stats
+
+    print("=" * 90)
+    print(f"SCENARIO COMPARISON: {labels[0]} vs {labels[1]}")
+    print("=" * 90)
+
+    print(f"\n  {labels[0]} shape: {df_validation.shape}")
+    print(f"  {labels[1]} shape: {df_riskflow.shape}")
+
+    tenors_v = df_validation.index.get_level_values(0).unique()
+    tenors_r = df_riskflow.index.get_level_values(0).unique()
+    scens_v = df_validation.index.get_level_values(1).unique()
+    scens_r = df_riskflow.index.get_level_values(1).unique()
+    dates_v = df_validation.columns
+    dates_r = df_riskflow.columns
+
+    print(f"\n  Tenors:    {labels[0]}={len(tenors_v)},  {labels[1]}={len(tenors_r)}")
+    print(f"  Scenarios: {labels[0]}={len(scens_v)},  {labels[1]}={len(scens_r)}")
+    print(f"  Dates:     {labels[0]}={len(dates_v)},  {labels[1]}={len(dates_r)}")
+
+    # Find common structure
+    common_tenors = sorted(set(tenors_v) & set(tenors_r))
+    common_dates = sorted(set(dates_v) & set(dates_r))
+    same_scenario_count = (len(scens_v) == len(scens_r))
+
+    if not common_tenors:
+        print("\n  ERROR: No common tenors found. Cannot compare.")
+        return {'error': 'no_common_tenors'}
+    if not common_dates:
+        print("\n  ERROR: No common dates found. Cannot compare.")
+        return {'error': 'no_common_dates'}
+
+    print(f"\n  Common tenors: {len(common_tenors)}")
+    print(f"  Common dates:  {len(common_dates)}")
+    print(f"  Same scenario count: {same_scenario_count}")
+
+    print(f"\n  {'':=<90s}")
+    print(f"  MOMENT COMPARISON (cross-scenario statistics at each date)")
+    print(f"  {'':=<90s}")
+
+    moment_records = []
+    for tenor in common_tenors:
+        for date in common_dates:
+            vals_v = df_validation.loc[tenor, :][date].values if isinstance(
+                df_validation.loc[tenor, :][date], pd.Series) else np.array([df_validation.loc[tenor, :][date]])
+            vals_r = df_riskflow.loc[tenor, :][date].values if isinstance(
+                df_riskflow.loc[tenor, :][date], pd.Series) else np.array([df_riskflow.loc[tenor, :][date]])
+
+            moment_records.append({
+                'tenor': tenor,
+                'date': date,
+                'mean_val': np.mean(vals_v),
+                'mean_rf': np.mean(vals_r),
+                'mean_diff': np.mean(vals_v) - np.mean(vals_r),
+                'std_val': np.std(vals_v, ddof=1),
+                'std_rf': np.std(vals_r, ddof=1),
+                'std_diff': np.std(vals_v, ddof=1) - np.std(vals_r, ddof=1),
+                'p5_val': np.percentile(vals_v, 5),
+                'p5_rf': np.percentile(vals_r, 5),
+                'p95_val': np.percentile(vals_v, 95),
+                'p95_rf': np.percentile(vals_r, 95),
+            })
+
+    moment_df = pd.DataFrame(moment_records)
+
+    # Print summary per tenor (last date only for brevity)
+    print(f"\n  Summary at final common date ({common_dates[-1]}):")
+    print(f"  {'Tenor':>12s}  {'Mean Val':>10s}  {'Mean RF':>10s}  {'Diff':>10s}  "
+          f"{'Std Val':>10s}  {'Std RF':>10s}  {'Std Diff':>10s}")
+    print("  " + "-" * 78)
+
+    for tenor in common_tenors:
+        row = moment_df[(moment_df['tenor'] == tenor) &
+                        (moment_df['date'] == common_dates[-1])]
+        if row.empty:
+            continue
+        r = row.iloc[0]
+        print(f"  {tenor:12.1f}  {r['mean_val']:10.4f}  {r['mean_rf']:10.4f}  {r['mean_diff']:10.6f}  "
+              f"{r['std_val']:10.4f}  {r['std_rf']:10.4f}  {r['std_diff']:10.6f}")
+
+    path_results = {}
+    if same_scenario_count:
+        print(f"\n  {'':=<90s}")
+        print(f"  PATH-LEVEL COMPARISON (scenario-by-scenario, same seed assumed)")
+        print(f"  {'':=<90s}")
+
+        print(f"\n  {'Tenor':>12s}  {'Date':>12s}  {'MaxAbsDiff':>12s}  {'MeanAbsDiff':>11s}  "
+              f"{'MaxRelDiff':>12s}  {'MeanRelDiff':>11s}  {'Corr':>10s}")
+        print("  " + "-" * 85)
+
+        for tenor in common_tenors:
+            # Show a few dates (first, mid, last)
+            date_indices = [0, len(common_dates) // 2, -1]
+            for di in date_indices:
+                date = common_dates[di]
+                vals_v = df_validation.loc[tenor, :][date].values
+                vals_r = df_riskflow.loc[tenor, :][date].values
+
+                abs_diff = np.abs(vals_v - vals_r)
+                rel_diff = abs_diff / np.maximum(np.abs(vals_r), 1e-10)
+                corr = np.corrcoef(vals_v, vals_r)[0, 1] if len(vals_v) > 1 else np.nan
+
+                path_results[(tenor, date)] = {
+                    'max_abs_diff': float(np.max(abs_diff)),
+                    'mean_abs_diff': float(np.mean(abs_diff)),
+                    'max_rel_diff': float(np.max(rel_diff)),
+                    'mean_rel_diff': float(np.mean(rel_diff)),
+                    'correlation': float(corr),
+                }
+
+                date_str = str(date.date()) if hasattr(date, 'date') else str(date)[:10]
+                print(f"  {tenor:12.1f}  {date_str:>12s}  {np.max(abs_diff):12.6f}  "
+                      f"{np.mean(abs_diff):11.6f}  {np.max(rel_diff):12.2e}  "
+                      f"{np.mean(rel_diff):11.2e}  {corr:10.8f}")
+
+        # Overall summary
+        all_abs = [v['max_abs_diff'] for v in path_results.values()]
+        all_rel = [v['max_rel_diff'] for v in path_results.values()]
+        all_corr = [v['correlation'] for v in path_results.values()]
+
+        print(f"\n  Overall path-level summary:")
+        print(f"    Max absolute diff across all tenors/dates:  {max(all_abs):.8f}")
+        print(f"    Max relative diff across all tenors/dates:  {max(all_rel):.2e}")
+        print(f"    Min correlation across all tenors/dates:    {min(all_corr):.10f}")
+
+        tol = 1e-6
+        match = max(all_abs) < tol
+        print(f"\n    VERDICT: {'MATCH' if match else 'MISMATCH'} "
+              f"(tolerance = {tol:.0e}, max abs diff = {max(all_abs):.2e})")
+
+    else:
+        # Different scenario counts — distributional comparison only
+        print(f"\n  Different scenario counts ({len(scens_v)} vs {len(scens_r)}).")
+        print(f"  Path-level comparison skipped. Using distributional (KS) tests instead.")
+
+        print(f"\n  {'Tenor':>12s}  {'Date':>12s}  {'KS stat':>10s}  {'KS p-val':>10s}  {'Result':>12s}")
+        print("  " + "-" * 62)
+
+        for tenor in common_tenors:
+            for di in [0, len(common_dates) // 2, -1]:
+                date = common_dates[di]
+                vals_v = df_validation.loc[tenor, :][date].values
+                vals_r = df_riskflow.loc[tenor, :][date].values
+
+                ks_stat, ks_p = sp_stats.ks_2samp(vals_v, vals_r)
+                result = 'MATCH' if ks_p > 0.05 else 'DIFFER'
+
+                date_str = str(date.date()) if hasattr(date, 'date') else str(date)[:10]
+                print(f"  {tenor:12.1f}  {date_str:>12s}  {ks_stat:10.4f}  {ks_p:10.4f}  {result:>12s}")
+
+    # ---- 4. Plots ----
+    if plot and common_tenors and common_dates:
+        _plot_scenario_comparison(
+            df_validation, df_riskflow, common_tenors, common_dates,
+            labels, same_scenario_count, metadata)
+
+    print("=" * 90)
+
+    return {
+        'moment_df': moment_df,
+        'path_results': path_results if same_scenario_count else None,
+        'common_tenors': common_tenors,
+        'common_dates': common_dates,
+        'same_scenario_count': same_scenario_count,
+    }
+
+
+def _plot_scenario_comparison(df_v, df_r, tenors, dates, labels,
+                              same_seed, metadata):
+    """Plot comparison charts: path scatter, distribution overlay, moment drift."""
+    n_tenors = min(len(tenors), 4)
+    n_cols = 3 if same_seed else 2
+
+    fig, axes = plt.subplots(n_tenors, n_cols, figsize=(5 * n_cols, 4 * n_tenors),
+                             squeeze=False)
+    fig.suptitle(f'{labels[0]} vs {labels[1]} — Scenario Comparison', fontsize=13)
+
+    final_date = dates[-1]
+
+    for row, tenor in enumerate(tenors[:n_tenors]):
+        vals_v = df_v.loc[tenor, :][final_date].values
+        vals_r = df_r.loc[tenor, :][final_date].values
+
+        # Column 0: Distribution overlay (histogram)
+        ax = axes[row, 0]
+        lo = min(vals_v.min(), vals_r.min())
+        hi = max(vals_v.max(), vals_r.max())
+        bins = np.linspace(lo, hi, 60)
+        ax.hist(vals_v, bins=bins, density=True, alpha=0.5, label=labels[0], color='steelblue')
+        ax.hist(vals_r, bins=bins, density=True, alpha=0.5, label=labels[1], color='coral')
+        ax.set_title(f'Tenor {tenor:.0f} — Distribution')
+        ax.set_xlabel('Forward Price')
+        ax.set_ylabel('Density')
+        if row == 0:
+            ax.legend(fontsize=8)
+
+        # Column 1: Mean path over time
+        ax = axes[row, 1]
+        means_v, means_r = [], []
+        for d in dates:
+            means_v.append(df_v.loc[tenor, :][d].mean())
+            means_r.append(df_r.loc[tenor, :][d].mean())
+
+        date_floats = np.arange(len(dates))
+        ax.plot(date_floats, means_v, 'o-', markersize=2, label=labels[0], color='steelblue')
+        ax.plot(date_floats, means_r, 's-', markersize=2, label=labels[1], color='coral')
+        ax.set_title(f'Tenor {tenor:.0f} — Mean Path')
+        ax.set_xlabel('Date Index')
+        ax.set_ylabel('Mean F(t,T)')
+        if row == 0:
+            ax.legend(fontsize=8)
+
+        # Column 2: Path scatter (only if same seed)
+        if same_seed and n_cols > 2:
+            ax = axes[row, 2]
+            n_show = min(len(vals_v), len(vals_r), 5000)
+            ax.scatter(vals_v[:n_show], vals_r[:n_show], s=1, alpha=0.15, color='steelblue')
+            lims = [min(vals_v.min(), vals_r.min()), max(vals_v.max(), vals_r.max())]
+            ax.plot(lims, lims, 'r--', linewidth=1)
+            ax.set_title(f'Tenor {tenor:.0f} — Path Scatter')
+            ax.set_xlabel(labels[0])
+            ax.set_ylabel(labels[1])
+
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
+# =============================================================================
 # STANDALONE SIMULATION (no JSON needed)
 # =============================================================================
 
