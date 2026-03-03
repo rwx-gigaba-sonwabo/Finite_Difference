@@ -850,6 +850,29 @@ def parameter_recovery(simulated, metadata, plot=True):
 
     vol_recovered = np.median(vol_estimates) if vol_estimates else np.nan
 
+    # --- Compute accuracy metrics ---
+    accuracy = []
+    for name, key, true_val, rec_val in [
+        ('Sigma (OU vol)', 'sigma', params['Sigma'], sigma_recovered),
+        ('Alpha (mean reversion)', 'alpha', params['Alpha'], alpha_recovered),
+        ('Drift (mu)', 'drift', params['Drift'], drift_recovered),
+        ('Annualised logret vol (*)', 'vol_annualised', np.nan, vol_recovered),
+    ]:
+        if np.isnan(true_val):
+            rel_err = np.nan
+            abs_err = np.nan
+        else:
+            abs_err = rec_val - true_val
+            rel_err = abs_err / abs(true_val) * 100 if abs(true_val) > 1e-10 else np.nan
+        accuracy.append({
+            'name': name,
+            'key': key,
+            'input': true_val,
+            'recovered': rec_val,
+            'abs_error': abs_err,
+            'rel_error_pct': rel_err,
+        })
+
     # --- Print results ---
     print("=" * 70)
     print("PARAMETER RECOVERY FROM SIMULATED PATHS")
@@ -860,18 +883,12 @@ def parameter_recovery(simulated, metadata, plot=True):
     print(f"  {'Parameter':<30s}  {'Input':>10s}  {'Recovered':>10s}  {'Rel Err':>10s}")
     print("  " + "-" * 65)
 
-    for name, true_val, rec_val in [
-        ('Sigma (OU vol)', params['Sigma'], sigma_recovered),
-        ('Alpha (mean reversion)', params['Alpha'], alpha_recovered),
-        ('Drift (mu)', params['Drift'], drift_recovered),
-        ('Annualised logret vol (*)', np.nan, vol_recovered),
-    ]:
-        if np.isnan(true_val):
-            print(f"  {name:<30s}  {'n/a':>10s}  {rec_val:10.6f}  {'n/a':>10s}")
+    for entry in accuracy:
+        if np.isnan(entry['input']):
+            print(f"  {entry['name']:<30s}  {'n/a':>10s}  {entry['recovered']:10.6f}  {'n/a':>10s}")
         else:
-            err = (rec_val - true_val) / abs(true_val) * 100 if abs(true_val) > 1e-10 else np.nan
-            err_str = f'{err:.2f}%' if not np.isnan(err) else 'n/a'
-            print(f"  {name:<30s}  {true_val:10.6f}  {rec_val:10.6f}  {err_str:>10s}")
+            err_str = f"{entry['rel_error_pct']:.2f}%" if not np.isnan(entry['rel_error_pct']) else 'n/a'
+            print(f"  {entry['name']:<30s}  {entry['input']:10.6f}  {entry['recovered']:10.6f}  {err_str:>10s}")
 
     print()
     if alpha_estimates:
@@ -898,6 +915,7 @@ def parameter_recovery(simulated, metadata, plot=True):
         'drift_estimates': drift_estimates,
         'vol_surface': vol_surface,
         'mean_surface': mean_surface,
+        'accuracy': accuracy,
     }
 
     if plot:
