@@ -2,13 +2,12 @@ import math
 import datetime as _dt
 from typing import List, Optional, Tuple, Literal, Dict, Any
 import pandas as pd
+import numpy as np
 
-# ---------------------------- Utility ----------------------------
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-# ---------------------------- Class ----------------------------
 
 OptionType = Literal["call", "put"]
 BarrierKind = Literal[
@@ -61,6 +60,17 @@ class DiscreteBarrierBGKPricer:
         include_expiry_monitor: bool = True,
         use_mean_sqrt_dt: bool = False,
         theta_from_forward: bool = False,  # False => μ = r - q (PDE carry), to match FA
+        # Pricing method: "bgk" | "mc" | "auto"
+        # "auto" → BGK when monitoring freq >= bgk_min_freq dates/year, else Monte Carlo
+        pricing_method: Literal["bgk", "mc", "auto"] = "auto",
+        bgk_min_freq: float = 20.0,       # monitoring dates/year threshold; >= → BGK, < → MC
+        mc_n_paths: int = 100_000,        # MC simulation paths
+        mc_seed: Optional[int] = 42,      # RNG seed (None = non-reproducible)
+        mc_use_antithetic: bool = True,   # antithetic variates for variance reduction
+        # Settlement lags (business days) — mirrors fd_american_equity pattern
+        underlying_spot_days: int = 0,     # spot lag for carry/forward period
+        option_days: int = 0,              # settlement start lag for discount period
+        option_settlement_days: int = 0,   # settlement end lag at option maturity
         # Trade/meta
         trade_id: str = "T-0001",
         direction: Literal["long", "short"] = "long",
@@ -88,47 +98,96 @@ class DiscreteBarrierBGKPricer:
         self.barrier_hit_date = barrier_hit_date
 
         self.discount_curve_df = discount_curve.copy() if discount_curve is not None else None
-        self.forward_curve_df  = forward_curve.copy() if forward_curve is not None else None
+        self.forward_curve_df = forward_curve.copy() if forward_curve is not None else None
         self.dividend_schedule = sorted(dividend_schedule or [], key=lambda x: x[0])
 
         self.sigma = float(volatility)
         self.day_count = day_count.upper()
+        self._year_denominator = self._infer_denominator(self.day_count)
+
+        # Settlement lag parameters (mirrors fd_american_equity)
+        self.underlying_spot_days  = int(underlying_spot_days)
+        self.option_days           = int(option_days)
+        self.option_settlement_days = int(option_settlement_days)
 
         self.include_expiry_monitor = include_expiry_monitor
         self.use_mean_sqrt_dt = use_mean_sqrt_dt
         self.theta_from_forward = theta_from_forward
+
+        self.pricing_method = pricing_method
+        self.bgk_min_freq = float(bgk_min_freq)
+        self.mc_n_paths = int(mc_n_paths)
+        self.mc_seed = mc_seed
+        self.mc_use_antithetic = bool(mc_use_antithetic)
+        self._last_mc_std_error: float = 0.0   # updated after each MC call for diagnostics
 
         self.trade_id = trade_id
         self.direction = direction
         self.quantity = int(quantity)
         self.contract_multiplier = float(contract_multiplier)
 
-        # Times
-        self.tenor_years = self._year_fraction(self.valuation_date, self.maturity_date)  # T
-        self.discount_years = self.tenor_years  # settle at expiry; adjust if needed
+        # Settlement dates (business-day adjusted, mirrors fd_american_equity)
+        _need_cal = (self.underlying_spot_days > 0
+                     or self.option_days > 0
+                     or self.option_settlement_days > 0)
+        if _need_cal:
+            try:
+                from workalendar.africa import SouthAfrica as _Cal
+                _cal = _Cal()
+                self.carry_start_date    = _cal.add_working_days(self.valuation_date, self.underlying_spot_days)
+                self.carry_end_date      = _cal.add_working_days(self.maturity_date,  self.underlying_spot_days)
+                self.discount_start_date = _cal.add_working_days(self.valuation_date, self.option_days)
+                self.discount_end_date   = _cal.add_working_days(self.maturity_date,  self.option_settlement_days)
+            except ImportError as _exc:
+                raise RuntimeError(
+                    "workalendar is required for non-zero settlement lags. "
+                    "Install with: pip install workalendar"
+                ) from _exc
+        else:
+            # No lags: carry and discount windows equal the option life
+            self.carry_start_date    = self.valuation_date
+            self.carry_end_date      = self.maturity_date
+            self.discount_start_date = self.valuation_date
+            self.discount_end_date   = self.maturity_date
 
-        # Curves -> flat rates
-        DF_T_disc = self._df_from_curve(self.discount_curve_df, self.maturity_date) if self.discount_curve_df is not None else 1.0
-        self.discount_rate = -math.log(max(DF_T_disc, 1e-16)) / max(self.discount_years, EPS)
+        # Three separate time measures (mirrors fd_american_equity exactly)
+        #   time_to_expiry  → σ√T for vol; simulation horizon; monitor schedule
+        #   time_to_carry   → forward price / cost-of-carry calculation
+        #   time_to_discount → discount-factor calculation
+        self.time_to_expiry   = self._year_fraction(self.valuation_date,    self.maturity_date)
+        self.time_to_carry    = self._year_fraction(self.carry_start_date,  self.carry_end_date)
+        self.time_to_discount = self._year_fraction(self.discount_start_date, self.discount_end_date)
 
-        # Carry curve: if not provided, fall back to discount curve
-        carry_curve = self.forward_curve_df if self.forward_curve_df is not None else self.discount_curve_df
-        DF_T_carry = self._df_from_curve(carry_curve, self.maturity_date) if carry_curve is not None else 1.0
-        self.carry_rate_nacc = -math.log(max(DF_T_carry, 1e-16)) / max(self.tenor_years, EPS)
+        # Backward-compat aliases so all existing formula code is unaffected
+        self.tenor_years    = self.time_to_expiry
+        self.discount_years = self.time_to_discount
 
-        # Dividend flat q via PV escrow
+        # Forward NACC rates over each window (mirrors fd_american_equity's
+        # get_forward_nacc_rate pattern: -ln(DF_far/DF_near) / tau)
+        self.discount_rate_nacc = (
+            self.get_forward_nacc_rate(self.discount_start_date, self.discount_end_date)
+            if self.discount_curve_df is not None else 0.0
+        )
+        self.discount_rate = self.discount_rate_nacc   # backward-compat alias
+
+        _carry_curve_df = self.forward_curve_df if self.forward_curve_df is not None else self.discount_curve_df
+        self.carry_rate_nacc = (
+            self.get_forward_nacc_rate(self.carry_start_date, self.carry_end_date,
+                                       curve_df=_carry_curve_df)
+            if _carry_curve_df is not None else self.discount_rate_nacc
+        )
+
+        # Dividend flat q via PV escrow (unchanged logic)
         self.div_yield_nacc = self._dividend_yield_nacc()
 
-        # Effective S for forward calc (Black-76 presentation)
-        self.spot_price_eff = self.spot_price * math.exp(-self.div_yield_nacc * self.tenor_years)
-        self.forward_price = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.tenor_years)
+        # Effective S and forward price — use time_to_carry for the carry window
+        self.spot_price_eff = self.spot_price * math.exp(-self.div_yield_nacc * self.time_to_carry)
+        self.forward_price  = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.time_to_carry)
 
         # Monitoring Δt (years) from schedule
         self._dt_years = self._compute_dt_years_from_schedule()
         # Effective m
         self.m = len(self._dt_years) if self._dt_years is not None else self._heuristic_m()
-
-    # -------------------------- Public API --------------------------
 
     def price(self) -> float:
         """Total price incl. rebate leg (if any)."""
@@ -136,6 +195,11 @@ class DiscreteBarrierBGKPricer:
             px = self._vanilla_b76()
             return self._signed_scale(px)
 
+        # ---- Route to Monte Carlo or BGK ----
+        if self._select_method() == "mc":
+            return self._signed_scale(self._price_via_mc())
+
+        # ---- BGK path (original analytic logic) ----
         if self.barrier_type in ("up-and-out", "down-and-out"):
             side = "up" if "up" in self.barrier_type else "down"
             px_core = self._single_barrier_out_price(side)
@@ -206,21 +270,39 @@ class DiscreteBarrierBGKPricer:
         lines.append(f"Valuation Date     : {self.valuation_date.isoformat()}")
         lines.append(f"Maturity Date      : {self.maturity_date.isoformat()}")
         lines.append(f"Day Count          : {self.day_count}")
-        lines.append(f"T (years)          : {self.tenor_years:.8f}")
+        lines.append(f"Spot lag (carry)   : {self.underlying_spot_days}bd  "
+                     f"({self.carry_start_date.isoformat()} -> {self.carry_end_date.isoformat()})")
+        lines.append(f"Settlement (disc)  : {self.option_days}bd start / "
+                     f"{self.option_settlement_days}bd end  "
+                     f"({self.discount_start_date.isoformat()} -> {self.discount_end_date.isoformat()})")
+        lines.append(f"T expiry (years)   : {self.time_to_expiry:.8f}")
+        lines.append(f"T carry (years)    : {self.time_to_carry:.8f}")
+        lines.append(f"T discount (years) : {self.time_to_discount:.8f}")
         lines.append(f"Volatility (sigma) : {self.sigma:.8f}")
-        lines.append(f"Discount r (NACC)  : {self.discount_rate:.8f}")
-        lines.append(f"Carry (r_a) NACC   : {self.carry_rate_nacc:.8f}")
+        lines.append(f"Discount r (NACC)  : {self.discount_rate_nacc:.8f}  (fwd over discount window)")
+        lines.append(f"Carry r (NACC)     : {self.carry_rate_nacc:.8f}  (fwd over carry window)")
         lines.append(f"Dividend y (q)     : {self.div_yield_nacc:.8f}")
         lines.append(f"F0 (forward)       : {self.forward_price:.8f}")
         lines.append(f"m (monitors)       : {self.m}")
         lines.append(f"include_expiry_mon : {self.include_expiry_monitor}")
         lines.append(f"use_mean_sqrt_dt   : {self.use_mean_sqrt_dt}")
         lines.append(f"theta_from_forward : {self.theta_from_forward}")
+        # Pricing method
+        selected = self._select_method()
+        lines.append(f"pricing_method     : {self.pricing_method}  →  selected: {selected.upper()}")
+        lines.append(f"bgk_min_freq       : {self.bgk_min_freq:.1f} dates/yr  "
+                     f"(mon freq = {self.m / max(self.tenor_years, EPS):.1f}/yr)")
+        if selected == "mc":
+            lines.append(f"mc_n_paths         : {self.mc_n_paths:,}")
+            lines.append(f"mc_seed            : {self.mc_seed}")
+            lines.append(f"mc_use_antithetic  : {self.mc_use_antithetic}")
         lines.append("----------------------------------------")
 
         px = self.price()
         greeks = self.greeks()
         lines.append(f"Price              : {px:.10f}")
+        if selected == "mc":
+            lines.append(f"MC std error       : {self._last_mc_std_error:.2e}")
         lines.append(f"Delta              : {greeks['delta']:.10f}")
         lines.append(f"Gamma              : {greeks['gamma']:.10f}")
         lines.append(f"Vega               : {greeks['vega']:.10f}")
@@ -301,13 +383,57 @@ class DiscreteBarrierBGKPricer:
             return (1.0 + naca) ** (-tau)
         raise ValueError("Curve must have ('date','df') or ('Date','NACA').")
 
+    def get_discount_factor(self, lookup_date: _dt.date,
+                             curve_df: Optional[pd.DataFrame] = None) -> float:
+        """
+        Discount factor from valuation_date to lookup_date.
+
+        Mirrors fd_american_equity's get_discount_factor() but delegates to
+        _df_from_curve() so that both ('Date','NACA') and ('date','df') curve
+        formats are supported with graceful fallback (nearest prior date).
+
+        Parameters
+        ----------
+        lookup_date : date
+        curve_df : DataFrame, optional
+            Override the instance discount_curve_df (e.g. to use forward curve).
+        """
+        crv = curve_df if curve_df is not None else self.discount_curve_df
+        return self._df_from_curve(crv, lookup_date)
+
+    def get_forward_nacc_rate(self, start_date: _dt.date, end_date: _dt.date,
+                               curve_df: Optional[pd.DataFrame] = None) -> float:
+        """
+        Continuously-compounded forward rate between start_date and end_date.
+
+        Mirrors fd_american_equity's get_forward_nacc_rate():
+            r_fwd = -ln(DF(end) / DF(start)) / tau(start, end)
+
+        When start_date == valuation_date, DF(start) = 1 and this collapses to
+        the standard terminal spot rate. With settlement lags start_date differs
+        from valuation_date, giving the true forward rate over the settlement
+        window — the same rate that enters the PDE / Black-76 formula.
+
+        Parameters
+        ----------
+        start_date, end_date : date
+        curve_df : DataFrame, optional
+            Override the instance discount_curve_df (e.g. to use forward curve).
+        """
+        df_far  = self.get_discount_factor(end_date,   curve_df)
+        df_near = self.get_discount_factor(start_date, curve_df)
+        tau = self._year_fraction(start_date, end_date)
+        if tau <= EPS:
+            return 0.0
+        return -math.log(max(df_far / max(df_near, 1e-16), 1e-16)) / tau
+
     def _pv_dividends(self) -> float:
         if not self.dividend_schedule:
             return 0.0
         pv = 0.0
         for pay_date, amt in self.dividend_schedule:
             if self.valuation_date < pay_date <= self.maturity_date:
-                DF = self._df_from_curve(self.discount_curve_df, pay_date)
+                DF = self.get_discount_factor(pay_date)   # uses discount_curve_df
                 pv += float(amt) * DF
         return pv
 
@@ -320,17 +446,32 @@ class DiscreteBarrierBGKPricer:
             return 50.0
         return -math.log((self.spot_price - pvD) / self.spot_price) / max(self.tenor_years, EPS)
 
+    def _infer_denominator(self, day_count: str) -> int:
+        """Year denominator for ACT/* conventions (mirrors fd_american_equity)."""
+        if day_count in ("ACT/365", "ACT/365F"):
+            return 365
+        if day_count == "ACT/360":
+            return 360
+        if day_count == "ACT/364":
+            return 364
+        if day_count in ("30/360", "30E/360", "BOND", "US30/360"):
+            return 360
+        return 365   # safe default
+
     def _year_fraction(self, d0: _dt.date, d1: _dt.date) -> float:
-        days = max(0, (d1 - d0).days)
-        if self.day_count in ("ACT/365", "ACT/365F"):
-            return days / 365.0
-        if self.day_count in ("ACT/360",):
-            return days / 360.0
-        if self.day_count in ("30/360", "30E/360"):
-            y0, m0, dd0 = d0.year, d0.month, min(d0.day, 30)
-            y1, m1, dd1 = d1.year, d1.month, min(d1.day, 30)
+        """Year fraction between two dates under self.day_count (mirrors fd_american_equity)."""
+        if d1 <= d0:
+            return 0.0
+        if self.day_count in ("ACT/365", "ACT/365F", "ACT/360", "ACT/364"):
+            return (d1 - d0).days / float(self._year_denominator)
+        if self.day_count in ("30/360", "30E/360", "BOND", "US30/360"):
+            y0, m0, dd0 = d0.year, d0.month, d0.day
+            y1, m1, dd1 = d1.year, d1.month, d1.day
+            dd0 = min(dd0, 30)
+            if dd0 == 30:
+                dd1 = min(dd1, 30)
             return ((y1 - y0) * 360 + (m1 - m0) * 30 + (dd1 - dd0)) / 360.0
-        return days / 365.0
+        return (d1 - d0).days / 365.0
 
     # ------------------- Monitoring schedule -------------------
 
@@ -389,7 +530,9 @@ class DiscreteBarrierBGKPricer:
     def _thetas_at(self, T: float) -> Tuple[float, float]:
         sqrtT = math.sqrt(max(T, EPS))
         if self.theta_from_forward:
-            mu = math.log(self.forward_price / self.spot_price_eff) / max(self.tenor_years, EPS)
+            # Derive drift from the actual forward over the carry window
+            # (F = S_eff * exp(carry * T_carry) => ln(F/S_eff)/T_carry = carry_rate_nacc)
+            mu = math.log(self.forward_price / self.spot_price_eff) / max(self.time_to_carry, EPS)
         else:
             mu = (self.carry_rate_nacc - self.div_yield_nacc)
         theta0 = (mu - 0.5 * self.sigma * self.sigma) * sqrtT / self.sigma
@@ -438,6 +581,197 @@ class DiscreteBarrierBGKPricer:
         else:
             shift_mag = BETA_BGK / math.sqrt(m_t)
         return d_phi + sign * shift_mag
+
+    # ------------------- Method selection (BGK vs Monte Carlo) -------------------
+
+    def _select_method(self) -> str:
+        """
+        Return "bgk" or "mc".
+
+        Mirrors the RiskFlow intuition:
+          - Frequent monitoring (dense dates, daily-ish) → BGK correction to continuous
+            formula is accurate (Broadie–Glasserman–Kou 1997 convergence).
+          - Infrequent monitoring (few dates per year, monthly/quarterly) → the BGK
+            shift breaks down; Monte Carlo handles discrete hitting exactly.
+
+        Threshold: bgk_min_freq monitoring dates per year (default 20 ≈ fortnightly).
+        """
+        if self.pricing_method in ("bgk", "mc"):
+            return self.pricing_method
+        # "auto"
+        if self.m <= 0:
+            return "bgk"
+        freq = self.m / max(self.tenor_years, EPS)
+        return "bgk" if freq >= self.bgk_min_freq else "mc"
+
+    # ------------------- Monte Carlo helpers -------------------
+
+    def _mc_monitoring_times(self) -> List[float]:
+        """Cumulative monitoring times (years from valuation date)."""
+        if self._dt_years:
+            acc, times = 0.0, []
+            for dt in self._dt_years:
+                acc += dt
+                times.append(round(acc, 12))
+            return times
+        # Fallback: evenly-spaced m points
+        T, m = self.tenor_years, max(1, self.m)
+        return [round(T * k / m, 12) for k in range(1, m + 1)]
+
+    def _mc_out_price(self, effective_barrier_type: Optional[str] = None) -> float:
+        """
+        Vectorised Monte Carlo price for a discretely monitored OUT-type option.
+
+        Parameters:
+        
+        - effective_barrier_type : str, optional
+            Override the instance barrier_type.  Used when in-type parity requires
+            pricing the corresponding out-type (e.g. "up-and-out" for "up-and-in").
+
+        Returns:
+        - The raw discounted present value (no direction/quantity scaling).
+            Side-effect: updates self._last_mc_std_error.
+        """
+        btype = effective_barrier_type or self.barrier_type
+        T = self.tenor_years
+        DF_T = math.exp(-self.discount_rate * self.discount_years)
+
+        # GBM parameters under risk-neutral measure
+        mu  = self.carry_rate_nacc - self.div_yield_nacc   # spot drift
+        sig = self.sigma
+        S0  = self.spot_price
+        K   = self.strike_price
+        Hu  = self.upper_barrier
+        Hd  = self.lower_barrier
+
+        # ------ Build time grid ------
+        mon_times = self._mc_monitoring_times()   # cumulative monitoring times
+
+        # Merge monitoring times and maturity, deduplicate, keep sorted
+        raw = [0.0] + mon_times
+        if not mon_times or abs(mon_times[-1] - T) > 1e-10:
+            raw.append(T)
+        time_points = sorted(set(round(t, 10) for t in raw))
+
+        mon_set = {round(t, 10) for t in mon_times}
+        is_mon  = [round(tp, 10) in mon_set for tp in time_points]  # includes t=0 (False)
+
+        dts = np.diff(time_points)
+        n_steps = len(dts)
+        sqrt_dts = np.sqrt(np.maximum(dts, 0.0))
+
+        # ------ Simulate ------
+        rng = np.random.default_rng(self.mc_seed)
+        n_half = max(1, self.mc_n_paths // 2) if self.mc_use_antithetic else self.mc_n_paths
+        Z  = rng.standard_normal((n_half, n_steps))
+        if self.mc_use_antithetic:
+            Z = np.concatenate([Z, -Z], axis=0)  # antithetic pairs
+        n_sim = Z.shape[0]
+
+        # Log-spot increments and cumulative path
+        log_drift = (mu - 0.5 * sig * sig) * dts         # (n_steps,)
+        log_vol   = sig * sqrt_dts                         # (n_steps,)
+        log_incs  = log_drift[None, :] + log_vol[None, :] * Z  # (n_sim, n_steps)
+        log_S = np.log(S0) + np.concatenate(
+            [np.zeros((n_sim, 1)), np.cumsum(log_incs, axis=1)], axis=1
+        )  # (n_sim, n_time_points)
+        S_paths = np.exp(log_S)
+
+        # ------ Barrier knockout tracking ------
+        alive = np.ones(n_sim, dtype=bool)
+        rebate_pv = np.zeros(n_sim)   # PV of rebate-at-hit (accrued per path)
+
+        for col, (tp, mon_flag) in enumerate(zip(time_points, is_mon)):
+            if col == 0 or not mon_flag:
+                continue   # skip t=0 and non-monitoring time points
+
+            S_k = S_paths[:, col]
+
+            newly_ko = np.zeros(n_sim, dtype=bool)
+            if btype in ("up-and-out", "double-out") and Hu is not None:
+                newly_ko |= (S_k >= Hu)
+            if btype in ("down-and-out", "double-out") and Hd is not None:
+                newly_ko |= (S_k <= Hd)
+            newly_ko &= alive   # only freshly knocked
+
+            alive[newly_ko] = False
+
+            # Rebate paid at first touch
+            if self.rebate_at_hit and self.rebate_amount > 0.0 and newly_ko.any():
+                DF_k = math.exp(-self.discount_rate * tp)
+                rebate_pv[newly_ko] = self.rebate_amount * DF_k   # present-value rebate
+
+        # ------ Terminal payoff ------
+        S_mat = S_paths[:, -1]
+        if self.option_type == "call":
+            intrinsic = np.maximum(S_mat - K, 0.0)
+        else:
+            intrinsic = np.maximum(K - S_mat, 0.0)
+
+        option_payoff = np.where(alive, intrinsic, 0.0)
+
+        # ------ Combine option + rebate ------
+        if self.rebate_amount > 0.0 and self.rebate_at_hit:
+            # rebate_pv already in present-value terms; option payoff needs DF_T
+            mc_price = DF_T * float(np.mean(option_payoff)) + float(np.mean(rebate_pv))
+            # std error: approximate as option part only (rebate part is deterministic per path)
+            se_payoff = np.std(option_payoff, ddof=1) * DF_T / math.sqrt(n_sim)
+        elif self.rebate_amount > 0.0:
+            # Rebate paid at expiry to knocked-out paths
+            rebate_payoff = np.where(~alive, self.rebate_amount, 0.0)
+            total_payoff  = option_payoff + rebate_payoff
+            mc_price = DF_T * float(np.mean(total_payoff))
+            se_payoff = np.std(total_payoff, ddof=1) * DF_T / math.sqrt(n_sim)
+        else:
+            mc_price  = DF_T * float(np.mean(option_payoff))
+            se_payoff = np.std(option_payoff, ddof=1) * DF_T / math.sqrt(n_sim)
+
+        self._last_mc_std_error = float(se_payoff)
+        return mc_price
+
+    def _price_via_mc(self) -> float:
+        """
+        Route all barrier types to Monte Carlo.
+        Returns raw price (no direction/quantity scaling).
+
+        - OUT types    → _mc_out_price() directly.
+        - IN types     → vanilla Black-76 minus _mc_out_price() (put-call parity).
+        - Vanilla      → _vanilla_b76() (exact, no MC needed).
+        - already_hit  → 0 or discounted rebate (as for the BGK path).
+        """
+        if self.barrier_type == "none":
+            return self._vanilla_b76()
+
+        # Immediate knockout if spot is already beyond barrier
+        if self.barrier_type in ("up-and-out", "double-out"):
+            if self.upper_barrier is not None and self.spot_price >= self.upper_barrier:
+                return 0.0
+        if self.barrier_type in ("down-and-out", "double-out"):
+            if self.lower_barrier is not None and self.spot_price <= self.lower_barrier:
+                return 0.0
+
+        # Already hit (e.g. trade carried over a knocked-out barrier date)
+        if self.already_hit:
+            hit_date = self.barrier_hit_date or self.valuation_date
+            DF = self._df_from_curve(self.discount_curve_df, hit_date)
+            return self.rebate_amount * DF if self.rebate_amount > 0.0 else 0.0
+
+        if self.barrier_type in ("up-and-out", "down-and-out", "double-out"):
+            return self._mc_out_price()
+
+        if self.barrier_type in ("up-and-in", "down-and-in"):
+            # Parity: IN = Vanilla − OUT (same-direction OUT type)
+            out_type = "up-and-out" if "up" in self.barrier_type else "down-and-out"
+            vanilla  = self._vanilla_b76()
+            out_px   = self._mc_out_price(effective_barrier_type=out_type)
+            return vanilla - out_px
+
+        if self.barrier_type == "double-in":
+            vanilla = self._vanilla_b76()
+            out_px  = self._mc_out_price(effective_barrier_type="double-out")
+            return vanilla - out_px
+
+        raise ValueError(f"Unsupported barrier_type for MC: {self.barrier_type}")
 
     # ------------------- Single-barrier OUT -------------------
 
@@ -591,7 +925,7 @@ class DiscreteBarrierBGKPricer:
             S_k = self._survival_prob_to(side, T_k, k)
             p_k = max(0.0, S_prev - S_k)  # hazard mass in (t_{k-1}, t_k]
             # discount factor at date
-            DF_k = self._df_from_curve(self.discount_curve_df, d_k)
+            DF_k = self.get_discount_factor(d_k)
             contrib = self.rebate_amount * DF_k * p_k
             hazards.append((d_k, p_k, DF_k, contrib))
             pv_rebate += contrib
@@ -643,8 +977,8 @@ class DiscreteBarrierBGKPricer:
 
     def _refresh_for_spot_change(self) -> None:
         """Recompute derived quantities after S bump (for Greeks)."""
-        self.spot_price_eff = self.spot_price * math.exp(-self.div_yield_nacc * self.tenor_years)
-        self.forward_price = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.tenor_years)
+        self.spot_price_eff = self.spot_price * math.exp(-self.div_yield_nacc * self.time_to_carry)
+        self.forward_price  = self.spot_price_eff * math.exp(self.carry_rate_nacc * self.time_to_carry)
 
     def _signed_scale(self, px: float) -> float:
         sgn = 1.0 if self.direction == "long" else -1.0
