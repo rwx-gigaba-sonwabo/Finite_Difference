@@ -3,10 +3,86 @@ import datetime as _dt
 from typing import List, Optional, Tuple, Literal, Dict, Any
 import pandas as pd
 import numpy as np
+import torch
 
 
 def _norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+# ============================================================================
+# RISKFLOW-style Smoothing Functions (for differentiable Monte Carlo)
+# ============================================================================
+
+def smooth_relu(x, eps=0.005):
+    """
+    Smooth approximation of ReLU: max(x, 0).
+
+    Used by RISKFLOW for differentiable payoff calculations.
+    - x < -eps: returns 0
+    - x > eps: returns x
+    - |x| <= eps: smooth quadratic transition
+
+    Args:
+        x: torch.Tensor or np.ndarray
+        eps: smoothing bandwidth (default 0.005, matches RISKFLOW)
+    """
+    if isinstance(x, np.ndarray):
+        return np.where(x < -eps, 0.0,
+                       np.where(x > eps, x,
+                               (0.5 * x**2 + eps * x + 0.5 * eps**2) / (2 * eps)))
+    else:  # torch.Tensor
+        return torch.where(x < -eps, torch.zeros_like(x),
+                          torch.where(x > eps, x,
+                                     (0.5 * x**2 + eps * x + 0.5 * eps**2) / (2 * eps)))
+
+
+def smooth_heaviside_up(x, k, eps=0.01):
+    """
+    Smooth approximation of the up-barrier indicator: 𝟙{x >= k}.
+
+    Used by RISKFLOW for differentiable barrier breach detection.
+    - x < k - eps: returns 0
+    - x > k + eps: returns 1
+    - |x - k| <= eps: smooth linear transition
+
+    Args:
+        x: spot price (torch.Tensor or np.ndarray)
+        k: barrier level
+        eps: smoothing bandwidth (default 0.01, matches RISKFLOW)
+    """
+    if isinstance(x, np.ndarray):
+        return np.where(x < k - eps, 0.0,
+                       np.where(x > k + eps, 1.0,
+                               0.5 + (x - k) / (2.0 * eps)))
+    else:  # torch.Tensor
+        return torch.where(x < k - eps, torch.zeros_like(x),
+                          torch.where(x > k + eps, torch.ones_like(x),
+                                     0.5 + (x - k) / (2.0 * eps)))
+
+
+def smooth_heaviside_down(x, k, eps=0.01):
+    """
+    Smooth approximation of the down-barrier indicator: 𝟙{x <= k}.
+
+    Used by RISKFLOW for differentiable barrier breach detection.
+    - x < k - eps: returns 1
+    - x > k + eps: returns 0
+    - |x - k| <= eps: smooth linear transition
+
+    Args:
+        x: spot price (torch.Tensor or np.ndarray)
+        k: barrier level
+        eps: smoothing bandwidth (default 0.01, matches RISKFLOW)
+    """
+    if isinstance(x, np.ndarray):
+        return np.where(x < k - eps, 1.0,
+                       np.where(x > k + eps, 0.0,
+                               0.5 + (k - x) / (2.0 * eps)))
+    else:  # torch.Tensor
+        return torch.where(x < k - eps, torch.ones_like(x),
+                          torch.where(x > k + eps, torch.zeros_like(x),
+                                     0.5 + (k - x) / (2.0 * eps)))
 
 
 OptionType = Literal["call", "put"]
@@ -64,9 +140,12 @@ class DiscreteBarrierBGKPricer:
         # "auto" → BGK when monitoring freq >= bgk_min_freq dates/year, else Monte Carlo
         pricing_method: Literal["bgk", "mc", "auto"] = "auto",
         bgk_min_freq: float = 20.0,       # monitoring dates/year threshold; >= → BGK, < → MC
-        mc_n_paths: int = 100_000,        # MC simulation paths
+        mc_n_paths: int = 4096,           # MC simulation paths (default matches RISKFLOW: 1024*4)
         mc_seed: Optional[int] = 42,      # RNG seed (None = non-reproducible)
         mc_use_antithetic: bool = True,   # antithetic variates for variance reduction
+        mc_use_torch_rng: bool = True,    # Use PyTorch RNG (matches RISKFLOW) vs NumPy RNG
+        mc_smooth_barrier_eps: float = 0.01,   # ε for smooth_heaviside (RISKFLOW default)
+        mc_smooth_payoff_eps: float = 0.005,   # ε for smooth_relu (RISKFLOW default)
         # Settlement lags (business days) — mirrors fd_american_equity pattern
         underlying_spot_days: int = 0,     # spot lag for carry/forward period
         option_days: int = 0,              # settlement start lag for discount period
@@ -119,6 +198,9 @@ class DiscreteBarrierBGKPricer:
         self.mc_n_paths = int(mc_n_paths)
         self.mc_seed = mc_seed
         self.mc_use_antithetic = bool(mc_use_antithetic)
+        self.mc_use_torch_rng = bool(mc_use_torch_rng)
+        self.mc_smooth_barrier_eps = float(mc_smooth_barrier_eps)
+        self.mc_smooth_payoff_eps = float(mc_smooth_payoff_eps)
         self._last_mc_std_error: float = 0.0   # updated after each MC call for diagnostics
 
         self.trade_id = trade_id
@@ -296,6 +378,11 @@ class DiscreteBarrierBGKPricer:
             lines.append(f"mc_n_paths         : {self.mc_n_paths:,}")
             lines.append(f"mc_seed            : {self.mc_seed}")
             lines.append(f"mc_use_antithetic  : {self.mc_use_antithetic}")
+            lines.append(f"mc_use_torch_rng   : {self.mc_use_torch_rng}")
+            lines.append(f"mc_smooth_barrier  : ε={self.mc_smooth_barrier_eps:.4f} "
+                        f"({'RISKFLOW-style' if self.mc_smooth_barrier_eps > 0 else 'exact'})")
+            lines.append(f"mc_smooth_payoff   : ε={self.mc_smooth_payoff_eps:.4f} "
+                        f"({'RISKFLOW-style' if self.mc_smooth_payoff_eps > 0 else 'exact'})")
         lines.append("----------------------------------------")
 
         px = self.price()
@@ -661,12 +748,24 @@ class DiscreteBarrierBGKPricer:
         sqrt_dts = np.sqrt(np.maximum(dts, 0.0))
 
         # ------ Simulate ------
-        rng = np.random.default_rng(self.mc_seed)
-        n_half = max(1, self.mc_n_paths // 2) if self.mc_use_antithetic else self.mc_n_paths
-        Z  = rng.standard_normal((n_half, n_steps))
-        if self.mc_use_antithetic:
-            Z = np.concatenate([Z, -Z], axis=0)  # antithetic pairs
-        n_sim = Z.shape[0]
+        if self.mc_use_torch_rng:
+            # PyTorch RNG (matches RISKFLOW)
+            if self.mc_seed is not None:
+                torch.manual_seed(self.mc_seed)
+            n_half = max(1, self.mc_n_paths // 2) if self.mc_use_antithetic else self.mc_n_paths
+            Z_torch = torch.randn(n_half, n_steps, dtype=torch.float64)
+            if self.mc_use_antithetic:
+                Z_torch = torch.cat([Z_torch, -Z_torch], dim=0)
+            Z = Z_torch.numpy()
+            n_sim = Z.shape[0]
+        else:
+            # NumPy RNG (original implementation)
+            rng = np.random.default_rng(self.mc_seed)
+            n_half = max(1, self.mc_n_paths // 2) if self.mc_use_antithetic else self.mc_n_paths
+            Z  = rng.standard_normal((n_half, n_steps))
+            if self.mc_use_antithetic:
+                Z = np.concatenate([Z, -Z], axis=0)
+            n_sim = Z.shape[0]
 
         # Log-spot increments and cumulative path
         log_drift = (mu - 0.5 * sig * sig) * dts         # (n_steps,)
@@ -678,37 +777,89 @@ class DiscreteBarrierBGKPricer:
         S_paths = np.exp(log_S)
 
         # ------ Barrier knockout tracking ------
-        alive = np.ones(n_sim, dtype=bool)
-        rebate_pv = np.zeros(n_sim)   # PV of rebate-at-hit (accrued per path)
+        # Use smooth breach detection (RISKFLOW style) or exact comparisons
+        use_smooth = (self.mc_smooth_barrier_eps > 0.0)
 
-        for col, (tp, mon_flag) in enumerate(zip(time_points, is_mon)):
-            if col == 0 or not mon_flag:
-                continue   # skip t=0 and non-monitoring time points
+        if use_smooth:
+            # Smooth (differentiable) barrier breach tracking
+            # breached accumulates smoothly over time (can be fractional)
+            breached = np.zeros(n_sim)
+            rebate_pv = np.zeros(n_sim)
 
-            S_k = S_paths[:, col]
+            for col, (tp, mon_flag) in enumerate(zip(time_points, is_mon)):
+                if col == 0 or not mon_flag:
+                    continue
 
-            newly_ko = np.zeros(n_sim, dtype=bool)
-            if btype in ("up-and-out", "double-out") and Hu is not None:
-                newly_ko |= (S_k >= Hu)
-            if btype in ("down-and-out", "double-out") and Hd is not None:
-                newly_ko |= (S_k <= Hd)
-            newly_ko &= alive   # only freshly knocked
+                S_k = S_paths[:, col]
 
-            alive[newly_ko] = False
+                # Smooth breach indicator (returns values in [0, 1])
+                breach_event = np.zeros(n_sim)
+                if btype in ("up-and-out", "double-out") and Hu is not None:
+                    breach_event = np.maximum(breach_event,
+                                             smooth_heaviside_up(S_k, Hu, eps=self.mc_smooth_barrier_eps))
+                if btype in ("down-and-out", "double-out") and Hd is not None:
+                    breach_event = np.maximum(breach_event,
+                                             smooth_heaviside_down(S_k, Hd, eps=self.mc_smooth_barrier_eps))
 
-            # Rebate paid at first touch
-            if self.rebate_at_hit and self.rebate_amount > 0.0 and newly_ko.any():
-                DF_k = math.exp(-self.discount_rate * tp)
-                rebate_pv[newly_ko] = self.rebate_amount * DF_k   # present-value rebate
+                breached = breached + breach_event
+
+                # Rebate at hit (RISKFLOW comments this out, but we keep it for completeness)
+                # Note: RISKFLOW only pays rebate at expiry in practice
+                if self.rebate_at_hit and self.rebate_amount > 0.0:
+                    DF_k = math.exp(-self.discount_rate * tp)
+                    # Only accumulate rebate for paths that just breached
+                    newly_breached = np.maximum(0.0, breach_event - (rebate_pv > 0).astype(float))
+                    rebate_pv += newly_breached * self.rebate_amount * DF_k
+
+            # Survival probability (1 - breached), clamped to [0, 1]
+            alive_smooth = np.clip(1.0 - breached, 0.0, 1.0)
+
+        else:
+            # Exact (boolean) barrier breach tracking (original implementation)
+            alive = np.ones(n_sim, dtype=bool)
+            rebate_pv = np.zeros(n_sim)
+
+            for col, (tp, mon_flag) in enumerate(zip(time_points, is_mon)):
+                if col == 0 or not mon_flag:
+                    continue
+
+                S_k = S_paths[:, col]
+
+                newly_ko = np.zeros(n_sim, dtype=bool)
+                if btype in ("up-and-out", "double-out") and Hu is not None:
+                    newly_ko |= (S_k >= Hu)
+                if btype in ("down-and-out", "double-out") and Hd is not None:
+                    newly_ko |= (S_k <= Hd)
+                newly_ko &= alive
+
+                alive[newly_ko] = False
+
+                # Rebate paid at first touch
+                if self.rebate_at_hit and self.rebate_amount > 0.0 and newly_ko.any():
+                    DF_k = math.exp(-self.discount_rate * tp)
+                    rebate_pv[newly_ko] = self.rebate_amount * DF_k
+
+            alive_smooth = alive.astype(float)
 
         # ------ Terminal payoff ------
         S_mat = S_paths[:, -1]
-        if self.option_type == "call":
-            intrinsic = np.maximum(S_mat - K, 0.0)
-        else:
-            intrinsic = np.maximum(K - S_mat, 0.0)
 
-        option_payoff = np.where(alive, intrinsic, 0.0)
+        # Use smooth payoff (RISKFLOW style) or exact max
+        if self.mc_smooth_payoff_eps > 0.0:
+            # Smooth ReLU (differentiable)
+            if self.option_type == "call":
+                intrinsic = smooth_relu(S_mat - K, eps=self.mc_smooth_payoff_eps)
+            else:
+                intrinsic = smooth_relu(K - S_mat, eps=self.mc_smooth_payoff_eps)
+        else:
+            # Exact max (original)
+            if self.option_type == "call":
+                intrinsic = np.maximum(S_mat - K, 0.0)
+            else:
+                intrinsic = np.maximum(K - S_mat, 0.0)
+
+        # Weight payoff by survival probability (smooth or exact)
+        option_payoff = alive_smooth * intrinsic
 
         # ------ Combine option + rebate ------
         if self.rebate_amount > 0.0 and self.rebate_at_hit:
