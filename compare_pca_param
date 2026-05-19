@@ -1,0 +1,207 @@
+def compare_pca_params(calibrated_param, extracted_param, asset_name, output_path=None):
+    """
+    Compare calibrated PCA parameters against extracted MarketData.json parameters.
+    
+    Args:
+        calibrated_param : OrderedDict from calibrate_pca_interest_rate()
+        extracted_param  : dict from extract_pca_params()[asset_name]
+        asset_name       : str, used for labelling in output
+        output_path      : optional CSV filepath e.g. r"C:\XVA_engine\pca_comparison.csv"
+    
+    Returns:
+        pd.DataFrame with columns:
+            Parameter, Tenor, Calibrated, Extracted, Abs_Diff, Rel_Diff_Pct
+    """
+    import pandas as pd
+    import numpy as np
+    import os
+
+    rows = []
+
+    # ── Helper: safe relative difference ────────────────────────────────────
+    def rel_diff(cal, ext):
+        if ext is None or cal is None:
+            return None
+        denom = abs(ext) if abs(ext) > 1e-12 else 1e-12
+        return abs(cal - ext) / denom * 100.0   # in percent
+
+    def abs_diff(cal, ext):
+        if ext is None or cal is None:
+            return None
+        return abs(cal - ext)
+
+    # ── Helper: unpack utils.Curve or list-of-pairs into dict {tenor: value} -
+    def to_tenor_dict(curve_obj):
+        """Handles both utils.Curve (iterable of pairs) and raw list."""
+        d = {}
+        try:
+            for pair in curve_obj:
+                tenor, value = float(pair[0]), float(pair[1])
+                d[tenor] = value
+        except Exception as e:
+            print(f"  WARNING: could not unpack curve — {e}")
+        return d
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 1. REVERSION SPEED (scalar)
+    # ════════════════════════════════════════════════════════════════════════
+    cal_rs  = float(calibrated_param['Reversion_Speed'])
+    ext_rs  = float(extracted_param['Reversion_Speed']) \
+              if extracted_param['Reversion_Speed'] is not None else None
+
+    rows.append({
+        'Parameter'    : 'Reversion_Speed',
+        'Tenor'        : 'scalar',
+        'Calibrated'   : cal_rs,
+        'Extracted'    : ext_rs,
+        'Abs_Diff'     : abs_diff(cal_rs, ext_rs),
+        'Rel_Diff_Pct' : rel_diff(cal_rs, ext_rs),
+    })
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 2. HISTORICAL YIELD  (term structure)
+    # ════════════════════════════════════════════════════════════════════════
+    cal_hy = to_tenor_dict(calibrated_param['Historical_Yield'])
+    ext_hy = to_tenor_dict(extracted_param['Historical_Yield'])
+    all_hy_tenors = sorted(set(cal_hy) | set(ext_hy))
+
+    for t in all_hy_tenors:
+        cal_v = cal_hy.get(t)
+        ext_v = ext_hy.get(t)
+        rows.append({
+            'Parameter'    : 'Historical_Yield',
+            'Tenor'        : t,
+            'Calibrated'   : cal_v,
+            'Extracted'    : ext_v,
+            'Abs_Diff'     : abs_diff(cal_v, ext_v),
+            'Rel_Diff_Pct' : rel_diff(cal_v, ext_v),
+        })
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 3. YIELD VOLATILITY  (term structure)
+    # ════════════════════════════════════════════════════════════════════════
+    cal_yv = to_tenor_dict(calibrated_param['Yield_Volatility'])
+    ext_yv = to_tenor_dict(extracted_param['Yield_Volatility'])
+    all_yv_tenors = sorted(set(cal_yv) | set(ext_yv))
+
+    for t in all_yv_tenors:
+        cal_v = cal_yv.get(t)
+        ext_v = ext_yv.get(t)
+        rows.append({
+            'Parameter'    : 'Yield_Volatility',
+            'Tenor'        : t,
+            'Calibrated'   : cal_v,
+            'Extracted'    : ext_v,
+            'Abs_Diff'     : abs_diff(cal_v, ext_v),
+            'Rel_Diff_Pct' : rel_diff(cal_v, ext_v),
+        })
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 4. EIGENVECTORS  (one block per PC, term structure of loadings)
+    # ════════════════════════════════════════════════════════════════════════
+    cal_evs = calibrated_param['Eigenvectors']
+    ext_evs = extracted_param['Eigenvectors']
+    n_pcs   = max(len(cal_evs), len(ext_evs))
+
+    for i in range(n_pcs):
+        pc_label = f'PC{i+1}'
+
+        # --- Eigenvalue (scalar per PC) ---
+        cal_eval = float(cal_evs[i]['Eigenvalue']) if i < len(cal_evs) else None
+        ext_eval = float(ext_evs[i]['Eigenvalue']) if i < len(ext_evs) else None
+
+        rows.append({
+            'Parameter'    : f'{pc_label}_Eigenvalue',
+            'Tenor'        : 'scalar',
+            'Calibrated'   : cal_eval,
+            'Extracted'    : ext_eval,
+            'Abs_Diff'     : abs_diff(cal_eval, ext_eval),
+            'Rel_Diff_Pct' : rel_diff(cal_eval, ext_eval),
+        })
+
+        # --- Eigenvector loadings (term structure) ---
+        cal_ev = to_tenor_dict(cal_evs[i]['Eigenvector']) if i < len(cal_evs) else {}
+        ext_ev = to_tenor_dict(ext_evs[i]['Eigenvector']) if i < len(ext_evs) else {}
+        all_ev_tenors = sorted(set(cal_ev) | set(ext_ev))
+
+        for t in all_ev_tenors:
+            cal_v = cal_ev.get(t)
+            ext_v = ext_ev.get(t)
+            rows.append({
+                'Parameter'    : f'{pc_label}_Eigenvector',
+                'Tenor'        : t,
+                'Calibrated'   : cal_v,
+                'Extracted'    : ext_v,
+                'Abs_Diff'     : abs_diff(cal_v, ext_v),
+                'Rel_Diff_Pct' : rel_diff(cal_v, ext_v),
+            })
+
+    # ════════════════════════════════════════════════════════════════════════
+    # 5. BUILD DATAFRAME
+    # ════════════════════════════════════════════════════════════════════════
+    df = pd.DataFrame(rows, columns=[
+        'Parameter', 'Tenor',
+        'Calibrated', 'Extracted',
+        'Abs_Diff', 'Rel_Diff_Pct'
+    ])
+
+    # Round for readability
+    for col in ['Calibrated', 'Extracted', 'Abs_Diff']:
+        df[col] = df[col].apply(
+            lambda x: round(x, 8) if isinstance(x, float) else x
+        )
+    df['Rel_Diff_Pct'] = df['Rel_Diff_Pct'].apply(
+        lambda x: round(x, 4) if isinstance(x, float) else x
+    )
+
+    # ── Print to terminal ────────────────────────────────────────────────────
+    print(f"\n{'='*80}")
+    print(f"  PCA Parameter Comparison — {asset_name}")
+    print(f"{'='*80}")
+    print(df.to_string(index=False))
+
+    # Flag large differences
+    large = df[
+        df['Rel_Diff_Pct'].apply(
+            lambda x: isinstance(x, float) and x > 1.0
+        )
+    ]
+    if not large.empty:
+        print(f"\n⚠️  DIFFERENCES > 1% ({len(large)} items):")
+        print(large[['Parameter','Tenor','Calibrated',
+                      'Extracted','Rel_Diff_Pct']].to_string(index=False))
+
+    # ── Write CSV ────────────────────────────────────────────────────────────
+    if output_path:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        df.to_csv(output_path, index=False)
+        print(f"\n✅ Saved to: {output_path}")
+
+    return df
+
+
+# ── Usage ────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+
+    ASSET = "PCAInterestRateModel.ZAR-BOND-CPI"
+
+    # 1. Extract from MarketData.json
+    extracted = extract_pca_params(
+        filepath    = r"C:\XVA_engine\MarketData.json",
+        asset_names = ASSET
+    )
+
+    # 2. Run your calibration
+    param, correlation_coef, delta = calibrate_pca_interest_rate(
+        curve_panel       = your_curve_panel_df,
+        num_business_days = 252.0,
+        num_factors       = 3,
+    )
+
+    # 3. Compare and export
+    comparison_df = compare_pca_params(
+        calibrated_param = param,
+        extracted_param  = extracted[ASSET],
+        asset_name       = ASSET,
+        output_path      = r"C:\XVA_engine\outputs\pca_comparison.csv"
+    )
