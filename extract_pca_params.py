@@ -1,45 +1,14 @@
 def extract_pca_params(filepath, asset_names):
-    """
-    Extract PCA Interest Rate model parameters from MarketData.json.
-    
-    Args:
-        filepath   : Path to MarketData.json
-        asset_names: String or list of PCA model names
-                     e.g. 'PCAInterestRateModel.ZAR-CORE-CPI'
-                     or   ['PCAInterestRateModel.ZAR-CORE-CPI',
-                            'PCAInterestRateModel.ZAR-BOND']
-    Returns:
-        Dictionary keyed by asset name, each containing:
-        {
-            'Reversion_Speed'  : float,
-            'Historical_Yield' : list of [tenor, value] pairs,
-            'Yield_Volatility' : list of [tenor, value] pairs,
-            'Eigenvectors'     : [
-                {'Eigenvalue': float, 'Eigenvector': list of [tenor, value]},
-                ...   (one per PC)
-            ],
-            'Rate_Drift_Model' : str,
-            'Princ_Comp_Source': str,
-            'Distribution_Type': str,
-        }
-    """
     import json
+    import os
 
     if isinstance(asset_names, str):
         asset_names = [asset_names]
 
-    # Initialise result structure
-    result = {name: {
-        'Reversion_Speed'  : None,
-        'Historical_Yield' : [],
-        'Yield_Volatility' : [],
-        'Eigenvectors'     : [],
-        'Rate_Drift_Model' : None,
-        'Princ_Comp_Source': None,
-        'Distribution_Type': None,
-    } for name in asset_names}
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
 
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding='utf-8') as f:
         market_data = json.load(f)
 
     price_models = (
@@ -48,43 +17,51 @@ def extract_pca_params(filepath, asset_names):
         .get('Price Models', {})
     )
 
+    results = {}
+
     for asset_name in asset_names:
         if asset_name not in price_models:
-            print(f"WARNING: '{asset_name}' not found in Price Models.")
+            available = [k for k in price_models if 'PCA' in k]
+            print(f"WARNING: '{asset_name}' not found.")
+            print(f"  Available PCA models: {available}")
             continue
 
         model = price_models[asset_name]
-        r     = result[asset_name]
 
-        # --- Scalar ---
-        r['Reversion_Speed']   = model.get('Reversion_Speed')
-        r['Rate_Drift_Model']  = model.get('Rate_Drift_Model')
-        r['Princ_Comp_Source'] = model.get('Princ_Comp_Source')
-        r['Distribution_Type'] = model.get('Distribution_Type')
+        # ── Curve unpacker — handles both storage formats ────────────────────
+        # Format A: value is already [[tenor, val], ...]
+        # Format B: value is {'.Curve': {'meta':[], 'data':[[tenor,val],...]}}
+        def unpack_curve(raw):
+            if raw is None:
+                return []
+            if isinstance(raw, list):
+                return raw                          # already clean pairs
+            if isinstance(raw, dict):
+                if '.Curve' in raw:
+                    return raw['.Curve'].get('data', [])
+                if 'data' in raw:
+                    return raw['data']
+            return []
 
-        # --- Curve helper: extracts list of [tenor, value] from .Curve.data ---
-        def extract_curve(key):
-            return (
-                model.get(key, {})
-                     .get('.Curve', {})
-                     .get('data', [])
-            )
-
-        r['Historical_Yield'] = extract_curve('Historical_Yield')
-        r['Yield_Volatility'] = extract_curve('Yield_Volatility')
-
-        # --- Eigenvectors: list of dicts, one per PC ---
+        # ── Eigenvectors: list of {Eigenvalue, Eigenvector} dicts ────────────
+        eigenvectors = []
         for ev_block in model.get('Eigenvectors', []):
-            r['Eigenvectors'].append({
+            eigenvectors.append({
                 'Eigenvalue' : ev_block.get('Eigenvalue'),
-                'Eigenvector': (
-                    ev_block.get('Eigenvector', {})
-                             .get('.Curve', {})
-                             .get('data', [])
-                ),
+                'Eigenvector': unpack_curve(ev_block.get('Eigenvector')),
             })
 
-    return result
+        results[asset_name] = {
+            'Reversion_Speed'  : model.get('Reversion_Speed'),
+            'Historical_Yield' : unpack_curve(model.get('Historical_Yield')),
+            'Yield_Volatility' : unpack_curve(model.get('Yield_Volatility')),
+            'Eigenvectors'     : eigenvectors,
+            'Rate_Drift_Model' : model.get('Rate_Drift_Model'),
+            'Princ_Comp_Source': model.get('Princ_Comp_Source'),
+            'Distribution_Type': model.get('Distribution_Type'),
+        }
+        
+    return results
 
 
 # ── Pretty-print helper ──────────────────────────────────────────────────────
