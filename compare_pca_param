@@ -1,152 +1,214 @@
-def compare_pca_params(calibrated_param, extracted_param, asset_name, output_path=None):
+def normalise_extracted(extracted_param, asset_name):
     """
-    Compare calibrated PCA parameters against extracted MarketData.json parameters.
-
-    Args:
-        calibrated_param : OrderedDict from calibrate_pca_interest_rate()
-        extracted_param  : dict from extract_pca_params() — pass the full
-                           return value; the function handles unwrapping
-        asset_name       : str, key into extracted_param
-        output_path      : optional CSV path
+    Robustly unwrap extracted_param regardless of nesting structure.
+    Prints the exact key map so you can see what was found.
     """
-    import pandas as pd
-    import numpy as np
-    import os
 
-    # ── Unwrap extracted_param if the asset name is still the top-level key ─
+    # ── Level 1: unwrap asset name if still top-level key ───────────────────
     if asset_name in extracted_param:
         extracted_param = extracted_param[asset_name]
+        print(f"Unwrapped asset key '{asset_name}'")
 
-    # ── Unwrap calibrated_param if wrapped in CalibrationInfo or similar ────
-    if hasattr(calibrated_param, 'param'):
-        calibrated_param = calibrated_param.param
-    # Handle OrderedDict wrapper from utils.CalibrationInfo
-    if hasattr(calibrated_param, '__getitem__'):
-        # try to detect if it's the top-level CalibrationInfo dict
-        if 'Reversion_Speed' in calibrated_param:
-            cal_key_rs = 'Reversion_Speed'
-        elif 'Alpha' in calibrated_param:
-            cal_key_rs = 'Alpha'
+    # ── Level 2: if it's STILL nested one more level (e.g. CalibrationInfo) -
+    if hasattr(extracted_param, 'param'):
+        extracted_param = extracted_param.param
+        print("Unwrapped .param attribute")
+
+    # ── Print exact keys as they exist in the dict ───────────────────────────
+    print("\n--- Exact keys in extracted_param ---")
+    for k in extracted_param.keys():
+        v = extracted_param[k]
+        print(f"  key='{k}'  type={type(v).__name__}  "
+              f"preview={str(v)[:80]}")
+
+    # ── Build a normalised dict with consistent key names ────────────────────
+    # Map whatever key names exist to the expected names
+    KEY_MAP = {
+        # possible extracted key  →  normalised key
+        'Reversion_Speed'         : 'Reversion_Speed',
+        'ReversionSpeed'          : 'Reversion_Speed',
+        'Reversion Speed'         : 'Reversion_Speed',
+        'Alpha'                   : 'Reversion_Speed',
+        'Mean Reversion Speed'    : 'Reversion_Speed',
+
+        'Historical_Yield'        : 'Historical_Yield',
+        'HistoricalYield'         : 'Historical_Yield',
+        'Historical Yield'        : 'Historical_Yield',
+
+        'Yield_Volatility'        : 'Yield_Volatility',
+        'YieldVolatility'         : 'Yield_Volatility',
+        'Yield Volatility'        : 'Yield_Volatility',
+        'Reversion Volatility'    : 'Yield_Volatility',
+
+        'Eigenvectors'            : 'Eigenvectors',
+        'eigenvectors'            : 'Eigenvectors',
+
+        'Rate_Drift_Model'        : 'Rate_Drift_Model',
+        'Rate Drift Model'        : 'Rate_Drift_Model',
+
+        'Princ_Comp_Source'       : 'Princ_Comp_Source',
+        'Matrix_Type'             : 'Princ_Comp_Source',
+
+        'Distribution_Type'       : 'Distribution_Type',
+        'Distribution Type'       : 'Distribution_Type',
+    }
+
+    normalised = {}
+    for raw_key, value in extracted_param.items():
+        mapped = KEY_MAP.get(raw_key, raw_key)   # fallback: keep original
+        normalised[mapped] = value
+        if mapped != raw_key:
+            print(f"  Remapped '{raw_key}' → '{mapped}'")
+
+    return normalised
+
+
+def to_tenor_dict(curve_obj, label=""):
+    """
+    Unpack any curve format into {tenor: value}.
+    Handles:
+      - list of [tenor, value]
+      - list of (tenor, value) tuples
+      - utils.Curve (iterable of pairs)
+      - dict {tenor: value} already
+      - nested dict with '.Curve' > 'data' key
+    """
+    d = {}
+    if curve_obj is None:
+        print(f"  WARNING [{label}]: curve_obj is None")
+        return d
+
+    # Already a plain dict — check if values are floats
+    if isinstance(curve_obj, dict):
+        # Could be {'.Curve': {'meta':[], 'data':[...]}}
+        if '.Curve' in curve_obj:
+            curve_obj = curve_obj['.Curve'].get('data', [])
+            print(f"  [{label}]: unwrapped .Curve.data")
         else:
-            raise KeyError(
-                f"Cannot find reversion speed in calibrated_param. "
-                f"Available keys: {list(calibrated_param.keys())}"
-            )
+            # Assume {tenor_str: value} — convert keys to float
+            try:
+                return {float(k): float(v) for k, v in curve_obj.items()}
+            except Exception as e:
+                print(f"  WARNING [{label}]: dict unpack failed — {e}")
+                return d
 
-    rows = []
-
-    # ── Helpers ──────────────────────────────────────────────────────────────
-    def abs_diff(a, b):
-        if a is None or b is None:
-            return None
-        return abs(float(a) - float(b))
-
-    def rel_diff(a, b):
-        if a is None or b is None:
-            return None
-        denom = abs(float(b)) if abs(float(b)) > 1e-12 else 1e-12
-        return abs(float(a) - float(b)) / denom * 100.0
-
-    def to_tenor_dict(curve_obj):
-        """Unpack utils.Curve, list-of-pairs, or list-of-lists."""
-        d = {}
-        if curve_obj is None:
-            return d
-        try:
-            for pair in curve_obj:
+    # Iterable of pairs
+    try:
+        for pair in curve_obj:
+            try:
                 tenor = float(pair[0])
                 value = float(pair[1])
                 d[tenor] = value
-        except Exception as e:
-            print(f"  WARNING: could not unpack curve — {e}")
-        return d
+            except Exception as inner:
+                print(f"  WARNING [{label}]: bad pair {pair} — {inner}")
+    except Exception as e:
+        print(f"  WARNING [{label}]: not iterable "
+              f"(type={type(curve_obj).__name__}) — {e}")
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 1. REVERSION SPEED
-    # ════════════════════════════════════════════════════════════════════════
-    cal_rs = float(calibrated_param[cal_key_rs])
+    return d
 
-    # extracted stores it as 'Reversion_Speed'
-    ext_rs_raw = extracted_param.get('Reversion_Speed')
-    ext_rs     = float(ext_rs_raw) if ext_rs_raw is not None else None
+
+def compare_pca_params(calibrated_param, extracted_param,
+                       asset_name, output_path=None):
+    import pandas as pd
+    import os
+
+    # ── Unwrap and normalise both dicts ─────────────────────────────────────
+    extracted_param  = normalise_extracted(extracted_param, asset_name)
+
+    if hasattr(calibrated_param, 'param'):
+        calibrated_param = calibrated_param.param
+
+    # Normalise calibrated keys too
+    calibrated_param = normalise_extracted(calibrated_param, asset_name) \
+                       if asset_name in (calibrated_param or {}) \
+                       else calibrated_param
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def abs_diff(a, b):
+        try:
+            return abs(float(a) - float(b)) \
+                   if a is not None and b is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def rel_diff(a, b):
+        try:
+            if a is None or b is None:
+                return None
+            denom = abs(float(b)) if abs(float(b)) > 1e-12 else 1e-12
+            return abs(float(a) - float(b)) / denom * 100.0
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+
+    # ── 1. Reversion Speed ───────────────────────────────────────────────────
+    cal_rs = calibrated_param.get('Reversion_Speed') \
+             or calibrated_param.get('Alpha')
+    ext_rs = extracted_param.get('Reversion_Speed')
+
+    print(f"\nReversion Speed  cal={cal_rs}  ext={ext_rs}")
 
     rows.append({
         'Parameter'   : 'Reversion_Speed',
         'Tenor'       : 'scalar',
-        'Calibrated'  : cal_rs,
-        'Extracted'   : ext_rs,
+        'Calibrated'  : float(cal_rs) if cal_rs is not None else None,
+        'Extracted'   : float(ext_rs) if ext_rs is not None else None,
         'Abs_Diff'    : abs_diff(cal_rs, ext_rs),
         'Rel_Diff_Pct': rel_diff(cal_rs, ext_rs),
     })
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 2. HISTORICAL YIELD
-    # ════════════════════════════════════════════════════════════════════════
-    # calibrated uses 'Historical_Yield', extracted uses same key
-    cal_hy      = to_tenor_dict(calibrated_param.get('Historical_Yield'))
-    ext_hy      = to_tenor_dict(extracted_param.get('Historical_Yield'))
-    hy_tenors   = sorted(set(cal_hy) | set(ext_hy))
+    # ── 2. Term structure parameters ─────────────────────────────────────────
+    for param_key in ['Historical_Yield', 'Yield_Volatility']:
+        cal_curve = to_tenor_dict(
+            calibrated_param.get(param_key), f"cal {param_key}"
+        )
+        ext_curve = to_tenor_dict(
+            extracted_param.get(param_key),  f"ext {param_key}"
+        )
+        print(f"{param_key}: cal={len(cal_curve)} tenors  "
+              f"ext={len(ext_curve)} tenors")
 
-    for t in hy_tenors:
-        rows.append({
-            'Parameter'   : 'Historical_Yield',
-            'Tenor'       : round(t, 6),
-            'Calibrated'  : cal_hy.get(t),
-            'Extracted'   : ext_hy.get(t),
-            'Abs_Diff'    : abs_diff(cal_hy.get(t), ext_hy.get(t)),
-            'Rel_Diff_Pct': rel_diff(cal_hy.get(t), ext_hy.get(t)),
-        })
+        for t in sorted(set(cal_curve) | set(ext_curve)):
+            rows.append({
+                'Parameter'   : param_key,
+                'Tenor'       : round(t, 6),
+                'Calibrated'  : cal_curve.get(t),
+                'Extracted'   : ext_curve.get(t),
+                'Abs_Diff'    : abs_diff(cal_curve.get(t), ext_curve.get(t)),
+                'Rel_Diff_Pct': rel_diff(cal_curve.get(t), ext_curve.get(t)),
+            })
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 3. YIELD VOLATILITY
-    # ════════════════════════════════════════════════════════════════════════
-    cal_yv    = to_tenor_dict(calibrated_param.get('Yield_Volatility'))
-    ext_yv    = to_tenor_dict(extracted_param.get('Yield_Volatility'))
-    yv_tenors = sorted(set(cal_yv) | set(ext_yv))
-
-    for t in yv_tenors:
-        rows.append({
-            'Parameter'   : 'Yield_Volatility',
-            'Tenor'       : round(t, 6),
-            'Calibrated'  : cal_yv.get(t),
-            'Extracted'   : ext_yv.get(t),
-            'Abs_Diff'    : abs_diff(cal_yv.get(t), ext_yv.get(t)),
-            'Rel_Diff_Pct': rel_diff(cal_yv.get(t), ext_yv.get(t)),
-        })
-
-    # ════════════════════════════════════════════════════════════════════════
-    # 4. EIGENVECTORS
-    # ════════════════════════════════════════════════════════════════════════
+    # ── 3. Eigenvectors ──────────────────────────────────────────────────────
     cal_evs = calibrated_param.get('Eigenvectors', [])
     ext_evs = extracted_param.get('Eigenvectors', [])
-    n_pcs   = max(len(cal_evs), len(ext_evs))
+    print(f"Eigenvectors: cal={len(cal_evs)} PCs  ext={len(ext_evs)} PCs")
 
-    for i in range(n_pcs):
-        pc_label = f'PC{i+1}'
-
-        # Eigenvalue
-        cal_eval = float(cal_evs[i]['Eigenvalue']) if i < len(cal_evs) else None
-        ext_eval = float(ext_evs[i]['Eigenvalue']) if i < len(ext_evs) else None
+    for i in range(max(len(cal_evs), len(ext_evs))):
+        pc = f'PC{i+1}'
+        cal_eval = cal_evs[i].get('Eigenvalue') if i < len(cal_evs) else None
+        ext_eval = ext_evs[i].get('Eigenvalue') if i < len(ext_evs) else None
 
         rows.append({
-            'Parameter'   : f'{pc_label}_Eigenvalue',
+            'Parameter'   : f'{pc}_Eigenvalue',
             'Tenor'       : 'scalar',
-            'Calibrated'  : cal_eval,
-            'Extracted'   : ext_eval,
+            'Calibrated'  : float(cal_eval) if cal_eval is not None else None,
+            'Extracted'   : float(ext_eval) if ext_eval is not None else None,
             'Abs_Diff'    : abs_diff(cal_eval, ext_eval),
             'Rel_Diff_Pct': rel_diff(cal_eval, ext_eval),
         })
 
-        # Eigenvector loadings
-        cal_ev    = to_tenor_dict(cal_evs[i].get('Eigenvector', [])) \
-                    if i < len(cal_evs) else {}
-        ext_ev    = to_tenor_dict(ext_evs[i].get('Eigenvector', [])) \
-                    if i < len(ext_evs) else {}
-        ev_tenors = sorted(set(cal_ev) | set(ext_ev))
+        cal_ev = to_tenor_dict(
+            cal_evs[i].get('Eigenvector', []), f"cal {pc}"
+        ) if i < len(cal_evs) else {}
+        ext_ev = to_tenor_dict(
+            ext_evs[i].get('Eigenvector', []), f"ext {pc}"
+        ) if i < len(ext_evs) else {}
 
-        for t in ev_tenors:
+        for t in sorted(set(cal_ev) | set(ext_ev)):
             rows.append({
-                'Parameter'   : f'{pc_label}_Eigenvector',
+                'Parameter'   : f'{pc}_Eigenvector',
                 'Tenor'       : round(t, 6),
                 'Calibrated'  : cal_ev.get(t),
                 'Extracted'   : ext_ev.get(t),
@@ -154,9 +216,7 @@ def compare_pca_params(calibrated_param, extracted_param, asset_name, output_pat
                 'Rel_Diff_Pct': rel_diff(cal_ev.get(t), ext_ev.get(t)),
             })
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 5. BUILD + PRINT + SAVE
-    # ════════════════════════════════════════════════════════════════════════
+    # ── 4. Build DataFrame ───────────────────────────────────────────────────
     df = pd.DataFrame(rows, columns=[
         'Parameter', 'Tenor',
         'Calibrated', 'Extracted',
@@ -172,7 +232,7 @@ def compare_pca_params(calibrated_param, extracted_param, asset_name, output_pat
     )
 
     print(f"\n{'='*80}")
-    print(f"  PCA Parameter Comparison — {asset_name}")
+    print(f"  PCA Comparison — {asset_name}")
     print(f"{'='*80}")
     print(df.to_string(index=False))
 
@@ -180,15 +240,14 @@ def compare_pca_params(calibrated_param, extracted_param, asset_name, output_pat
         lambda x: isinstance(x, float) and x > 1.0
     )]
     if not large.empty:
-        print(f"\n⚠️  DIFFERENCES > 1% ({len(large)} items):")
-        print(large[['Parameter', 'Tenor', 'Calibrated',
-                      'Extracted', 'Rel_Diff_Pct']].to_string(index=False))
+        print(f"\n⚠️  {len(large)} differences > 1%:")
+        print(large.to_string(index=False))
     else:
-        print("\n✅ All parameters within 1% tolerance.")
+        print("\n✅ All within 1% tolerance.")
 
     if output_path:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         df.to_csv(output_path, index=False)
-        print(f"\n✅ Saved to: {output_path}")
+        print(f"✅ Saved: {output_path}")
 
     return df
