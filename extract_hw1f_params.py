@@ -76,27 +76,20 @@ def extract_hw1f_params(filepath, asset_names):
 def compare_hw1f_params(calibrated_param, extracted_param,
                          asset_name, output_path=None):
     """
-    Compare calibrated HW1F parameters against MarketData.json parameters.
+    Compare HW1F calibrated vs extracted parameters.
 
-    The Pre-Computed Statistics Averaging method produces:
-      - sigma : (1/m) * sum of per-tenor reversion volatilities
-      - alpha : (1/m) * sum of per-tenor mean reversion speeds
+    RiskFlow stores ONLY two comparable parameters for HW1F:
+        Alpha : scalar mean reversion speed
+        Sigma : single scalar reversion volatility
+                (stored as .Curve with one point at tenor 0.0)
 
-    Both are scalars — so unlike PCA there is no tenor-level
-    comparison for alpha and sigma. However if a Vol term structure
-    is stored, that is compared tenor by tenor.
-
-    Args:
-        calibrated_param : dict from your HW1F calibration function
-                           expects keys: 'Alpha', 'Sigma', 'Vol_Curve'
-        extracted_param  : full dict from extract_hw1f_params()
-        asset_name       : str
-        output_path      : optional CSV path
+    Calibrated-only outputs (no extracted counterpart) are reported
+    in a separate derived table and exported to a second CSV sheet.
     """
     import pandas as pd
     import os
 
-    # ── Unwrap asset key ─────────────────────────────────────────────────────
+    # ── Unwrap ───────────────────────────────────────────────────────────────
     if asset_name in extracted_param:
         ext = extracted_param[asset_name]
     else:
@@ -110,7 +103,11 @@ def compare_hw1f_params(calibrated_param, extracted_param,
     def to_dict(pairs):
         if not pairs:
             return {}
-        return {float(p[0]): float(p[1]) for p in pairs}
+        if isinstance(pairs, dict) and '.Curve' in pairs:
+            pairs = pairs['.Curve'].get('data', [])
+        if isinstance(pairs, list):
+            return {float(p[0]): float(p[1]) for p in pairs}
+        return {}
 
     def adiff(a, b):
         return abs(float(a) - float(b)) \
@@ -122,19 +119,16 @@ def compare_hw1f_params(calibrated_param, extracted_param,
         denom = abs(float(b)) if abs(float(b)) > 1e-12 else 1e-12
         return abs(float(a) - float(b)) / denom * 100.0
 
-    rows = []
-
     # ════════════════════════════════════════════════════════════════════════
-    # 1. ALPHA — scalar mean reversion speed
-    #    Per the Pre-Computed Statistics Averaging method:
-    #    alpha = (1/m) * sum(alpha_k) across tenors
+    # TABLE 1: DIRECTLY COMPARABLE PARAMETERS
+    # Only Alpha and Sigma scalar — what RiskFlow actually stores
     # ════════════════════════════════════════════════════════════════════════
-    cal_alpha = cal.get('Alpha') or cal.get('Reversion_Speed')
-    ext_alpha = ext.get('Alpha') or ext.get('Reversion_Speed')
+    comparable_rows = []
 
-    print(f"\nAlpha  cal={cal_alpha}  ext={ext_alpha}")
-
-    rows.append({
+    # ── Alpha (scalar) ───────────────────────────────────────────────────────
+    cal_alpha = cal.get('Alpha')
+    ext_alpha = ext.get('Alpha')
+    comparable_rows.append({
         'Parameter'   : 'Alpha (Mean Reversion Speed)',
         'Tenor'       : 'scalar',
         'Calibrated'  : float(cal_alpha) if cal_alpha is not None else None,
@@ -143,78 +137,146 @@ def compare_hw1f_params(calibrated_param, extracted_param,
         'Rel_Diff_Pct': rdiff(cal_alpha, ext_alpha),
     })
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 2. SIGMA — scalar reversion volatility
-    #    Per the Pre-Computed Statistics Averaging method:
-    #    sigma = (1/m) * sum(sigma_k) across tenors
-    # ════════════════════════════════════════════════════════════════════════
-    cal_sigma = cal.get('Sigma') or cal.get('Reversion_Volatility')
-    ext_sigma = ext.get('Sigma') or ext.get('Reversion_Volatility')
+    # ── Sigma scalar
+    # RiskFlow stores Sigma as .Curve with ONE point at tenor=0.0
+    # The single value is the scalar reversion volatility for the curve
+    # Calibrated scalar = average of per-tenor sigma values
+    # ────────────────────────────────────────────────────────────────────────
+    ext_sig_dict = to_dict(ext.get('Sigma', []))
 
-    print(f"Sigma  cal={cal_sigma}  ext={ext_sigma}")
+    # Extract the single scalar from extracted
+    # (tenor 0.0 or first available point)
+    if ext_sig_dict:
+        ext_sigma_scalar = list(ext_sig_dict.values())[0]
+    else:
+        ext_sigma_scalar = None
 
-    rows.append({
+    # Calibrated scalar sigma = average of per-tenor curve
+    cal_sig_dict = to_dict(cal.get('Sigma', {}))
+    if cal_sig_dict:
+        import numpy as np
+        cal_sigma_scalar = float(np.mean(list(cal_sig_dict.values())))
+    else:
+        cal_sigma_scalar = cal.get('Sigma_Scalar')
+
+    comparable_rows.append({
         'Parameter'   : 'Sigma (Reversion Volatility)',
         'Tenor'       : 'scalar',
-        'Calibrated'  : float(cal_sigma) if cal_sigma is not None else None,
-        'Extracted'   : float(ext_sigma) if ext_sigma is not None else None,
-        'Abs_Diff'    : adiff(cal_sigma, ext_sigma),
-        'Rel_Diff_Pct': rdiff(cal_sigma, ext_sigma),
+        'Calibrated'  : round(cal_sigma_scalar, 8)
+                        if cal_sigma_scalar is not None else None,
+        'Extracted'   : round(ext_sigma_scalar, 8)
+                        if ext_sigma_scalar is not None else None,
+        'Abs_Diff'    : adiff(cal_sigma_scalar, ext_sigma_scalar),
+        'Rel_Diff_Pct': rdiff(cal_sigma_scalar, ext_sigma_scalar),
     })
 
-    # ════════════════════════════════════════════════════════════════════════
-    # 3. VOL CURVE — term structure (if stored)
-    # ════════════════════════════════════════════════════════════════════════
-    cal_vc = to_dict(cal.get('Vol_Curve', []))
-    ext_vc = to_dict(ext.get('Vol_Curve', []))
+    # ── Lambda scalar (always 0 — confirm alignment) ─────────────────────────
+    cal_lam = cal.get('Lambda', 0.0)
+    ext_lam = ext.get('Lambda', 0.0)
+    comparable_rows.append({
+        'Parameter'   : 'Lambda',
+        'Tenor'       : 'scalar',
+        'Calibrated'  : float(cal_lam),
+        'Extracted'   : float(ext_lam),
+        'Abs_Diff'    : adiff(cal_lam, ext_lam),
+        'Rel_Diff_Pct': rdiff(cal_lam, ext_lam),
+    })
 
-    print(f"Vol Curve: cal={len(cal_vc)} tenors  ext={len(ext_vc)} tenors")
-
-    for t in sorted(set(cal_vc) | set(ext_vc)):
-        rows.append({
-            'Parameter'   : 'Vol_Curve',
-            'Tenor'       : round(t, 6),
-            'Calibrated'  : cal_vc.get(t),
-            'Extracted'   : ext_vc.get(t),
-            'Abs_Diff'    : adiff(cal_vc.get(t), ext_vc.get(t)),
-            'Rel_Diff_Pct': rdiff(cal_vc.get(t), ext_vc.get(t)),
-        })
-
-    # ════════════════════════════════════════════════════════════════════════
-    # 4. BUILD DATAFRAME
-    # ════════════════════════════════════════════════════════════════════════
-    df = pd.DataFrame(rows, columns=[
+    comparable_df = pd.DataFrame(comparable_rows, columns=[
         'Parameter', 'Tenor',
         'Calibrated', 'Extracted',
         'Abs_Diff', 'Rel_Diff_Pct'
     ])
-
     for col in ['Calibrated', 'Extracted', 'Abs_Diff']:
-        df[col] = df[col].apply(
+        comparable_df[col] = comparable_df[col].apply(
             lambda x: round(x, 8) if isinstance(x, float) else x)
-    df['Rel_Diff_Pct'] = df['Rel_Diff_Pct'].apply(
+    comparable_df['Rel_Diff_Pct'] = comparable_df['Rel_Diff_Pct'].apply(
         lambda x: round(x, 4) if isinstance(x, float) else x)
 
-    print(f"\n{'='*80}")
-    print(f"  HW1F Parameter Comparison — {asset_name}")
-    print(f"{'='*80}")
-    print(df.to_string(index=False))
+    # ════════════════════════════════════════════════════════════════════════
+    # TABLE 2: CALIBRATED-ONLY DERIVED OUTPUTS
+    # Sigma term structure and Historical Yield are produced by calibration
+    # but not stored in RiskFlow — reported for transparency only
+    # ════════════════════════════════════════════════════════════════════════
+    derived_rows = []
 
-    large = df[df['Rel_Diff_Pct'].apply(
+    # Sigma per tenor
+    for t, v in sorted(cal_sig_dict.items()):
+        derived_rows.append({
+            'Parameter' : 'Sigma_PerTenor (Calibrated Only)',
+            'Tenor'     : round(t, 6),
+            'Value'     : round(v, 8),
+            'Note'      : 'Not stored in RiskFlow MarketData.json'
+        })
+
+    # Historical Yield per tenor
+    cal_hy = to_dict(cal.get('Historical_Yield', []))
+    for t, v in sorted(cal_hy.items()):
+        derived_rows.append({
+            'Parameter' : 'Historical_Yield_PerTenor (Calibrated Only)',
+            'Tenor'     : round(t, 6),
+            'Value'     : round(v, 8),
+            'Note'      : 'Not stored in RiskFlow MarketData.json'
+        })
+
+    derived_df = pd.DataFrame(derived_rows, columns=[
+        'Parameter', 'Tenor', 'Value', 'Note'
+    ])
+
+    # ════════════════════════════════════════════════════════════════════════
+    # PRINT
+    # ════════════════════════════════════════════════════════════════════════
+    print(f"\n{'='*80}")
+    print(f"  HW1F Comparison — {asset_name}")
+    print(f"{'='*80}")
+    print("\n── Directly Comparable Parameters (RiskFlow vs Calibrated) ──")
+    print(comparable_df.to_string(index=False))
+
+    large = comparable_df[comparable_df['Rel_Diff_Pct'].apply(
         lambda x: isinstance(x, float) and x > 1.0)]
     if not large.empty:
         print(f"\n⚠️  {len(large)} differences > 1%:")
         print(large.to_string(index=False))
     else:
-        print("\n✅ All within 1% tolerance.")
+        print("\n✅ All comparable parameters within 1% tolerance.")
 
+    print("\n── Calibrated-Only Derived Outputs (no RiskFlow counterpart) ──")
+    print(derived_df.to_string(index=False))
+
+    # ════════════════════════════════════════════════════════════════════════
+    # EXPORT — two sheets in one Excel file, or two CSVs
+    # ════════════════════════════════════════════════════════════════════════
     if output_path:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        df.to_csv(output_path, index=False)
-        print(f"✅ Saved: {output_path}")
 
-    return df
+        # Try Excel first (two sheets), fall back to two CSVs
+        try:
+            with pd.ExcelWriter(
+                output_path.replace('.csv', '.xlsx'),
+                engine='openpyxl'
+            ) as writer:
+                comparable_df.to_excel(
+                    writer,
+                    sheet_name='Comparable_Parameters',
+                    index=False
+                )
+                derived_df.to_excel(
+                    writer,
+                    sheet_name='Calibrated_Only_Derived',
+                    index=False
+                )
+            print(f"\n✅ Saved Excel: "
+                  f"{output_path.replace('.csv', '.xlsx')}")
 
+        except ImportError:
+            # openpyxl not available — write two CSVs
+            comparable_df.to_csv(output_path, index=False)
+            derived_path = output_path.replace('.csv', '_derived.csv')
+            derived_df.to_csv(derived_path, index=False)
+            print(f"\n✅ Saved: {output_path}")
+            print(f"✅ Saved: {derived_path}")
+
+    return comparable_df, derived_df
 
 # ── Usage ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
