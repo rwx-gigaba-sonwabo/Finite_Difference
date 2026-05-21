@@ -669,25 +669,47 @@ def run_gbm_fx_calibration(json_path, output_path,
 
 
 # ===========================================================================
-# Entry point
+# Entry point — set paths and parameters manually here
 # ===========================================================================
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2 or sys.argv[1] in ('--test', '-t', 'test'):
-        # Run self-test from uploaded file
-        from gbm_fx_implied_calibration import _self_test
-        _self_test()
-        sys.exit(0)
 
-    json_path   = sys.argv[1]
-    fx_name     = sys.argv[2] if len(sys.argv) > 2 else None
-    output_path = sys.argv[3] if len(sys.argv) > 3 \
-                  else r'C:\XVA_engine\outputs\gbm_fx_calibration.xlsx'
+    # ── Set your inputs here ─────────────────────────────────────────────────
+    JSON_PATH   = r"C:\XVA_engine\MarketData.json"
+    OUTPUT_PATH = r"C:\XVA_engine\outputs\gbm_fx_calibration.xlsx"
 
-    calibrated, extracted, comparisons, cal_df, summary_df = \
-        run_gbm_fx_calibration(
-            json_path   = json_path,
-            output_path = output_path,
-            fx_name     = fx_name,
-            verbose     = True,
-        )
+    # Set to a specific currency pair to calibrate one pair only,
+    # or None to calibrate ALL FX pairs found in the JSON
+    FX_NAME     = None   # e.g. "FxRate.USD.ZAR" or None for all
+
+    VERBOSE     = True
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Step 1: Bootstrap calibrated vols from FXVol surfaces in Market Prices
+    calibrated = bootstrap_fx_from_json(
+        json_path = JSON_PATH,
+        fx_name   = FX_NAME,
+        verbose   = VERBOSE,
+    )
+
+    # Step 2: Extract stored production vols from GBMAssetPriceTSModelParameters
+    extracted = extract_gbm_fx_params(
+        json_path = JSON_PATH,
+        fx_names  = FX_NAME,
+        verbose   = VERBOSE,
+    )
+
+    # Step 3: Compare expiry-by-expiry
+    comparisons = compare_gbm_fx_params(
+        calibrated = calibrated,
+        extracted  = extracted,
+        verbose    = VERBOSE,
+    )
+
+    # Step 4: Export to Excel / CSV
+    cal_df, summary_df = export_gbm_fx_results(
+        calibrated  = calibrated,
+        comparisons = comparisons,
+        output_path = OUTPUT_PATH,
+        verbose     = VERBOSE,
+    )
