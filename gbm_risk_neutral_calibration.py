@@ -30,46 +30,115 @@ import pandas as pd
 # ===========================================================================
 
 def load_market_data(json_path):
+    """
+    Load RiskFlow JSON and unwrap the MarketData wrapper if present.
+
+    Handles both:
+      Format A (CVAMarketData): {"MarketData": {"Price Factors": {...}, ...}}
+      Format B (flat):          {"Price Factors": {...}, ...}
+    """
     with open(json_path, 'r') as fh:
-        return json.load(fh)
+        raw = json.load(fh)
+
+    # Unwrap "MarketData" top-level key if present
+    if "MarketData" in raw and isinstance(raw["MarketData"], dict):
+        data = raw["MarketData"]
+        print(f"  JSON format: wrapped (MarketData key found — unwrapped)")
+    else:
+        data = raw
+        print(f"  JSON format: flat (no MarketData wrapper)")
+
+    return data
 
 
 def _curve_array(obj):
     """
-    Extract numpy array from RiskFlow curve / surface object.
-    Handles {'_type':'Curve','array':[...]} and plain list-of-lists.
-    Also handles the .Curve nesting used in some JSON exports.
+    Extract numpy array from all known RiskFlow curve/surface formats:
+
+    Format A: {'_type': 'Curve', 'array': [...]}
+    Format B: {'.Curve': {'meta': [...], 'data': [[...], ...]}}
+    Format C: {'data': [[...], ...]}
+    Format D: plain list of lists
+    Format E: {'Surface': {'.Curve': {'meta': [...], 'data': [...]}}}
     """
+    if obj is None:
+        return np.array([], dtype=float).reshape(0, 2)
+
+    # Unwrap Surface wrapper first (Images 2-4)
+    if isinstance(obj, dict) and 'Surface' in obj:
+        obj = obj['Surface']
+
     if isinstance(obj, dict):
+        # Format A
         if obj.get('_type') == 'Curve':
             return np.array(obj['array'], dtype=float)
+
+        # Format B — .Curve nesting (CVAMarketData format)
         if '.Curve' in obj:
-            return np.array(obj['.Curve'].get('data', []), dtype=float)
-        if 'array' in obj:
-            return np.array(obj['array'], dtype=float)
+            inner = obj['.Curve']
+            data  = inner.get('data', [])
+            return np.array(data, dtype=float)
+
+        # Format C
         if 'data' in obj:
             return np.array(obj['data'], dtype=float)
+
+        # Format D — dict with 'array' key
+        if 'array' in obj:
+            return np.array(obj['array'], dtype=float)
+
+    # Plain list/tuple of lists
     if isinstance(obj, (list, tuple)):
-        return np.array(sorted(obj), dtype=float)
+        return np.array(obj, dtype=float)
+
     return np.array(obj, dtype=float)
 
 
-# ===========================================================================
-# Vol surface reader  (from uploaded file)
-# ===========================================================================
-
 def read_vol_surface(price_factors, vol_name, is_fx=True):
     """
-    Read FXVol or EquityPriceVol surface from price_factors dict.
+    Read FXVol or EquityPriceVol surface.
 
-    Returns np.ndarray shape (N, 3): [moneyness, expiry, vol]
+    Handles the CVAMarketData nesting:
+        "FXVol.EUR.GHS": {
+            "Surface": {
+                ".Curve": {
+                    "meta": [2, "Flat"],
+                    "data": [[moneyness, expiry, vol], ...]
+                }
+            },
+            "Property_Aliases": null
+        }
     """
     prefix = 'FXVol' if is_fx else 'EquityPriceVol'
     key    = f'{prefix}.{vol_name}'
-    if key not in price_factors:
-        raise KeyError(f"'{key}' not found in Price Factors")
-    return _curve_array(price_factors[key].get('Surface', {}))
 
+    if key not in price_factors:
+        raise KeyError(f"'{key}' not found in Price Factors. "
+                       f"Available FXVol keys: "
+                       f"{[k for k in price_factors if k.startswith('FXVol')][:10]}")
+
+    factor_data = price_factors[key]
+
+    # Get the Surface object — could be nested under 'Surface' key
+    surface_obj = factor_data.get('Surface', factor_data)
+
+    arr = _curve_array(surface_obj)
+
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        raise ValueError(
+            f"Could not parse surface for {key}. "
+            f"Got shape {arr.shape}. Raw: {str(factor_data)[:200]}"
+        )
+
+    # Surface columns: [moneyness, expiry, vol]  (3 cols)
+    # Some surfaces may only have 2 cols [expiry, vol]
+    if arr.shape[1] == 2:
+        # Flat surface — no moneyness dimension
+        # Expand to [1.0, expiry, vol]
+        ones = np.ones((arr.shape[0], 1))
+        arr  = np.hstack([ones, arr])
+
+    return arr   # shape (N, 3): [moneyness, expiry, vol]
 
 # ===========================================================================
 # ATM vol extraction  (from uploaded file — core function)
@@ -195,26 +264,8 @@ _MARKET_PRICE_TYPES = {'GBMAssetPriceTSModelPrices', 'GBMTSModelPrices'}
 
 def bootstrap_fx_from_json(json_path, fx_name=None, verbose=True):
     """
-    Full GBM FX implied calibration from a RiskFlow JSON file.
-
-    Parameters
-    ----------
-    json_path : str   path to RiskFlow JSON
-    fx_name   : str   optional filter, e.g. 'EUR.USD'
-    verbose   : bool
-
-    Returns
-    -------
-    dict keyed by currency name, each containing:
-        'Vol'                   list of (expiry, avg_vol)
-        'Quanto_FX_Volatility'  None
-        'Quanto_FX_Correlation' 0.0
-        '_vol_surface_name'     str
-        '_is_fx'                bool
-        '_was_corrected'        bool
-        '_details'              list of per-expiry diagnostic dicts
-        '_expiries'             np.ndarray
-        '_atm_vols_raw'         np.ndarray  (before correction)
+    Full GBM FX implied calibration pipeline.
+    Now correctly handles CVAMarketData JSON structure.
     """
     if verbose:
         print("=" * 70)
@@ -223,12 +274,34 @@ def bootstrap_fx_from_json(json_path, fx_name=None, verbose=True):
         print(f"  File: {json_path}")
 
     market_data   = load_market_data(json_path)
-    price_factors = market_data.get('Price Factors', {})
-    market_prices = market_data.get('Market Prices', {})
+
+    # Both key variants seen in the wild
+    price_factors = (
+        market_data.get('Price Factors')
+        or market_data.get('PriceFactors')
+        or {}
+    )
+    market_prices = (
+        market_data.get('Market Prices')
+        or market_data.get('MarketPrices')
+        or {}
+    )
 
     if verbose:
         print(f"  Price Factors : {len(price_factors)} entries")
         print(f"  Market Prices : {len(market_prices)} entries")
+        # Show what GBMAssetPriceTSModel keys exist
+        gbm_pf_keys = [k for k in price_factors
+                       if 'GBMAsset' in k or 'GBMTSModel' in k]
+        gbm_mp_keys = [k for k in market_prices
+                       if 'GBMAsset' in k or 'GBMTSModel' in k]
+        fxvol_keys  = [k for k in price_factors if k.startswith('FXVol')]
+        print(f"  GBM Price Factor keys : {len(gbm_pf_keys)}  "
+              f"e.g. {gbm_pf_keys[:3]}")
+        print(f"  GBM Market Price keys : {len(gbm_mp_keys)}  "
+              f"e.g. {gbm_mp_keys[:3]}")
+        print(f"  FXVol surface keys    : {len(fxvol_keys)}  "
+              f"e.g. {fxvol_keys[:5]}")
 
     results = {}
 
@@ -246,15 +319,17 @@ def bootstrap_fx_from_json(json_path, fx_name=None, verbose=True):
         vol_name   = instrument.get('Asset_Price_Volatility', '')
         if not vol_name:
             if verbose:
-                print(f"  WARNING: No Asset_Price_Volatility for {mp_name} — skipping")
+                print(f"  WARNING: No Asset_Price_Volatility for "
+                      f"{mp_name} — skipping")
             continue
 
-        is_fx = ('FXVol.'          + vol_name) in price_factors
-        is_eq = ('EquityPriceVol.' + vol_name) in price_factors
+        is_fx = (f'FXVol.{vol_name}')          in price_factors
+        is_eq = (f'EquityPriceVol.{vol_name}') in price_factors
 
         if not is_fx and not is_eq:
             if verbose:
-                print(f"  WARNING: surface not found for {vol_name} — skipping {currency}")
+                print(f"  WARNING: Neither FXVol.{vol_name} nor "
+                      f"EquityPriceVol.{vol_name} found — skipping {currency}")
             continue
 
         surf_type = 'FXVol' if is_fx else 'EquityPriceVol'
@@ -264,41 +339,32 @@ def bootstrap_fx_from_json(json_path, fx_name=None, verbose=True):
             print(f"  Surface  : {surf_type}.{vol_name}")
 
         try:
-            surface_arr = read_vol_surface(price_factors, vol_name, is_fx=is_fx)
-        except KeyError as exc:
+            surface_arr = read_vol_surface(
+                price_factors, vol_name, is_fx=is_fx
+            )
+        except (KeyError, ValueError) as exc:
             if verbose:
-                print(f"  ERROR: {exc} — skipping")
+                print(f"  ERROR reading surface: {exc} — skipping")
             continue
 
-        # ── Core extraction: ATM vols from surface ───────────────────────────
         expiries, atm_vols_raw = extract_atm_vols(surface_arr)
 
         if verbose:
-            print(f"\n  Raw ATM vols ({len(expiries)} expiry points):")
+            print(f"  Extracted {len(expiries)} ATM vol points")
             print(f"  {'Expiry':>8s}  {'ATM Vol':>10s}  {'Variance':>10s}")
-            print("  " + "-" * 36)
+            print("  " + "-"*36)
             for t, v in zip(expiries, atm_vols_raw):
                 print(f"  {t:8.4f}  {v:10.6f}  {v*v*t:10.6f}")
 
-        # ── Variance correction ──────────────────────────────────────────────
         avg_vols, inst_vols, was_corrected, details = \
             correct_declining_variance(expiries, atm_vols_raw)
 
-        if verbose:
-            if was_corrected:
-                print(f"\n  NOTE: Declining variance corrected.")
-            print(f"\n  Calibrated Vol curve (after correction):")
-            print(f"  {'Expiry':>8s}  {'Raw ATM':>10s}  {'Avg Vol':>10s}  "
-                  f"{'Inst Vol':>10s}  {'Variance':>10s}  {'Clamped':>8s}")
-            print("  " + "-" * 70)
-            for d in details:
-                flag = '*' if d['clamped'] else ' '
-                print(f"  {d['expiry']:8.4f}  {d['raw_atm_vol']:10.6f}  "
-                      f"{d['avg_vol']:10.6f}  {d['inst_vol']:10.6f}  "
-                      f"{d['var_actual']:10.6f}  {flag:>8s}")
+        if verbose and was_corrected:
+            print(f"  NOTE: Declining variance corrected.")
 
         results[currency] = {
-            'Vol'                   : list(zip(expiries.tolist(), avg_vols)),
+            'Vol'                   : list(zip(
+                                          expiries.tolist(), avg_vols)),
             'Quanto_FX_Volatility'  : None,
             'Quanto_FX_Correlation' : 0.0,
             '_vol_surface_name'     : vol_name,
@@ -311,15 +377,14 @@ def bootstrap_fx_from_json(json_path, fx_name=None, verbose=True):
 
     if not results and verbose:
         print(f"\n  WARNING: No GBM market price entries found.")
-        print(f"  First 20 Market Prices keys:")
-        for k in list(market_prices.keys())[:20]:
-            print(f"    {k}")
+        all_types = set(k.split('.')[0] for k in market_prices)
+        print(f"  Market Prices entry types found: {all_types}")
 
     if verbose:
-        print("\n" + "=" * 70)
+        print("\n" + "="*70)
         print(f"  Calibrated {len(results)} pair(s): "
               f"{', '.join(results.keys()) or 'none'}")
-        print("=" * 70)
+        print("="*70)
 
     return results
 
@@ -331,24 +396,15 @@ def bootstrap_fx_from_json(json_path, fx_name=None, verbose=True):
 
 def extract_gbm_fx_params(json_path, fx_names=None, verbose=True):
     """
-    Extract stored GBM FX parameters from the Price Factors section.
-    These are the PRODUCTION values RiskFlow reads at runtime.
-
-    Parameters
-    ----------
-    json_path : str
-    fx_names  : str, list, or None (extract all)
-
-    Returns
-    -------
-    dict keyed by currency name:
-        'Vol_Curve'             list of [expiry, vol]
-        'Integrated_Variance'   list of [expiry, V(T)]
-        'Quanto_FX_Volatility'  list or None
-        'Quanto_FX_Correlation' float
+    Extract stored GBMAssetPriceTSModelParameters from Price Factors.
+    Handles CVAMarketData JSON structure.
     """
     market_data   = load_market_data(json_path)
-    price_factors = market_data.get('Price Factors', {})
+    price_factors = (
+        market_data.get('Price Factors')
+        or market_data.get('PriceFactors')
+        or {}
+    )
 
     GBM_PREFIX = 'GBMAssetPriceTSModelParameters.'
 
@@ -359,48 +415,48 @@ def extract_gbm_fx_params(json_path, fx_names=None, verbose=True):
             if k.startswith(GBM_PREFIX)
         ]
         if not fx_names and verbose:
-            print("WARNING: No GBMAssetPriceTSModelParameters entries found.")
-            print("Available Price Factor keys (first 20):",
-                  list(price_factors.keys())[:20])
+            print("WARNING: No GBMAssetPriceTSModelParameters found.")
+            gbm_any = [k for k in price_factors
+                       if 'GBM' in k or 'Gbm' in k]
+            print(f"  GBM-related keys found: {gbm_any[:10]}")
     elif isinstance(fx_names, str):
         fx_names = [fx_names]
 
     results = {}
 
     for name in fx_names:
-        full_key = GBM_PREFIX + name \
-                   if not name.startswith(GBM_PREFIX) else name
+        full_key = (GBM_PREFIX + name
+                    if not name.startswith(GBM_PREFIX) else name)
         clean    = full_key[len(GBM_PREFIX):]
 
         factor_data = price_factors.get(full_key)
         if factor_data is None:
             if verbose:
-                print(f"WARNING: '{full_key}' not found in Price Factors.")
+                print(f"WARNING: '{full_key}' not found.")
             continue
 
-        # ── Extract Vol curve ────────────────────────────────────────────────
-        vol_raw  = factor_data.get('Vol')
+        vol_raw = factor_data.get('Vol')
         if vol_raw is None:
             if verbose:
-                print(f"WARNING: No 'Vol' key in {full_key}")
+                print(f"WARNING: No 'Vol' in {full_key}")
             continue
 
-        vol_arr  = _curve_array(vol_raw)
-        if vol_arr.ndim != 2 or vol_arr.shape[1] < 2:
+        vol_arr = _curve_array(vol_raw)
+        if vol_arr.ndim != 2 or vol_arr.shape[0] == 0:
             if verbose:
-                print(f"WARNING: Unexpected Vol shape {vol_arr.shape} for {full_key}")
+                print(f"WARNING: Unexpected Vol shape "
+                      f"{vol_arr.shape} for {full_key}")
             continue
 
         vol_pairs = [[float(r[0]), float(r[1])] for r in vol_arr]
-
-        # Recompute integrated variance from stored vols
         integ_var = [[T, v**2 * T] for T, v in vol_pairs]
 
-        # ── Quanto fields ────────────────────────────────────────────────────
-        qv_raw  = factor_data.get('Quanto_FX_Volatility')
-        qv      = _curve_array(qv_raw).tolist() \
-                  if qv_raw is not None and qv_raw != 0.0 else []
-        qc      = float(factor_data.get('Quanto_FX_Correlation', 0.0) or 0.0)
+        qv_raw = factor_data.get('Quanto_FX_Volatility')
+        qv     = (_curve_array(qv_raw).tolist()
+                  if qv_raw is not None and qv_raw != 0.0 else [])
+        qc     = float(
+            factor_data.get('Quanto_FX_Correlation', 0.0) or 0.0
+        )
 
         results[clean] = {
             'Vol_Curve'            : vol_pairs,
@@ -410,13 +466,11 @@ def extract_gbm_fx_params(json_path, fx_names=None, verbose=True):
         }
 
         if verbose:
-            print(f"\n✅ Extracted '{full_key}':")
-            print(f"   Vol Curve : {len(vol_pairs)} expiry points  "
+            print(f"✅ Extracted '{full_key}': "
+                  f"{len(vol_pairs)} expiry points  "
                   f"first={vol_pairs[0]}  last={vol_pairs[-1]}")
-            print(f"   Quanto FX Correlation: {qc}")
 
     return results
-
 
 # ===========================================================================
 # STEP 3: compare_gbm_fx_params
