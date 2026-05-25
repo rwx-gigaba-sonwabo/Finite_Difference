@@ -1,0 +1,60 @@
+def _build_cpi_fixings(
+    self,
+    instrument,
+    base_market_state: dict[str, RiskFactorSlice],
+    sim_date: date,
+    cpi_fixings_cache: dict[int, dict],
+    scenario_dates: list[date],
+    all_states: list[dict[str, RiskFactorSlice]],
+) -> dict:
+    """Return CPI kwargs for scenario_npvs, or {} for non-CPI instruments.
+
+    The cache stores pathwise CPI levels by CPI reference month. A cached
+    value is only *used* by pricing once the reference date is at or before
+    T_last_pub; unpublished dates are still projected from T_last_pub inside
+    models.inflation_pv._get_cpi_level.
+
+    For reference dates between simulation dates, the CPI fixing is stamped
+    from an interpolated reset-date market state, matching RiskFlow's
+    scenario-offset interpolation more closely than nearest-prior lookup.
+    """
+    if not hasattr(instrument, "get_cpi_reference_dates"):
+        return {}
+
+    inst_id = id(instrument)
+    if inst_id not in cpi_fixings_cache:
+        cpi_fixings_cache[inst_id] = {}
+
+    accumulated = cpi_fixings_cache[inst_id]
+
+    if hasattr(instrument, "_compute_t_last_pub_fixing"):
+        accumulated.update(
+            instrument._compute_t_last_pub_fixing(
+                base_market_state, sim_date, accumulated,
+            )
+        )
+
+    for ref_date, _cpi_name in instrument.get_cpi_reference_dates():
+        if ref_date > sim_date:
+            break
+        if ref_date in accumulated:
+            continue
+
+        fix_state = self._interpolated_market_state(
+            ref_date,
+            scenario_dates,
+            all_states,
+        )
+        accumulated.update(
+            instrument._compute_cpi_fixing_for_date(ref_date, fix_state)
+        )
+
+    cpi_last_pub_date = (
+        instrument.get_cpi_last_pub_date(sim_date)
+        if hasattr(instrument, "get_cpi_last_pub_date")
+        else None
+    )
+    return {
+        "cpi_fixings": accumulated,
+        "cpi_last_pub_date": cpi_last_pub_date,
+    }
