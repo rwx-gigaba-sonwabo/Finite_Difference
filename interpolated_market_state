@@ -1,0 +1,72 @@
+def _interpolated_market_state(
+    self,
+    target_date: date,
+    scenario_dates: list[date],
+    all_states: list[dict],
+) -> dict[str, RiskFactorSlice]:
+    """Return market state linearly interpolated to target_date.
+
+    This is closer to RiskFlow's TimeGrid.get_scenario_offset + 
+    gather_scenario_interp behaviour than using the nearest prior scenario.
+    """
+    if target_date <= scenario_dates[0]:
+        return all_states[0]
+
+    if target_date >= scenario_dates[-1]:
+        return all_states[-1]
+
+    right_idx = bisect_right(scenario_dates, target_date)
+    left_idx = right_idx - 1
+
+    left_date = scenario_dates[left_idx]
+    right_date = scenario_dates[right_idx]
+
+    if target_date == left_date:
+        return all_states[left_idx]
+
+    if target_date == right_date:
+        return all_states[right_idx]
+
+    alpha = (
+        (target_date - left_date).days
+        / (right_date - left_date).days
+    )
+
+    left_state = all_states[left_idx]
+    right_state = all_states[right_idx]
+    interp_state: dict[str, RiskFactorSlice] = {}
+
+    for name, left_slice in left_state.items():
+        right_slice = right_state[name]
+
+        if isinstance(left_slice, ScalarSlice):
+            interp_state[name] = ScalarSlice(
+                values=(
+                    (1.0 - alpha) * left_slice.values
+                    + alpha * right_slice.values
+                )
+            )
+
+        elif isinstance(left_slice, CurveSlice):
+            interp_state[name] = CurveSlice(
+                values=(
+                    (1.0 - alpha) * left_slice.values
+                    + alpha * right_slice.values
+                ),
+                tenors=left_slice.tenors,
+            )
+
+        elif isinstance(left_slice, SurfaceSlice):
+            interp_state[name] = SurfaceSlice(
+                values=(
+                    (1.0 - alpha) * left_slice.values
+                    + alpha * right_slice.values
+                ),
+                tenors=left_slice.tenors,
+                strikes=left_slice.strikes,
+            )
+
+        else:
+            interp_state[name] = left_slice
+
+    return interp_state
