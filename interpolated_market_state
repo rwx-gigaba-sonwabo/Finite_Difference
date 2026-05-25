@@ -1,14 +1,22 @@
+# ------------------------------------------------------------------
+# Market-state interpolation for reset/fixing dates
+# ------------------------------------------------------------------
+
 def _interpolated_market_state(
     self,
     target_date: date,
     scenario_dates: list[date],
-    all_states: list[dict],
+    all_states: list[dict[str, RiskFactorSlice]],
 ) -> dict[str, RiskFactorSlice]:
-    """Return market state linearly interpolated to target_date.
+    """Return the market state linearly interpolated to target_date.
 
-    This is closer to RiskFlow's TimeGrid.get_scenario_offset + 
-    gather_scenario_interp behaviour than using the nearest prior scenario.
+    This is closer to RiskFlow's scenario-offset interpolation than using
+    the nearest scenario date on or before the fixing date. It matters
+    whenever CPI reference dates fall between exposure simulation dates.
     """
+    if not scenario_dates:
+        raise ValueError("scenario_dates cannot be empty")
+
     if target_date <= scenario_dates[0]:
         return all_states[0]
 
@@ -23,24 +31,22 @@ def _interpolated_market_state(
 
     if target_date == left_date:
         return all_states[left_idx]
-
     if target_date == right_date:
         return all_states[right_idx]
 
-    alpha = (
-        (target_date - left_date).days
-        / (right_date - left_date).days
-    )
+    alpha = (target_date - left_date).days / (right_date - left_date).days
 
     left_state = all_states[left_idx]
     right_state = all_states[right_idx]
-    interp_state: dict[str, RiskFactorSlice] = {}
+    interpolated: dict[str, RiskFactorSlice] = {}
 
     for name, left_slice in left_state.items():
         right_slice = right_state[name]
 
         if isinstance(left_slice, ScalarSlice):
-            interp_state[name] = ScalarSlice(
+            if not isinstance(right_slice, ScalarSlice):
+                raise TypeError(f"Mismatched risk factor slice type for {name}")
+            interpolated[name] = ScalarSlice(
                 values=(
                     (1.0 - alpha) * left_slice.values
                     + alpha * right_slice.values
@@ -48,7 +54,9 @@ def _interpolated_market_state(
             )
 
         elif isinstance(left_slice, CurveSlice):
-            interp_state[name] = CurveSlice(
+            if not isinstance(right_slice, CurveSlice):
+                raise TypeError(f"Mismatched risk factor slice type for {name}")
+            interpolated[name] = CurveSlice(
                 values=(
                     (1.0 - alpha) * left_slice.values
                     + alpha * right_slice.values
@@ -57,7 +65,9 @@ def _interpolated_market_state(
             )
 
         elif isinstance(left_slice, SurfaceSlice):
-            interp_state[name] = SurfaceSlice(
+            if not isinstance(right_slice, SurfaceSlice):
+                raise TypeError(f"Mismatched risk factor slice type for {name}")
+            interpolated[name] = SurfaceSlice(
                 values=(
                     (1.0 - alpha) * left_slice.values
                     + alpha * right_slice.values
@@ -67,6 +77,9 @@ def _interpolated_market_state(
             )
 
         else:
-            interp_state[name] = left_slice
+            raise TypeError(
+                f"Unsupported risk factor slice type for {name}: "
+                f"{type(left_slice)}"
+            )
 
-    return interp_state
+    return interpolated
