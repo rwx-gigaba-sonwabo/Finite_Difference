@@ -1,0 +1,91 @@
+def _get_cpi_level(
+    ref_date: date,
+    val_date: date,
+    cpi_interp: Optional[Callable],
+    hist_map: Dict[date, float],
+    curve_day_counter: ql.DayCounter,
+    ql_val: ql.Date,
+    n_paths: int,
+    cpi_fixings: Optional[Dict[date, np.ndarray]] = None,
+    spot_cpi: Optional[np.ndarray] = None,
+    inflation_rate_curve: Optional[YieldCurve] = None,
+    last_pub_date: Optional[date] = None,
+) -> np.ndarray:
+    """Return CPI(ref_date) as a pathwise array.
+
+    RiskFlow-style mode is active when ``inflation_rate_curve`` is provided.
+    In that mode, only CPI reference dates at or before ``last_pub_date`` are
+    treated as fixed/published. Any reference date after ``last_pub_date`` —
+    even if it is calendar-past — is projected from CPI(last_pub_date) using
+    the inflation-rate curve.
+    """
+    use_riskflow = inflation_rate_curve is not None
+
+    # ------------------------------------------------------------------
+    # Legacy mode: preserve the old behaviour as closely as possible.
+    # ------------------------------------------------------------------
+    if not use_riskflow:
+        if cpi_fixings is not None and ref_date in cpi_fixings:
+            return np.asarray(cpi_fixings[ref_date], dtype=np.float64)
+
+        if ref_date in hist_map:
+            return np.full(n_paths, hist_map[ref_date], dtype=np.float64)
+
+        if ref_date <= val_date:
+            known = [k for k in hist_map if k <= val_date]
+            if known:
+                return np.full(n_paths, hist_map[max(known)], dtype=np.float64)
+            return np.zeros(n_paths, dtype=np.float64)
+
+        if cpi_interp is None:
+            raise ValueError("cpi_interp is required in legacy CPI mode")
+
+        t_ref = float(curve_day_counter.yearFraction(
+            ql_val,
+            to_ql_date(ref_date),
+        ))
+        return cpi_interp(t_ref)
+
+    # ------------------------------------------------------------------
+    # RiskFlow-style mode: PriceIndex + InflationRate.
+    # ------------------------------------------------------------------
+    if last_pub_date is None:
+        last_pub_date = _shift_months(_first_of_month(val_date), -1)
+
+    # Published CPI reference dates are true fixings/resets.
+    if ref_date <= last_pub_date:
+        if cpi_fixings is not None and ref_date in cpi_fixings:
+            return np.asarray(cpi_fixings[ref_date], dtype=np.float64)
+
+        if ref_date in hist_map:
+            return np.full(n_paths, hist_map[ref_date], dtype=np.float64)
+
+        raise ValueError(
+            f"Missing published CPI fixing for ref_date={ref_date}. "
+            f"last_pub_date={last_pub_date}."
+        )
+
+    # Unpublished-past or future CPI reference dates are projected from
+    # T_last_pub. Do NOT use cpi_fixings[ref_date] here, even if it exists;
+    # the engine may have precomputed old reset values before publication.
+    anchor_date = last_pub_date
+
+    if cpi_fixings is not None and anchor_date in cpi_fixings:
+        anchor_cpi = np.asarray(cpi_fixings[anchor_date], dtype=np.float64)
+    elif anchor_date in hist_map:
+        anchor_cpi = np.full(n_paths, hist_map[anchor_date], dtype=np.float64)
+    elif spot_cpi is not None:
+        # In RiskFlow-style setup, the PriceIndex factor at valuation time
+        # represents the latest published CPI level, i.e. CPI(T_last_pub).
+        anchor_cpi = np.asarray(spot_cpi, dtype=np.float64)
+    else:
+        raise ValueError(
+            f"Cannot determine CPI projection anchor at {anchor_date}."
+        )
+
+    t_ref = float(curve_day_counter.yearFraction(
+        to_ql_date(anchor_date),
+        to_ql_date(ref_date),
+    ))
+    df_infl = inflation_rate_curve.discount_factor(t_ref)
+    return anchor_cpi / df_infl
