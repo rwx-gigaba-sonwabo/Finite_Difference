@@ -13,7 +13,7 @@ import QuantLib as ql
 from utils.ql_helpers import to_ql_date, BUSINESS_CONVENTIONS, generate_sub_periods
 from market_data.yield_curve import YieldCurve
 from market_data.risk_factor import CurveSlice, RiskFactorSlice
-from models.cashflow_pv import leg_pv
+from models.cashflow_pv import leg_pv, _build_overnight_tenors
 
 
 # ---------------------------------------------------------------------------
@@ -135,25 +135,29 @@ class IRSwap(Instrument):
         t_to: date,
         time_slice: dict[str, RiskFactorSlice],
     ) -> np.ndarray:
-        """One-step OIS compound factor 1/DF(t_from → t_to).
+        """One-step OIS compound factor ∏ DF(dᵢ)/DF(dᵢ₊₁) over [t_from, t_to].
 
-        Uses the OIS projection curve from *time_slice* (the scenario at
-        *t_from*) to estimate the overnight compounding over [t_from, t_to].
+        Builds the business-day tenor grid between t_from and t_to (tenors
+        measured from t_from, the scenario origin) and returns the product of
+        consecutive discount-factor ratios.  By telescoping this equals
+        DF(0)/DF(τ) = 1/DF(τ), matching the scalar shortcut exactly.  The
+        daily grid is kept explicit so the accumulation mirrors the overnight
+        compounding structure used in _calc_forward_rates for future periods,
+        and extends naturally to lockout / lookback variants.
 
         Parameters
         ----------
         curve_name : str
             OIS projection curve key in *time_slice*.
         t_from, t_to : date
-            Endpoints of the increment (t_to is the next simulation date
-            or the current valuation date).
+            Endpoints of the step (consecutive simulation dates).
         time_slice : dict
             Market state at *t_from*.
 
         Returns
         -------
         np.ndarray, shape (n_paths,)
-            1 / DF(τ)  where τ = yearFraction(t_from, t_to).
+            Compound factor for [t_from, t_to].
         """
         sc = self.schedule_config
         fwd_slice: CurveSlice = time_slice[curve_name]
@@ -162,10 +166,14 @@ class IRSwap(Instrument):
             rates=fwd_slice.values,
             interpolator=self.interpolator,
         )
-        tau = sc.curve_day_counter.yearFraction(
-            to_ql_date(t_from), to_ql_date(t_to),
+        t_sched = _build_overnight_tenors(
+            t_from, t_to,
+            val_date=t_from,
+            calendar=sc.ql_calendar,
+            curve_day_counter=sc.curve_day_counter,
         )
-        return 1.0 / fwd_curve.discount_factor(tau)  # (n_paths,)
+        dfs = fwd_curve.discount_factor(t_sched)          # (n_paths, n_bdays+1)
+        return np.prod(dfs[:, :-1] / dfs[:, 1:], axis=1)  # (n_paths,)
 
     def compute_fixings(
         self,
@@ -261,11 +269,3 @@ class IRSwap(Instrument):
             day_counter=sc.day_counter,
             curve_day_counter=sc.curve_day_counter,
             calendar=sc.ql_calendar,
-            fixings=fixings,
-            include_on_val_date=include_on_date,
-        )
-
-        rec_pv = leg_pv(self.receive_schedule, self.receive_leg, **common_kwargs)
-        pay_pv = leg_pv(self.pay_schedule, self.pay_leg, **common_kwargs)
-
-        return rec_pv - pay_pv
