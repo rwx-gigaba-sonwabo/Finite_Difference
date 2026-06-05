@@ -269,3 +269,11 @@ class IRSwap(Instrument):
             day_counter=sc.day_counter,
             curve_day_counter=sc.curve_day_counter,
             calendar=sc.ql_calendar,
+            fixings=fixings,
+            include_on_val_date=include_on_date,
+        )
+
+        rec_pv = leg_pv(self.receive_schedule, self.receive_leg, **common_kwargs)
+        pay_pv = leg_pv(self.pay_schedule, self.pay_leg, **common_kwargs)
+
+        return rec_pv - pay_pv
