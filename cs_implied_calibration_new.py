@@ -183,21 +183,56 @@ def cs_variance(sigma, alpha, T, S):
 # Factor lookup builders
 # ===========================================================================
 
+def _curve_array(obj):
+    """
+    Extract a numpy float array from all known RiskFlow curve/surface formats.
+
+    Format A: {'_type': 'Curve', 'array': [...]}            -- legacy flat JSON
+    Format B: {'.Curve': {'meta': [...], 'data': [[...]]}}  -- CVAMarketData
+    Format C: {'data': [[...]]}                              -- bare data wrapper
+    Format D: {'array': [...]}                               -- bare array wrapper
+    Format E: plain list/tuple of lists
+    Format F: surface wrapper {'Surface': <any above>}
+    """
+    if obj is None:
+        return np.array([], dtype=float).reshape(0, 2)
+
+    # Unwrap Surface wrapper
+    if isinstance(obj, dict) and 'Surface' in obj:
+        obj = obj['Surface']
+
+    if isinstance(obj, dict):
+        # Format A
+        if obj.get('_type') == 'Curve':
+            return np.array(obj['array'], dtype=float)
+        # Format B -- CVAMarketData nesting
+        if '.Curve' in obj:
+            inner = obj['.Curve']
+            return np.array(inner.get('data', []), dtype=float)
+        # Format C
+        if 'data' in obj:
+            return np.array(obj['data'], dtype=float)
+        # Format D
+        if 'array' in obj:
+            return np.array(obj['array'], dtype=float)
+
+    # Format E -- plain list/tuple
+    if isinstance(obj, (list, tuple)):
+        return np.array(obj, dtype=float)
+
+    return np.array(obj, dtype=float)
+
+
 def _build_forward_lookup(price_factors, energy_name):
     """
     Build a forward price interpolator from the Price Factors section.
     Replicates ForwardPrice.current_value(excel_date).
+    Handles all CVAMarketData curve formats via _curve_array().
     """
     factor_key  = 'ForwardPrice.' + energy_name
     factor_data = price_factors[factor_key]
 
-    curve = factor_data['Curve']
-    if isinstance(curve, dict) and curve.get('_type') == 'Curve':
-        arr = curve['array']
-    else:
-        arr = np.array(sorted(curve))
-
-    arr     = np.array(arr, dtype=float)
+    arr     = _curve_array(factor_data.get('Curve', factor_data))
     tenors  = arr[:, 0]
     prices  = arr[:, 1]
 
@@ -211,17 +246,12 @@ def _build_discount_lookup(price_factors, discount_rate_name):
     """
     Build a discount rate interpolator from the Price Factors section.
     Replicates InterestRate.current_value(year_fraction).
+    Handles all CVAMarketData curve formats via _curve_array().
     """
     factor_key  = 'InterestRate.' + discount_rate_name
     factor_data = price_factors[factor_key]
 
-    curve = factor_data['Curve']
-    if isinstance(curve, dict) and curve.get('_type') == 'Curve':
-        arr = curve['array']
-    else:
-        arr = np.array(sorted(curve))
-
-    arr     = np.array(arr, dtype=float)
+    arr     = _curve_array(factor_data.get('Curve', factor_data))
     tenors  = arr[:, 0]
     rates   = arr[:, 1]
 
@@ -243,15 +273,14 @@ def _build_vol_surface_lookup(price_factors, vol_name):
     """
     Build a volatility surface interpolator from the Price Factors section.
     Replicates ForwardPriceVol.current_value([[t, d, moneyness]]).
+    Handles all CVAMarketData surface formats via _curve_array().
     """
     factor_key  = 'ForwardPriceVol.' + vol_name
     factor_data = price_factors[factor_key]
 
-    surface = factor_data['Surface']
-    if isinstance(surface, dict) and surface.get('_type') == 'Curve':
-        arr = surface['array']
-    else:
-        arr = np.array(sorted(surface))
+    # Surface may live under a 'Surface' key or directly on factor_data
+    surface_obj = factor_data.get('Surface', factor_data)
+    arr         = _curve_array(surface_obj)
 
     arr              = np.array(arr, dtype=float)
     unique_moneyness = np.unique(arr[:, 2])
