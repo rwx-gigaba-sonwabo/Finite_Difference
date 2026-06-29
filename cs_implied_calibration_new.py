@@ -323,14 +323,41 @@ def bootstrap_from_json(json_path, commodity_name=None, verbose=True):
     market_prices = market_data.get('Market Prices', {})
     sys_params    = market_data.get('System Parameters', {})
 
-    # Resolve Base_Date
-    base_date = sys_params.get('Base_Date')
+    # Resolve Base_Date — handles string, Excel serial int, and dict formats
+    def _parse_base_date(raw):
+        """
+        RiskFlow JSONs store Base_Date in several formats:
+          - plain string:        "2026-02-26"
+          - Excel serial int:    45000  (days since 1899-12-30)
+          - dict with value key: {"_value": "2026-02-26"} or
+                                 {"_value": 45000}
+        """
+        if raw is None:
+            return None
+        # Unwrap dict — e.g. {"_value": ..., "_type": "DateOffset"}
+        if isinstance(raw, dict):
+            raw = (raw.get('_value') or raw.get('value') or
+                   raw.get('date')   or raw.get('Date') or
+                   next(iter(raw.values()), None))
+        if raw is None:
+            return None
+        if isinstance(raw, (int, float)):
+            # Excel serial date — same EXCEL_OFFSET used for forward lookups
+            return EXCEL_OFFSET + pd.Timedelta(days=int(raw))
+        if isinstance(raw, str):
+            return pd.Timestamp(raw)
+        if isinstance(raw, pd.Timestamp):
+            return raw
+        # Last resort
+        return pd.Timestamp(str(raw))
+
+    base_date = _parse_base_date(sys_params.get('Base_Date'))
     if base_date is None:
         val_config = market_data.get('Valuation Configuration', {})
         if isinstance(val_config, dict):
-            base_date = val_config.get('Base_Date', val_config.get('Run_Date'))
-    if isinstance(base_date, str):
-        base_date = pd.Timestamp(base_date)
+            base_date = _parse_base_date(
+                val_config.get('Base_Date', val_config.get('Run_Date'))
+            )
 
     if base_date is None:
         raise ValueError(
