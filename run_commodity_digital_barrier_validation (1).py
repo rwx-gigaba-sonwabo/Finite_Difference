@@ -372,7 +372,7 @@ def main(cfg: Config = CONFIG) -> None:
             day_count=cfg.day_count, interpolation=cfg.json_forward_interp,
         )
         money_market_curve = build_yield_curve_from_json(
-            cfg.json_path, cfg.money_market_curve_risk_key,
+            cfg.json_path, cfg.money_market_curve_risk_key, cfg.val_date,
             rate_convention=cfg.money_market_rate_convention_json,
             compounding_freq=cfg.money_market_compounding_freq_json,
             interpolation=cfg.money_market_interp_json,
@@ -382,14 +382,14 @@ def main(cfg: Config = CONFIG) -> None:
         domestic_curve_obj = foreign_curve_obj = fx_spot = None
         if is_composite:
             domestic_curve_obj = build_yield_curve_from_json(
-                cfg.json_path, cfg.domestic_curve_risk_key,
+                cfg.json_path, cfg.domestic_curve_risk_key, cfg.val_date,
                 rate_convention=cfg.domestic_rate_convention_json,
                 compounding_freq=cfg.domestic_compounding_freq_json,
                 interpolation=cfg.domestic_interp_json,
             )
             if cfg.domestic_basis_curve_risk_key is not None:
                 domestic_basis = build_yield_curve_from_json(
-                    cfg.json_path, cfg.domestic_basis_curve_risk_key,
+                    cfg.json_path, cfg.domestic_basis_curve_risk_key, cfg.val_date,
                     rate_convention=cfg.domestic_rate_convention_json,
                     compounding_freq=cfg.domestic_compounding_freq_json,
                     interpolation="linear",
@@ -399,14 +399,14 @@ def main(cfg: Config = CONFIG) -> None:
                 )
 
             foreign_curve_obj = build_yield_curve_from_json(
-                cfg.json_path, cfg.foreign_curve_risk_key,
+                cfg.json_path, cfg.foreign_curve_risk_key, cfg.val_date,
                 rate_convention=cfg.foreign_rate_convention_json,
                 compounding_freq=cfg.foreign_compounding_freq_json,
                 interpolation=cfg.foreign_interp_json,
             )
             if cfg.foreign_basis_curve_risk_key is not None:
                 foreign_basis = build_yield_curve_from_json(
-                    cfg.json_path, cfg.foreign_basis_curve_risk_key,
+                    cfg.json_path, cfg.foreign_basis_curve_risk_key, cfg.val_date,
                     rate_convention=cfg.foreign_rate_convention_json,
                     compounding_freq=cfg.foreign_compounding_freq_json,
                     interpolation="linear",
