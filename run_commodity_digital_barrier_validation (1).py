@@ -44,6 +44,16 @@ For a composite trade: set ``domestic_curve``, ``foreign_curve``, and
 all as ``None`` for a standard single-currency trade -- only
 ``money_market_curve`` is used.
 
+``settlement_days`` / ``settlement_calendar`` control when the option
+actually settles -- independent of ``spot_days`` (which only shifts the
+forward-curve lookup date for the underlying's own price). This single
+setting drives both the money-market discount factor and, for a
+composite trade, the delivery date used on both legs of the FX-forward
+that converts the underlying's forward curve into domestic terms --
+keeping the FX rate baked into the composite curve consistent with the
+date the converted payoff is actually discounted at, even when the
+option settles a few days after the underlying's own spot convention.
+
 To run a validation check: edit the CONFIG block below directly, then
 run this file. No command-line flags to remember.
 
@@ -162,8 +172,19 @@ class Config:
     money_market_compounding_freq: int = 1  # 1=NACA, 2=NACS, 4=NACQ, 12=NACM
     money_market_interp: str = "hermite_rt"
     # "linear" | "linear_rt" | "reciprocal_time" | "hermite_rt" | "stitched_linear_hermite_rt"
-    money_market_settle_days: int = 2
-    money_market_settlement_calendar: str = "USD"
+
+    # --- Settlement (when the option settles) -------------------------------
+    # Independent of spot_days (which only shifts the forward-curve lookup
+    # date -- see Trade terms below). Drives: (1) the money-market discount
+    # factor (T_disc, via settlement_date = maturity + settlement_days), and
+    # (2) -- for a composite trade -- the delivery date used on *both* legs
+    # of the FX-forward that converts the underlying's forward curve into
+    # domestic terms. A single settlement_days here keeps the FX rate baked
+    # into the composite curve consistent with the date the converted
+    # payoff is actually discounted at, even when the option settles a few
+    # days after the underlying's own spot convention.
+    settlement_days: int = 2
+    settlement_calendar: str = "USD"
 
     # --- Domestic curve (CSV composite, FX-forward only) -------------------
     domestic_curve: Path | None = None
@@ -172,8 +193,6 @@ class Config:
     domestic_rate_convention: str = "NACA"
     domestic_compounding_freq: int = 1
     domestic_interp: str = "hermite_rt"
-    domestic_settle_days: int = 2
-    domestic_settlement_calendar: str = "USD"
 
     # Optional cross-currency basis spread added onto domestic_curve
     domestic_basis_curve: Path | None = None
@@ -181,8 +200,6 @@ class Config:
     domestic_basis_value_col: str = "value"
     domestic_basis_rate_convention: str = "NACA"
     domestic_basis_compounding_freq: int = 1
-    domestic_basis_settle_days: int = 2
-    domestic_basis_settlement_calendar: str = "USD"
 
     # --- Foreign curve (CSV composite, FX-forward only) --------------------
     foreign_curve: Path | None = None
@@ -191,8 +208,6 @@ class Config:
     foreign_rate_convention: str = "NACA"
     foreign_compounding_freq: int = 1
     foreign_interp: str = "hermite_rt"
-    foreign_settle_days: int = 2
-    foreign_settlement_calendar: str = "USD"
 
     # Optional cross-currency basis spread added onto foreign_curve
     foreign_basis_curve: Path | None = None
@@ -200,8 +215,6 @@ class Config:
     foreign_basis_value_col: str = "value"
     foreign_basis_rate_convention: str = "NACA"
     foreign_basis_compounding_freq: int = 1
-    foreign_basis_settle_days: int = 2
-    foreign_basis_settlement_calendar: str = "USD"
 
     fx_spot_rate: float | None = None  # domestic currency units per 1 unit of foreign currency
     fx_spot_days: int = 2
@@ -434,10 +447,10 @@ def main(cfg: Config = CONFIG) -> None:
         priced_forward_curve = build_composite_forward_curve(
             foreign_forward_curve=fwd_curve, fx_spot=fx_spot,
             domestic_curve=domestic_curve_obj, foreign_curve=foreign_curve_obj,
-            domestic_settle_days=cfg.domestic_settle_days,
-            domestic_settlement_calendar=cfg.domestic_settlement_calendar,
-            foreign_settle_days=cfg.foreign_settle_days,
-            foreign_settlement_calendar=cfg.foreign_settlement_calendar,
+            domestic_settle_days=cfg.settlement_days,
+            domestic_settlement_calendar=cfg.settlement_calendar,
+            foreign_settle_days=cfg.settlement_days,
+            foreign_settlement_calendar=cfg.settlement_calendar,
             day_count=cfg.day_count,
         )
 
@@ -463,7 +476,7 @@ def main(cfg: Config = CONFIG) -> None:
         monitoring=cfg.monitoring, monitoring_calendar=cfg.monitoring_calendar,
         cost_of_carry=cfg.cost_of_carry,
         spot_days=cfg.spot_days, spot_calendar=cfg.spot_calendar,
-        settle_days=cfg.money_market_settle_days, settlement_calendar=cfg.money_market_settlement_calendar,
+        settle_days=cfg.settlement_days, settlement_calendar=cfg.settlement_calendar,
         day_count=cfg.day_count, n_mc_paths=cfg.n_mc_paths, mc_seed=cfg.mc_seed,
     )
 
