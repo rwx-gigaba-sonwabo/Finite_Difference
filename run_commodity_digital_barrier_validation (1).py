@@ -9,20 +9,40 @@ checks against an external pricing system (e.g. Front Arena).
 Market data can come from either of two sources -- toggle with
 ``data_source``:
 
-- ``"csv"`` (default): two-column (date, value) CSV files -- see
-  market_data_csv/commodity_forward_curve.csv and
-  market_data_csv/discount_curve_naca.csv.
+- ``"csv"`` (default): two-column (date, value) CSV files.
 - ``"json"``: pulled directly from a RiskFlow-exported market data JSON
-  via ``base_valuation.market_data_json``, by risk-factor name (e.g.
-  ``"ForwardPrice.GOLD"``) instead of a file path. See that module's
-  docstring for exactly what's verified and what to check before relying
-  on a JSON-sourced run -- unlike the CSV path, it wasn't built against
-  a live system.
+  via ``base_valuation.market_data_json``, by risk-factor name instead
+  of a file path. See that module's docstring for what's verified and
+  what to check before relying on a JSON-sourced run.
 
-Whichever source is used, everything downstream -- trade terms, the
-composite/cross-currency machinery, pricing, printing, logging -- is
-identical; only the market-data-building step at the top of ``main()``
-branches on ``data_source``.
+Curve roles
+------------
+Three distinct curve roles, following ``instruments/commodity_average_
+forward.py``'s pattern:
+
+- ``money_market_curve`` -- discounts the payoff. Used **directly** for
+  a standard (non-composite) trade -- domestic/foreign/FX are not
+  involved at all in that case. Always in the contract (domestic)
+  currency.
+- ``domestic_curve`` / ``foreign_curve`` -- used **only**, in a
+  composite trade, to compute the FX forward via covered interest rate
+  parity (see ``base_valuation.fx``). Each may optionally have a cross-
+  currency basis spread added on top (``domestic_basis_curve`` /
+  ``foreign_basis_curve``) via ``base_valuation.fx.combine_curve_with_
+  basis`` -- the combined rate is the base curve's own rate,
+  interpolated at the basis curve's tenors, plus the basis spread,
+  built on the basis curve's tenor grid. Leave a basis field as ``None``
+  to use the base curve unmodified. ``domestic_curve`` and
+  ``money_market_curve`` are independent curves, even though usually the
+  same currency -- e.g. ``domestic_curve`` might be a cross-currency
+  basis-adjusted swap curve while ``money_market_curve`` is a plain
+  OIS/deposit curve.
+
+For a composite trade: set ``domestic_curve``, ``foreign_curve``, and
+``fx_spot_rate`` (CSV) or ``domestic_curve_risk_key``,
+``foreign_curve_risk_key``, and ``fx_spot_risk_key`` (JSON). Leave them
+all as ``None`` for a standard single-currency trade -- only
+``money_market_curve`` is used.
 
 To run a validation check: edit the CONFIG block below directly, then
 run this file. No command-line flags to remember.
@@ -32,21 +52,6 @@ results/commodity_digital_barrier_validation_log.csv (created with a
 header on first run). Set ``external_price`` to have the script compute
 and report the diff against a price read off the system you're
 validating.
-
-Composite (cross-currency) trades
-----------------------------------
-When the underlying's forward price currency differs from the contract
-(settlement) currency: in CSV mode, set ``foreign_discount_curve`` (a
-second CSV) and ``fx_spot_rate``; in JSON mode, set
-``foreign_curve_risk_key`` and ``fx_spot_risk_key`` instead.
-``forward_curve`` / ``forward_risk_key`` continues to describe the
-underlying in its own natural currency; the barrier level, payout, and
-price are all still in contract (domestic) currency terms. The
-domestic-currency forward curve actually priced off is built via
-covered interest rate parity -- see ``base_valuation.fx`` for the
-mechanics and important caveats (no FX volatility / correlation is
-modelled). Leave the foreign-curve fields as ``None`` (the default) for
-an ordinary single-currency trade -- nothing else changes.
 
 Examples
 --------
@@ -59,7 +64,7 @@ system's price::
     CONFIG = Config(
         val_date=date(2025, 6, 2),
         forward_curve=Path("market_data_csv/brent_fwd_2025-06-02.csv"),
-        domestic_discount_curve=Path("market_data_csv/zar_swap_naca_2025-06-02.csv"),
+        money_market_curve=Path("market_data_csv/zar_swap_naca_2025-06-02.csv"),
         maturity=date(2026, 6, 2), lower_barrier=65.0, touch="out",
         monitoring="discrete", cost_of_carry=0.035,
         vol=0.28, external_price=12.40,
@@ -77,12 +82,14 @@ closed-form-eligible continuous single-barrier cash digital::
     )
 
 Composite, CSV: USD Brent underlying, ZAR-settled barrier (barrier/payout
-in ZAR), diffed against an external ZAR price::
+in ZAR), with a cross-currency basis spread on the domestic leg::
 
     CONFIG = Config(
         forward_curve=Path("market_data_csv/commodity_forward_curve.csv"),  # USD
-        domestic_discount_curve=Path("market_data_csv/zar_swap_naca.csv"),
-        foreign_discount_curve=Path("market_data_csv/discount_curve_naca.csv"),  # USD
+        money_market_curve=Path("market_data_csv/zar_swap_naca.csv"),
+        domestic_curve=Path("market_data_csv/zar_swap_naca.csv"),
+        domestic_basis_curve=Path("market_data_csv/zar_usd_basis.csv"),
+        foreign_curve=Path("market_data_csv/discount_curve_naca.csv"),  # USD
         upper_barrier=1800.0, payout=2000.0,
         fx_spot_rate=18.50, external_price=95.40,
     )
@@ -93,7 +100,9 @@ Same trade, sourced from a RiskFlow JSON instead::
         data_source="json",
         json_path=Path(r"C:\\...\\309gold2_compo_asian.json"),
         forward_risk_key="ForwardPrice.GOLD",
+        money_market_curve_risk_key="InterestRate.ZAR-SWAP",
         domestic_curve_risk_key="InterestRate.ZAR-SWAP",
+        domestic_basis_curve_risk_key="InterestRate.ZAR-SWAP.ZAR-USD-BASIS",
         foreign_curve_risk_key="InterestRate.USD-SOFR",
         fx_spot_risk_key="FxRate.ZAR",
         upper_barrier=1800.0, payout=2000.0, external_price=95.40,
@@ -121,7 +130,8 @@ from base_valuation.commodity_digital_barrier_option import (
     value_commodity_digital_barrier_option,
     bump_and_reprice_commodity_digital_barrier_option,
 )
-from base_valuation.fx import FXSpotRate, build_composite_forward_curve
+from base_valuation.fx import FXSpotRate, build_composite_forward_curve, combine_curve_with_basis
+from base_valuation.yield_curve import INTERPOLATORS
 
 REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_FORWARD_CSV = REPO_ROOT / "market_data_csv" / "commodity_forward_curve.csv"
@@ -144,46 +154,85 @@ class Config:
     forward_value_col: str = "value"
     forward_interp: str = "linear"  # "linear" | "forward_price"
 
-    # --- Domestic discount curve (CSV, used when data_source == "csv") ----
-    domestic_discount_curve: Path = DEFAULT_DISCOUNT_CSV
-    domestic_discount_date_col: str = "date"
-    domestic_discount_value_col: str = "value"
-    domestic_rate_convention: str = "NACA"  # "NACA" | "NACC"
-    domestic_compounding_freq: int = 1  # 1=NACA, 2=NACS, 4=NACQ, 12=NACM
-    domestic_discount_interp: str = "hermite_rt"
+    # --- Money market curve (CSV, discounting -- always used) -------------
+    money_market_curve: Path = DEFAULT_DISCOUNT_CSV
+    money_market_date_col: str = "date"
+    money_market_value_col: str = "value"
+    money_market_rate_convention: str = "NACA"  # "NACA" | "NACC"
+    money_market_compounding_freq: int = 1  # 1=NACA, 2=NACS, 4=NACQ, 12=NACM
+    money_market_interp: str = "hermite_rt"
     # "linear" | "linear_rt" | "reciprocal_time" | "hermite_rt" | "stitched_linear_hermite_rt"
+    money_market_settle_days: int = 2
+    money_market_settlement_calendar: str = "USD"
+
+    # --- Domestic curve (CSV composite, FX-forward only) -------------------
+    domestic_curve: Path | None = None
+    domestic_date_col: str = "date"
+    domestic_value_col: str = "value"
+    domestic_rate_convention: str = "NACA"
+    domestic_compounding_freq: int = 1
+    domestic_interp: str = "hermite_rt"
     domestic_settle_days: int = 2
     domestic_settlement_calendar: str = "USD"
 
-    # --- Foreign discount curve (CSV composite, used when data_source == "csv") -
-    foreign_discount_curve: Path | None = None
-    foreign_discount_date_col: str = "date"
-    foreign_discount_value_col: str = "value"
-    foreign_rate_convention: str = "NACA"  # "NACA" | "NACC"
+    # Optional cross-currency basis spread added onto domestic_curve
+    domestic_basis_curve: Path | None = None
+    domestic_basis_date_col: str = "date"
+    domestic_basis_value_col: str = "value"
+    domestic_basis_rate_convention: str = "NACA"
+    domestic_basis_compounding_freq: int = 1
+    domestic_basis_settle_days: int = 2
+    domestic_basis_settlement_calendar: str = "USD"
+
+    # --- Foreign curve (CSV composite, FX-forward only) --------------------
+    foreign_curve: Path | None = None
+    foreign_date_col: str = "date"
+    foreign_value_col: str = "value"
+    foreign_rate_convention: str = "NACA"
     foreign_compounding_freq: int = 1
-    foreign_discount_interp: str = "hermite_rt"
+    foreign_interp: str = "hermite_rt"
     foreign_settle_days: int = 2
     foreign_settlement_calendar: str = "USD"
+
+    # Optional cross-currency basis spread added onto foreign_curve
+    foreign_basis_curve: Path | None = None
+    foreign_basis_date_col: str = "date"
+    foreign_basis_value_col: str = "value"
+    foreign_basis_rate_convention: str = "NACA"
+    foreign_basis_compounding_freq: int = 1
+    foreign_basis_settle_days: int = 2
+    foreign_basis_settlement_calendar: str = "USD"
 
     fx_spot_rate: float | None = None  # domestic currency units per 1 unit of foreign currency
     fx_spot_days: int = 2
     fx_spot_calendar: str = "USD"
 
     # --- JSON market data (used when data_source == "json") ----------------
-    # Pulls directly from a RiskFlow-exported JSON via
-    # base_valuation.market_data_json instead of the CSV fields above --
-    # see that module's docstring before relying on a run.
     json_path: Path | None = None
     forward_risk_key: str | None = None  # e.g. "ForwardPrice.GOLD"
-    domestic_curve_risk_key: str | None = None  # e.g. "InterestRate.ZAR-SWAP"
-    foreign_curve_risk_key: str | None = None  # composite only, e.g. "InterestRate.USD-SOFR"
-    fx_spot_risk_key: str | None = None  # composite only, e.g. "FxRate.ZAR"
+
+    money_market_curve_risk_key: str | None = None  # e.g. "InterestRate.ZAR-SWAP"
+    money_market_rate_convention_json: str = "NACC"
+    money_market_compounding_freq_json: int = 1
+    money_market_interp_json: str = "hermite_rt"
+
+    domestic_curve_risk_key: str | None = None
+    domestic_basis_curve_risk_key: str | None = None
+    domestic_rate_convention_json: str = "NACC"
+    domestic_compounding_freq_json: int = 1
+    domestic_interp_json: str = "hermite_rt"
+
+    foreign_curve_risk_key: str | None = None
+    foreign_basis_curve_risk_key: str | None = None
+    foreign_rate_convention_json: str = "NACC"
+    foreign_compounding_freq_json: int = 1
+    foreign_interp_json: str = "hermite_rt"
+
+    fx_spot_risk_key: str | None = None
+    json_forward_interp: str = "forward_price"
+
     vol_risk_key: str | None = None  # alternative to vol_skew_curve, e.g. "CommodityPriceVol.GOLD"
     vol_surface_type: str = "malz"  # "malz" | "non_precious" -- see market_data_json docstring
-    json_rate_convention: str = "NACC"  # "NACA" | "NACC" -- JSON curves default NACC, unlike CSV's NACA
-    json_compounding_freq: int = 1
-    json_discount_interp: str = "hermite_rt"
-    json_forward_interp: str = "forward_price"
 
     # --- Trade terms -------------------------------------------------------
     maturity: date = date(2026, 1, 2)
@@ -233,23 +282,26 @@ class Config:
         if self.monitoring_start is None:
             self.monitoring_start = self.val_date
         if self.data_source == "csv":
-            composite = self.foreign_discount_curve is not None or self.fx_spot_rate is not None
-            if composite and (self.foreign_discount_curve is None or self.fx_spot_rate is None):
+            composite_fields = (self.domestic_curve, self.foreign_curve, self.fx_spot_rate)
+            composite = any(f is not None for f in composite_fields)
+            if composite and not all(f is not None for f in composite_fields):
                 raise ValueError(
-                    "a composite trade requires both foreign_discount_curve and "
-                    "fx_spot_rate to be set (leave both as None for a single-currency trade)"
+                    "a composite trade requires domestic_curve, foreign_curve, and "
+                    "fx_spot_rate all to be set (leave all three as None for a "
+                    "single-currency trade)"
                 )
         else:  # json
-            if self.json_path is None or self.forward_risk_key is None or self.domestic_curve_risk_key is None:
+            if self.json_path is None or self.forward_risk_key is None or self.money_market_curve_risk_key is None:
                 raise ValueError(
                     "data_source='json' requires json_path, forward_risk_key, and "
-                    "domestic_curve_risk_key to be set"
+                    "money_market_curve_risk_key to be set"
                 )
-            composite = self.foreign_curve_risk_key is not None or self.fx_spot_risk_key is not None
-            if composite and (self.foreign_curve_risk_key is None or self.fx_spot_risk_key is None):
+            composite_fields = (self.domestic_curve_risk_key, self.foreign_curve_risk_key, self.fx_spot_risk_key)
+            composite = any(f is not None for f in composite_fields)
+            if composite and not all(f is not None for f in composite_fields):
                 raise ValueError(
-                    "a composite trade in json mode requires both foreign_curve_risk_key "
-                    "and fx_spot_risk_key to be set"
+                    "a composite trade in json mode requires domestic_curve_risk_key, "
+                    "foreign_curve_risk_key, and fx_spot_risk_key all to be set"
                 )
 
 
@@ -269,6 +321,21 @@ def append_results_log(path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
+def _build_leg_csv(cfg: Config, path_attr: str, prefix: str, interp: str) -> "YieldCurve":  # noqa: F821
+    """Build one CSV-sourced curve by reading ``path_attr`` (the CSV path
+    field) and the ``f"{prefix}_*"`` date_col/value_col/rate_convention/
+    compounding_freq fields."""
+    path = getattr(cfg, path_attr)
+    return build_yield_curve_from_csv(
+        path, cfg.val_date,
+        date_col=getattr(cfg, f"{prefix}_date_col"),
+        rate_col=getattr(cfg, f"{prefix}_value_col"),
+        rate_convention=getattr(cfg, f"{prefix}_rate_convention"),
+        compounding_freq=getattr(cfg, f"{prefix}_compounding_freq"),
+        day_count=cfg.day_count, interpolation=interp,
+    )
+
+
 def main(cfg: Config = CONFIG) -> None:
     # --- Build curves: CSV or JSON, per cfg.data_source ---------------
     if cfg.data_source == "csv":
@@ -277,21 +344,25 @@ def main(cfg: Config = CONFIG) -> None:
             date_col=cfg.forward_date_col, price_col=cfg.forward_value_col,
             day_count=cfg.day_count, interpolation=cfg.forward_interp,
         )
-        domestic_curve = build_yield_curve_from_csv(
-            cfg.domestic_discount_curve, cfg.val_date,
-            date_col=cfg.domestic_discount_date_col, rate_col=cfg.domestic_discount_value_col,
-            rate_convention=cfg.domestic_rate_convention, compounding_freq=cfg.domestic_compounding_freq,
-            day_count=cfg.day_count, interpolation=cfg.domestic_discount_interp,
-        )
-        is_composite = cfg.foreign_discount_curve is not None
-        foreign_curve = fx_spot = None
+        money_market_curve = _build_leg_csv(cfg, "money_market_curve", "money_market", cfg.money_market_interp)
+
+        is_composite = cfg.domestic_curve is not None
+        domestic_curve_obj = foreign_curve_obj = fx_spot = None
         if is_composite:
-            foreign_curve = build_yield_curve_from_csv(
-                cfg.foreign_discount_curve, cfg.val_date,
-                date_col=cfg.foreign_discount_date_col, rate_col=cfg.foreign_discount_value_col,
-                rate_convention=cfg.foreign_rate_convention, compounding_freq=cfg.foreign_compounding_freq,
-                day_count=cfg.day_count, interpolation=cfg.foreign_discount_interp,
-            )
+            domestic_curve_obj = _build_leg_csv(cfg, "domestic_curve", "domestic", cfg.domestic_interp)
+            if cfg.domestic_basis_curve is not None:
+                domestic_basis = _build_leg_csv(cfg, "domestic_basis_curve", "domestic_basis", "linear")
+                domestic_curve_obj = combine_curve_with_basis(
+                    domestic_curve_obj, domestic_basis, INTERPOLATORS[cfg.domestic_interp],
+                )
+
+            foreign_curve_obj = _build_leg_csv(cfg, "foreign_curve", "foreign", cfg.foreign_interp)
+            if cfg.foreign_basis_curve is not None:
+                foreign_basis = _build_leg_csv(cfg, "foreign_basis_curve", "foreign_basis", "linear")
+                foreign_curve_obj = combine_curve_with_basis(
+                    foreign_curve_obj, foreign_basis, INTERPOLATORS[cfg.foreign_interp],
+                )
+
             fx_spot = FXSpotRate(
                 rate=cfg.fx_spot_rate, spot_days=cfg.fx_spot_days, spot_calendar=cfg.fx_spot_calendar,
             )
@@ -300,19 +371,50 @@ def main(cfg: Config = CONFIG) -> None:
             cfg.json_path, cfg.forward_risk_key, cfg.val_date,
             day_count=cfg.day_count, interpolation=cfg.json_forward_interp,
         )
-        domestic_curve = build_yield_curve_from_json(
-            cfg.json_path, cfg.domestic_curve_risk_key,
-            rate_convention=cfg.json_rate_convention, compounding_freq=cfg.json_compounding_freq,
-            interpolation=cfg.json_discount_interp,
+        money_market_curve = build_yield_curve_from_json(
+            cfg.json_path, cfg.money_market_curve_risk_key,
+            rate_convention=cfg.money_market_rate_convention_json,
+            compounding_freq=cfg.money_market_compounding_freq_json,
+            interpolation=cfg.money_market_interp_json,
         )
-        is_composite = cfg.foreign_curve_risk_key is not None
-        foreign_curve = fx_spot = None
+
+        is_composite = cfg.domestic_curve_risk_key is not None
+        domestic_curve_obj = foreign_curve_obj = fx_spot = None
         if is_composite:
-            foreign_curve = build_yield_curve_from_json(
-                cfg.json_path, cfg.foreign_curve_risk_key,
-                rate_convention=cfg.json_rate_convention, compounding_freq=cfg.json_compounding_freq,
-                interpolation=cfg.json_discount_interp,
+            domestic_curve_obj = build_yield_curve_from_json(
+                cfg.json_path, cfg.domestic_curve_risk_key,
+                rate_convention=cfg.domestic_rate_convention_json,
+                compounding_freq=cfg.domestic_compounding_freq_json,
+                interpolation=cfg.domestic_interp_json,
             )
+            if cfg.domestic_basis_curve_risk_key is not None:
+                domestic_basis = build_yield_curve_from_json(
+                    cfg.json_path, cfg.domestic_basis_curve_risk_key,
+                    rate_convention=cfg.domestic_rate_convention_json,
+                    compounding_freq=cfg.domestic_compounding_freq_json,
+                    interpolation="linear",
+                )
+                domestic_curve_obj = combine_curve_with_basis(
+                    domestic_curve_obj, domestic_basis, INTERPOLATORS[cfg.domestic_interp_json],
+                )
+
+            foreign_curve_obj = build_yield_curve_from_json(
+                cfg.json_path, cfg.foreign_curve_risk_key,
+                rate_convention=cfg.foreign_rate_convention_json,
+                compounding_freq=cfg.foreign_compounding_freq_json,
+                interpolation=cfg.foreign_interp_json,
+            )
+            if cfg.foreign_basis_curve_risk_key is not None:
+                foreign_basis = build_yield_curve_from_json(
+                    cfg.json_path, cfg.foreign_basis_curve_risk_key,
+                    rate_convention=cfg.foreign_rate_convention_json,
+                    compounding_freq=cfg.foreign_compounding_freq_json,
+                    interpolation="linear",
+                )
+                foreign_curve_obj = combine_curve_with_basis(
+                    foreign_curve_obj, foreign_basis, INTERPOLATORS[cfg.foreign_interp_json],
+                )
+
             fx_spot = FXSpotRate(
                 rate=build_fx_spot_from_json(cfg.json_path, cfg.fx_spot_risk_key),
                 spot_days=cfg.fx_spot_days, spot_calendar=cfg.fx_spot_calendar,
@@ -322,7 +424,7 @@ def main(cfg: Config = CONFIG) -> None:
     if is_composite:
         priced_forward_curve = build_composite_forward_curve(
             foreign_forward_curve=fwd_curve, fx_spot=fx_spot,
-            domestic_discount_curve=domestic_curve, foreign_discount_curve=foreign_curve,
+            domestic_curve=domestic_curve_obj, foreign_curve=foreign_curve_obj,
             domestic_settle_days=cfg.domestic_settle_days,
             domestic_settlement_calendar=cfg.domestic_settlement_calendar,
             foreign_settle_days=cfg.foreign_settle_days,
@@ -338,9 +440,6 @@ def main(cfg: Config = CONFIG) -> None:
             strike_col=cfg.vol_skew_strike_col, vol_col=cfg.vol_skew_vol_col,
         )
     elif cfg.vol_risk_key is not None:
-        # priced_forward_curve (not the raw foreign fwd_curve) so the vol
-        # adapter's forward lookup matches the barrier's currency when
-        # composite -- see market_data_json.py's _MalzVolAdapter docstring.
         vol_skew = build_commodity_vol_skew_from_json(
             cfg.json_path, cfg.vol_risk_key, priced_forward_curve,
             surface_type=cfg.vol_surface_type,
@@ -350,12 +449,12 @@ def main(cfg: Config = CONFIG) -> None:
         val_date=cfg.val_date, maturity_date=cfg.maturity,
         upper_barrier=cfg.upper_barrier, lower_barrier=cfg.lower_barrier,
         touch=cfg.touch, digital_type=cfg.digital_type, payout=cfg.payout,
-        forward_curve=priced_forward_curve, discount_curve=domestic_curve,
+        forward_curve=priced_forward_curve, discount_curve=money_market_curve,
         vol=cfg.vol, vol_skew=vol_skew, apply_skew_adjustment=cfg.apply_skew_adjustment,
         monitoring=cfg.monitoring, monitoring_calendar=cfg.monitoring_calendar,
         cost_of_carry=cfg.cost_of_carry,
         spot_days=cfg.spot_days, spot_calendar=cfg.spot_calendar,
-        settle_days=cfg.domestic_settle_days, settlement_calendar=cfg.domestic_settlement_calendar,
+        settle_days=cfg.money_market_settle_days, settlement_calendar=cfg.money_market_settlement_calendar,
         day_count=cfg.day_count, n_mc_paths=cfg.n_mc_paths, mc_seed=cfg.mc_seed,
     )
 
@@ -376,25 +475,28 @@ def main(cfg: Config = CONFIG) -> None:
           f"@ {cfg.val_date}  [source={cfg.data_source}]")
     print("=" * 72)
     if cfg.data_source == "csv":
-        print(f"  Forward curve:   {cfg.forward_curve}  (interp={cfg.forward_interp})"
+        print(f"  Forward curve:      {cfg.forward_curve}  (interp={cfg.forward_interp})"
               f"{'  [foreign ccy]' if is_composite else ''}")
-        print(f"  Domestic curve:  {cfg.domestic_discount_curve}  "
-              f"(convention={cfg.domestic_rate_convention}, interp={cfg.domestic_discount_interp})")
+        print(f"  Money market curve: {cfg.money_market_curve}  "
+              f"(convention={cfg.money_market_rate_convention}, interp={cfg.money_market_interp})")
         if is_composite:
-            print(f"  Foreign curve:   {cfg.foreign_discount_curve}  "
-                  f"(convention={cfg.foreign_rate_convention}, interp={cfg.foreign_discount_interp})")
-            print(f"  FX spot:         {fx_spot.rate}  "
+            print(f"  Domestic curve:     {cfg.domestic_curve}  (interp={cfg.domestic_interp})"
+                  f"{'  + basis ' + str(cfg.domestic_basis_curve) if cfg.domestic_basis_curve else ''}")
+            print(f"  Foreign curve:      {cfg.foreign_curve}  (interp={cfg.foreign_interp})"
+                  f"{'  + basis ' + str(cfg.foreign_basis_curve) if cfg.foreign_basis_curve else ''}")
+            print(f"  FX spot:            {fx_spot.rate}  "
                   f"(spot_days={fx_spot.spot_days}, calendar={fx_spot.spot_calendar})")
     else:
-        print(f"  JSON:            {cfg.json_path}")
-        print(f"  Forward risk key:  {cfg.forward_risk_key}  (interp={cfg.json_forward_interp})"
+        print(f"  JSON:               {cfg.json_path}")
+        print(f"  Forward risk key:   {cfg.forward_risk_key}  (interp={cfg.json_forward_interp})"
               f"{'  [foreign ccy]' if is_composite else ''}")
-        print(f"  Domestic curve key: {cfg.domestic_curve_risk_key}  "
-              f"(convention={cfg.json_rate_convention}, interp={cfg.json_discount_interp})")
+        print(f"  Money market key:   {cfg.money_market_curve_risk_key}")
         if is_composite:
-            print(f"  Foreign curve key:  {cfg.foreign_curve_risk_key}")
-            print(f"  FX spot key:        {cfg.fx_spot_risk_key} = {fx_spot.rate}  "
-                  f"(spot_days={fx_spot.spot_days}, calendar={fx_spot.spot_calendar})")
+            print(f"  Domestic key:       {cfg.domestic_curve_risk_key}"
+                  f"{'  + basis ' + cfg.domestic_basis_curve_risk_key if cfg.domestic_basis_curve_risk_key else ''}")
+            print(f"  Foreign key:        {cfg.foreign_curve_risk_key}"
+                  f"{'  + basis ' + cfg.foreign_basis_curve_risk_key if cfg.foreign_basis_curve_risk_key else ''}")
+            print(f"  FX spot key:        {cfg.fx_spot_risk_key} = {fx_spot.rate}")
     if vol_skew is not None:
         skew_src = cfg.vol_skew_curve if cfg.vol_skew_curve is not None else cfg.vol_risk_key
         print(f"  Vol skew source: {skew_src}  (apply_skew_adjustment={cfg.apply_skew_adjustment})")
@@ -445,11 +547,25 @@ def main(cfg: Config = CONFIG) -> None:
                                  else cfg.vol_risk_key) if vol_skew is not None else "",
             "skew_adjusted": result.skew_adjusted,
             "forward_source": str(cfg.forward_curve) if cfg.data_source == "csv" else cfg.forward_risk_key,
-            "domestic_curve_source": (str(cfg.domestic_discount_curve) if cfg.data_source == "csv"
-                                       else cfg.domestic_curve_risk_key),
+            "money_market_source": (str(cfg.money_market_curve) if cfg.data_source == "csv"
+                                     else cfg.money_market_curve_risk_key),
             "is_composite": is_composite,
-            "foreign_curve_source": (
-                (str(cfg.foreign_discount_curve) if cfg.data_source == "csv" else cfg.foreign_curve_risk_key)
+            "domestic_source": (
+                (str(cfg.domestic_curve) if cfg.data_source == "csv" else cfg.domestic_curve_risk_key)
+                if is_composite else ""
+            ),
+            "domestic_basis_source": (
+                (str(cfg.domestic_basis_curve) if cfg.data_source == "csv"
+                 else cfg.domestic_basis_curve_risk_key) or ""
+                if is_composite else ""
+            ),
+            "foreign_source": (
+                (str(cfg.foreign_curve) if cfg.data_source == "csv" else cfg.foreign_curve_risk_key)
+                if is_composite else ""
+            ),
+            "foreign_basis_source": (
+                (str(cfg.foreign_basis_curve) if cfg.data_source == "csv"
+                 else cfg.foreign_basis_curve_risk_key) or ""
                 if is_composite else ""
             ),
             "fx_spot_rate": fx_spot.rate if is_composite else None,
