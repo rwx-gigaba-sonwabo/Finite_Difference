@@ -52,6 +52,7 @@ array by position.
 from __future__ import annotations
 
 from datetime import date, timedelta
+import json
 
 import numpy as np
 
@@ -376,12 +377,24 @@ def build_commodity_vol_skew_from_json(
 
 
 def build_fx_spot_from_json(json_path: str, risk_key: str) -> float:
-    """Pulls a scalar FX spot rate for *risk_key* via ``pull_curve``,
-    reused here even though an FX spot has no term structure -- there is
-    no dedicated scalar puller visible in ``utils.json_handling``.
-    Raises if the pulled data has more than one distinct value (a real
-    curve, not a scalar), since that would indicate *risk_key* points at
-    the wrong risk factor.
+    """Pulls a scalar FX spot rate for *risk_key*.
+
+    Confirmed against a real export: an FX spot risk factor is a flat
+    dict directly under Price Factors, with no ``Curve``/``.Curve``/
+    ``data`` nesting at all (unlike the curve risk factors ``pull_curve``
+    handles) -- e.g.::
+
+        "FxRate.ZAR": {
+            "Domestic_Currency": "USD",
+            "Interest_Rate": "ZAR-SWAP.ZAR-USD-BASIS",
+            "Spot": 0.0624469201178998
+        }
+
+    so this reads ``Price Factors[risk_key]["Spot"]`` directly rather
+    than going through ``pull_curve``. Note this value may be quoted
+    foreign-per-domestic (as in the example above -- USD per ZAR) rather
+    than the domestic-per-foreign convention ``FXSpotRate.rate`` needs;
+    use ``Config.fx_spot_invert=True`` in the run scripts if so.
 
     Parameters
     ----------
@@ -393,11 +406,21 @@ def build_fx_spot_from_json(json_path: str, risk_key: str) -> float:
     -------
     float
     """
-    _, values = _pulled_curve_raw(json_path, risk_key)
-    if not np.allclose(values, values[0]):
+    with open(json_path) as f:
+        data = json.load(f)
+
+    factors = (
+        data.get("Calc", {})
+        .get("MergeMarketData", {})
+        .get("ExplicitMarketData", {})
+        .get("Price Factors", {})
+    )
+    node = factors.get(risk_key, {})
+    if "Spot" not in node:
         raise ValueError(
-            f"pull_curve(json_path, {risk_key!r}) returned multiple distinct values "
-            f"{values.tolist()} for an FX spot rate, which should be scalar -- "
-            f"{risk_key!r} may not be the right risk factor name."
+            f"Price Factors[{risk_key!r}] has no 'Spot' key -- keys found: "
+            f"{sorted(node.keys())!r}. This risk factor's structure doesn't "
+            "match what this loader expects; open the JSON and check what's "
+            "actually stored there."
         )
-    return float(values[0])
+    return float(node["Spot"])
