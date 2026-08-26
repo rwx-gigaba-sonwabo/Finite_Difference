@@ -72,17 +72,50 @@ __all__ = [
 
 
 def _pulled_curve_to_year_fracs_values(json_path: str, risk_key: str) -> tuple[np.ndarray, np.ndarray]:
-    """``pull_curve`` -> sorted ``(year_fracs, values)`` arrays."""
-    raw = np.asarray(pull_curve(json_path, risk_key), dtype=np.float64)
-    if raw.ndim != 2 or raw.shape[1] != 2:
+    """``pull_curve`` -> sorted ``(year_fracs, values)`` arrays.
+
+    Handles one extra level of nesting some RiskFlow exports use --
+    ``{"meta": {...}, "data": [[t, v], ...]}`` -- since ``pull_curve``'s
+    own ``.get('data', {})`` step can land on that wrapper dict rather
+    than the inner list, depending on how deep the JSON actually nests
+    "meta"/"data" under Curve.Curve.
+    """
+    raw = pull_curve(json_path, risk_key)
+
+    if isinstance(raw, dict):
+        if "data" in raw:
+            raw = raw["data"]
+        else:
+            raise ValueError(
+                f"pull_curve(json_path, {risk_key!r}) returned a dict with no "
+                f"'data' key -- keys found: {sorted(raw.keys())!r}. The JSON's "
+                f"structure under Price Factors[{risk_key!r}].Curve.Curve doesn't "
+                "match what this loader expects; open the JSON and check what's "
+                "actually stored there."
+            )
+
+    try:
+        arr = np.asarray(raw, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        sample = raw[0] if isinstance(raw, list) and raw else raw
+        raise ValueError(
+            f"pull_curve(json_path, {risk_key!r}) returned data that isn't a plain "
+            f"list of (tenor, value) pairs -- got {type(raw).__name__}, first "
+            f"element looks like {sample!r}. If pillars are dicts (e.g. "
+            "{'date': ..., 'value': ...} or {'tenor': ..., 'rate': ...}), this "
+            "loader needs updating to read those key names -- tell me what the "
+            "actual keys are and I'll fix it."
+        ) from exc
+
+    if arr.ndim != 2 or arr.shape[1] != 2:
         raise ValueError(
             f"pull_curve(json_path, {risk_key!r}) returned an array of shape "
-            f"{raw.shape}; expected (n_pillars, 2) of (tenor_year_frac, value). "
+            f"{arr.shape}; expected (n_pillars, 2) of (tenor_year_frac, value). "
             "Check what's actually stored at Price Factors[risk_key].Curve.Curve.data "
             "in your JSON."
         )
-    order = np.argsort(raw[:, 0])
-    return raw[order, 0], raw[order, 1]
+    order = np.argsort(arr[:, 0])
+    return arr[order, 0], arr[order, 1]
 
 
 def build_forward_curve_from_json(
