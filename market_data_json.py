@@ -23,7 +23,7 @@ notes). Two things worth knowing before using this:
    [:, 0]`` / ``[:, 1]``) to be an ``(n_pillars, 2)`` array-like of
    ``(tenor_year_frac, value)`` pairs. If your actual JSON stores
    something else under that path this will surface as a shape error
-   from ``_pulled_curve_to_dates_and_values`` below, not a silent
+   from ``_pulled_curve_raw`` below, not a silent
    wrong answer.
 2. ``MalzVol`` and ``NonPreciousCommodityVol`` (both real classes in
    ``market_data.vol_surface``) expose ``get_vol(strike, forward, tenor)``
@@ -51,7 +51,7 @@ array by position.
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 import numpy as np
 
@@ -72,17 +72,10 @@ __all__ = [
 ]
 
 
-def _pulled_curve_to_dates_and_values(json_path: str, risk_key: str) -> tuple[list[date], np.ndarray]:
-    """``pull_curve`` -> sorted ``(dates, values)``.
-
-    The tenor column stores **Excel serial dates** (e.g. ``45868``), not
-    year fractions -- confirmed against a real export where
-    ``ForwardPrice.GOLD``'s pillars looked like ``[45868, 3307.06]``,
-    ``[45869, 3307.46...]``, one per calendar day. Each is converted via
-    ``utils.interpolation.excel_serial_to_date`` before use; year
-    fractions (needed by ``YieldCurve``, which doesn't work with dates
-    directly) are derived downstream from these dates and a caller-
-    supplied ``val_date`` + day-count convention, not computed here.
+def _pulled_curve_raw(json_path: str, risk_key: str) -> tuple[np.ndarray, np.ndarray]:
+    """``pull_curve`` -> sorted ``(raw_tenor, values)`` arrays, with no
+    interpretation yet of what the tenor column actually represents --
+    see :func:`_resolve_tenor_dates` for that.
 
     Handles one extra level of nesting some RiskFlow exports use --
     ``{"meta": [...], "data": [[t, v], ...]}`` -- since ``pull_curve``'s
@@ -120,15 +113,79 @@ def _pulled_curve_to_dates_and_values(json_path: str, risk_key: str) -> tuple[li
     if arr.ndim != 2 or arr.shape[1] != 2:
         raise ValueError(
             f"pull_curve(json_path, {risk_key!r}) returned an array of shape "
-            f"{arr.shape}; expected (n_pillars, 2) of (excel_serial_date, value). "
+            f"{arr.shape}; expected (n_pillars, 2) of (tenor, value). "
             "Check what's actually stored at Price Factors[risk_key].Curve['.Curve'].data "
             "in your JSON."
         )
 
     order = np.argsort(arr[:, 0])
-    serials, values = arr[order, 0], arr[order, 1]
-    dates = [excel_serial_to_date(s) for s in serials]
-    return dates, values
+    return arr[order, 0], arr[order, 1]
+
+
+# Excel serials for any realistic calendar date (say, 1990-2100) are in the
+# tens of thousands; year fractions for any realistic pillar tenor (even a
+# 100-year curve) are at most a few hundred. The two ranges don't overlap in
+# practice, so auto-detecting by magnitude is safe -- confirmed necessary
+# because different risk-factor *types* in the same JSON use different
+# conventions: ForwardPrice.GOLD's pillars are Excel serial dates (e.g.
+# 45868), while InterestRate.USD-SOFR's are plain year fractions (e.g. 0.25,
+# 1.0) -- feeding the latter through excel_serial_to_date lands at the 1899
+# Excel epoch, which is exactly the "year 1899 out of bound" error this
+# resolves.
+_EXCEL_SERIAL_THRESHOLD = 1000.0
+
+
+def _resolve_tenor_dates(
+    raw_tenor: np.ndarray,
+    val_date: date,
+    day_counter,
+    tenor_format: str = "auto",
+) -> tuple[list[date], np.ndarray]:
+    """Interpret a raw tenor column as either Excel serial dates or plain
+    year fractions, returning ``(curve_dates, year_fracs)`` either way.
+
+    Parameters
+    ----------
+    raw_tenor : np.ndarray
+        The raw first column from :func:`_pulled_curve_raw`.
+    val_date : date
+    day_counter : QuantLib DayCounter
+    tenor_format : {"auto", "excel_serial", "year_frac"}
+        ``"auto"`` (default) detects by magnitude -- see module-level
+        comment above ``_EXCEL_SERIAL_THRESHOLD``. Pass ``"excel_serial"``
+        or ``"year_frac"`` explicitly to skip detection for a risk key
+        you already know the convention for.
+
+    Returns
+    -------
+    curve_dates : list of date
+        Real dates if ``excel_serial``; approximated from ``val_date +
+        year_frac`` if ``year_frac`` (needed only for
+        ``CommodityForwardCurve.price_at(date)`` -- ``YieldCurve`` never
+        uses these).
+    year_fracs : np.ndarray
+    """
+    if tenor_format == "auto":
+        tenor_format = (
+            "excel_serial" if raw_tenor.min() > _EXCEL_SERIAL_THRESHOLD else "year_frac"
+        )
+    elif tenor_format not in ("excel_serial", "year_frac"):
+        raise ValueError(
+            f"tenor_format must be 'auto', 'excel_serial', or 'year_frac', got {tenor_format!r}"
+        )
+
+    ql_val = to_ql_date(val_date)
+    if tenor_format == "excel_serial":
+        curve_dates = [excel_serial_to_date(t) for t in raw_tenor]
+        year_fracs = np.array(
+            [float(day_counter.yearFraction(ql_val, to_ql_date(d))) for d in curve_dates],
+            dtype=np.float64,
+        )
+    else:  # year_frac
+        year_fracs = raw_tenor.astype(np.float64)
+        curve_dates = [val_date + timedelta(days=round(float(t) * 365)) for t in year_fracs]
+
+    return curve_dates, year_fracs
 
 
 def build_forward_curve_from_json(
@@ -137,16 +194,18 @@ def build_forward_curve_from_json(
     val_date: date,
     day_count: str = "ACT/365",
     interpolation: str = "forward_price",
+    tenor_format: str = "auto",
 ) -> CommodityForwardCurve:
     """JSON counterpart of
     :func:`base_valuation.market_data_io.build_forward_curve_from_csv`.
 
-    Pulls ``(excel_serial_date, price)`` pillars for *risk_key* via
-    ``pull_curve``, converts the serials to real calendar dates, and
-    builds a ``CommodityForwardCurve`` on those exact dates -- no
-    approximation needed here, unlike an earlier version of this
-    function that reconstructed dates from a (wrongly assumed)
-    year-fraction tenor column.
+    Pulls ``(tenor, price)`` pillars for *risk_key* via ``pull_curve``
+    and builds a ``CommodityForwardCurve``. The tenor column's format
+    (Excel serial date vs. plain year fraction) is auto-detected by
+    magnitude by default -- see :func:`_resolve_tenor_dates` -- since
+    different risk-factor types in the same JSON have been seen to use
+    different conventions. Pass ``tenor_format`` explicitly to skip
+    detection.
 
     Parameters
     ----------
@@ -154,28 +213,23 @@ def build_forward_curve_from_json(
     risk_key : str
         E.g. ``"ForwardPrice.GOLD"``.
     val_date : date
-        Must match the JSON's own valuation date -- pillar year
-        fractions (needed only for the interpolator, not the dates
-        themselves) are measured from here.
+        Must match the JSON's own valuation date.
     day_count : str
     interpolation : {"forward_price", "linear"}
+    tenor_format : {"auto", "excel_serial", "year_frac"}
 
     Returns
     -------
     CommodityForwardCurve
     """
-    curve_dates, prices = _pulled_curve_to_dates_and_values(json_path, risk_key)
+    raw_tenor, prices = _pulled_curve_raw(json_path, risk_key)
     if interpolation not in FORWARD_INTERPOLATORS:
         raise ValueError(
             f"Unknown interpolation scheme {interpolation!r}; "
             f"choose from {sorted(FORWARD_INTERPOLATORS)}"
         )
     day_counter = DAY_COUNTERS[day_count]
-    ql_val = to_ql_date(val_date)
-    year_fracs = np.array(
-        [float(day_counter.yearFraction(ql_val, to_ql_date(d))) for d in curve_dates],
-        dtype=np.float64,
-    )
+    curve_dates, year_fracs = _resolve_tenor_dates(raw_tenor, val_date, day_counter, tenor_format)
     interp = FORWARD_INTERPOLATORS[interpolation](year_fracs, prices.reshape(1, -1))
 
     return CommodityForwardCurve(
@@ -197,16 +251,19 @@ def build_yield_curve_from_json(
     compounding_freq: int = 1,
     interpolation: str = "hermite_rt",
     day_count: str = "ACT/365",
+    tenor_format: str = "auto",
 ) -> YieldCurve:
     """JSON counterpart of
     :func:`base_valuation.market_data_io.build_yield_curve_from_csv`.
 
-    Pulls ``(excel_serial_date, rate)`` pillars for *risk_key* via
-    ``pull_curve``, converts each serial to a real calendar date, and
-    derives year fractions from *val_date* via *day_count* -- the tenor
-    column is a calendar-date serial, not a pre-computed year fraction
-    (confirmed against a real export; see
-    :func:`_pulled_curve_to_dates_and_values`).
+    Pulls ``(tenor, rate)`` pillars for *risk_key* via ``pull_curve`` and
+    builds a ``YieldCurve``. The tenor column's format (Excel serial
+    date vs. plain year fraction) is auto-detected by magnitude by
+    default -- see :func:`_resolve_tenor_dates` -- since different
+    risk-factor types in the same JSON have been seen to use different
+    conventions (e.g. a commodity forward curve's pillars as Excel
+    serial dates vs. an interest rate curve's as plain year fractions).
+    Pass ``tenor_format`` explicitly to skip detection.
 
     Parameters
     ----------
@@ -225,6 +282,7 @@ def build_yield_curve_from_json(
     interpolation : str
         Any key in ``base_valuation.yield_curve.INTERPOLATORS``.
     day_count : str
+    tenor_format : {"auto", "excel_serial", "year_frac"}
 
     Returns
     -------
@@ -232,13 +290,9 @@ def build_yield_curve_from_json(
     """
     if rate_convention not in ("NACA", "NACC"):
         raise ValueError(f"rate_convention must be 'NACA' or 'NACC', got {rate_convention!r}")
-    curve_dates, rates = _pulled_curve_to_dates_and_values(json_path, risk_key)
+    raw_tenor, rates = _pulled_curve_raw(json_path, risk_key)
     day_counter = DAY_COUNTERS[day_count]
-    ql_val = to_ql_date(val_date)
-    year_fracs = np.array(
-        [float(day_counter.yearFraction(ql_val, to_ql_date(d))) for d in curve_dates],
-        dtype=np.float64,
-    )
+    _, year_fracs = _resolve_tenor_dates(raw_tenor, val_date, day_counter, tenor_format)
     if rate_convention == "NACA":
         rates = effective_annual_to_continuous(rates, compounding_freq)
     if interpolation not in INTERPOLATORS:
@@ -339,7 +393,7 @@ def build_fx_spot_from_json(json_path: str, risk_key: str) -> float:
     -------
     float
     """
-    _, values = _pulled_curve_to_dates_and_values(json_path, risk_key)
+    _, values = _pulled_curve_raw(json_path, risk_key)
     if not np.allclose(values, values[0]):
         raise ValueError(
             f"pull_curve(json_path, {risk_key!r}) returned multiple distinct values "
