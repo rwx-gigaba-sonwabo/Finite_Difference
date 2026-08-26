@@ -201,6 +201,11 @@ class Config:
     fx_spot_rate: float | None = None  # domestic currency units per 1 unit of foreign currency
     fx_spot_days: int = 2
     fx_spot_calendar: str = "USD"
+    fx_spot_invert: bool = False
+    # Set True if the raw fx_spot_rate / fx_spot_risk_key value is actually
+    # quoted foreign-per-domestic (e.g. USD per ZAR, ~0.054) rather than the
+    # domestic-per-foreign convention FXSpotRate needs (ZAR per USD, ~18.5)
+    # -- the reciprocal is taken before use, in either data source.
 
     # --- JSON market data (used when data_source == "json") ----------------
     json_path: Path | None = None
@@ -343,8 +348,9 @@ def main(cfg: Config = CONFIG) -> None:
                     foreign_curve_obj, foreign_basis, INTERPOLATORS[cfg.foreign_interp],
                 )
 
+            fx_rate = cfg.fx_spot_rate if not cfg.fx_spot_invert else 1.0 / cfg.fx_spot_rate
             fx_spot = FXSpotRate(
-                rate=cfg.fx_spot_rate, spot_days=cfg.fx_spot_days, spot_calendar=cfg.fx_spot_calendar,
+                rate=fx_rate, spot_days=cfg.fx_spot_days, spot_calendar=cfg.fx_spot_calendar,
             )
     else:  # json
         fwd_curve = build_forward_curve_from_json(
@@ -395,8 +401,11 @@ def main(cfg: Config = CONFIG) -> None:
                     foreign_curve_obj, foreign_basis, INTERPOLATORS[cfg.foreign_interp_json],
                 )
 
+            fx_rate_json = build_fx_spot_from_json(cfg.json_path, cfg.fx_spot_risk_key)
+            if cfg.fx_spot_invert:
+                fx_rate_json = 1.0 / fx_rate_json
             fx_spot = FXSpotRate(
-                rate=build_fx_spot_from_json(cfg.json_path, cfg.fx_spot_risk_key),
+                rate=fx_rate_json,
                 spot_days=cfg.fx_spot_days, spot_calendar=cfg.fx_spot_calendar,
             )
 
