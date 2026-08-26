@@ -367,12 +367,55 @@ def build_commodity_vol_skew_from_json(
     """
     if surface_type == "malz":
         raw = pull_3d_fx_vol_surface(json_path, risk_key)
-        vol_surface = MalzVol(raw)
     elif surface_type == "non_precious":
         raw = pull_commodity_fx_vol_surface(json_path, risk_key)
-        vol_surface = NonPreciousCommodityVol(raw)
     else:
         raise ValueError(f"surface_type must be 'malz' or 'non_precious', got {surface_type!r}")
+
+    if isinstance(raw, dict):
+        if "data" in raw:
+            raw = raw["data"]
+        else:
+            raise ValueError(
+                f"Vol surface for {risk_key!r} returned a dict with no 'data' key -- "
+                f"keys found: {sorted(raw.keys())!r}. Open the JSON and check what's "
+                "actually stored there."
+            )
+
+    try:
+        arr = np.asarray(raw)
+    except ValueError as exc:
+        sample = raw[0] if isinstance(raw, list) and raw else raw
+        raise ValueError(
+            f"Vol surface for {risk_key!r} isn't a plain (n, 3) array of "
+            f"(delta_or_moneyness, tenor, vol) rows -- numpy couldn't even "
+            f"build a rectangular array from it ({exc}). Got a Python "
+            f"{type(raw).__name__} of length {len(raw) if hasattr(raw, '__len__') else '?'}, "
+            f"first row looks like {sample!r}. This usually means the rows have "
+            "inconsistent lengths, or the data is nested one level deeper (e.g. "
+            "grouped by tenor) rather than a flat list of triples -- paste this "
+            "risk factor's 'Delta_Surface'/'Surface' -> '.Curve' -> 'data' "
+            "structure and I'll adjust the parsing to match."
+        ) from exc
+
+    if arr.ndim != 2 or arr.shape[1] != 3 or arr.dtype == object:
+        sample = raw[0] if isinstance(raw, list) and raw else raw
+        raise ValueError(
+            f"Vol surface for {risk_key!r} isn't a plain (n, 3) array of "
+            f"(delta_or_moneyness, tenor, vol) rows -- got a Python "
+            f"{type(raw).__name__} of length {len(raw) if hasattr(raw, '__len__') else '?'}, "
+            f"first row looks like {sample!r} (numpy read it as shape {arr.shape}, "
+            f"dtype {arr.dtype}). This usually means the rows have inconsistent "
+            "lengths, or the data is nested one level deeper (e.g. grouped by "
+            "tenor) rather than a flat list of triples -- paste this risk factor's "
+            "'Delta_Surface'/'Surface' -> '.Curve' -> 'data' structure and I'll "
+            "adjust the parsing to match."
+        )
+
+    if surface_type == "malz":
+        vol_surface = MalzVol(raw)
+    else:
+        vol_surface = NonPreciousCommodityVol(raw)
     return _MalzVolAdapter(vol_surface, forward_curve)
 
 
