@@ -102,3 +102,33 @@ def create_rate_df(rate: float) -> pd.DataFrame:
     )
 
     return df
+
+    _cutoff = cutoff_date if cutoff_date is not None else val_date
+    future = filter_future_periods(schedule, _cutoff, include_on_val_date)
+    if not future:
+        return np.zeros(n_paths)
+
+    last_end = max(e for _, e, _, _ in schedule)
+    ql_val = to_ql_date(val_date)
+    hist_map: Dict[date, float] = historical_cpi_map or {}
+
+    spot_cpi, cpi_interp, infl_curve, last_pub_date = _resolve_cpi_setup(
+        leg, val_date, market_state, cpi_interpolator,
+        inflation_rate_interpolator, cpi_last_pub_date,
+    )
+
+    _, t_ends, t_pays, accruals = compute_period_year_fractions(
+        future, val_date, curve_day_counter,
+    )
+    dfs = discount_curve.discount_factor(t_pays)
+
+    n_periods = len(future)
+    coupon_rate = leg.fixed_rate + leg.spread
+
+    index_ratios = np.empty((n_paths, n_periods), dtype=np.float64)
+    for i, (_, end_date, _, _) in enumerate(future):
+        index_ratios[:, i] = _index_ratio_at(
+            end_date, leg, val_date, hist_map, cpi_interp, spot_cpi,
+            infl_curve, last_pub_date, curve_day_counter, ql_val, n_paths,
+            cpi_fixings,
+        )
