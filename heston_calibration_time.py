@@ -410,7 +410,24 @@ class BootstrapResult:
 
 class BootstrapCalibrator:
     def __init__(self, market: MarketData, feller=True, bounds=BUCKET_BOUNDS,
-                 weights="spread", objective="vol"):
+                 weights="spread", objective="vol", moneyness_bounds=None):
+        """
+        moneyness_bounds: optional {bucket_index: (lo_pct, hi_pct)}, 0-based in
+        maturity order (0 = shortest). Restricts which quotes THAT bucket is
+        CALIBRATED against to K/S0 in [lo_pct, hi_pct]; buckets not listed use every
+        quote at that maturity, unchanged. report()/plot() still show the fit
+        against the FULL smile regardless -- only the optimizer's own target set
+        narrows. Keyed by index rather than the maturity value itself so there's no
+        float-equality matching to get wrong.
+
+        Use this for short-dated buckets where deep OTM/ITM quotes (wide bid-ask,
+        near-zero vega, so a tiny pricing error becomes a huge implied-vol error --
+        see Benhamou-Gobet-Miri (2010) sec. 3) drag kappa/sigma to extremes trying
+        to match noise, which is also what tends to push the FINAL calibrated
+        price outside arbitrage bounds for those same strikes (-> NaN implied
+        vols) and what a Feller constraint fights hardest at short maturities.
+        E.g. {0: (0.90, 1.10)} restricts only the first (shortest) bucket.
+        """
         if objective not in ("vol", "price"):
             raise ValueError("objective must be 'vol' or 'price'")
         if objective == "price" and market.price is None:
@@ -421,6 +438,22 @@ class BootstrapCalibrator:
         self.objective = objective
         self.weights_name = weights
         self.maturities = np.unique(market.T)
+        self.moneyness_bounds = moneyness_bounds or {}
+
+    def _fit_selection(self, bucket_idx: int, sel: np.ndarray) -> np.ndarray:
+        """sel (bool mask, m.T==Ti) narrowed to this bucket's moneyness_bounds, if any."""
+        bounds = self.moneyness_bounds.get(bucket_idx)
+        if bounds is None:
+            return sel
+        lo, hi = bounds
+        moneyness = self.m.K / self.m.S0
+        narrowed = sel & (moneyness >= lo) & (moneyness <= hi)
+        if narrowed.sum() < 4:
+            raise ValueError(
+                f"moneyness_bounds[{bucket_idx}]=({lo},{hi}) leaves only "
+                f"{int(narrowed.sum())} quote(s) -- need at least 4 to fit "
+                f"(kappa, theta, sigma, rho)")
+        return narrowed
 
     # ---- per-maturity weights, same formulas as Calibrator._weights --------
     def _weights(self, sel: np.ndarray) -> np.ndarray:
@@ -533,8 +566,9 @@ class BootstrapCalibrator:
         td = HestonTDParams(v0, [])
         fits = []
         T_prev = 0.0
-        for Ti in self.maturities:
-            sel = m.T == Ti
+        for bucket_idx, Ti in enumerate(self.maturities):
+            sel_all = m.T == Ti
+            sel = self._fit_selection(bucket_idx, sel_all)
             x0 = self._initial_guess_bucket(sel)
             t0 = time.perf_counter()
             if method == "solver":
@@ -552,8 +586,10 @@ class BootstrapCalibrator:
             td.buckets.append(HestonBucket(T_prev, Ti, *[float(v) for v in x]))
             fits.append(BucketFit(Ti, n_evals, seconds, sse))
             if verbose:
+                narrowed = " (narrowed fit)" if sel.sum() < sel_all.sum() else ""
                 print(f"  bucket [{T_prev:.4f}, {Ti:.4f}]: {td.buckets[-1]}   "
-                     f"SSE={sse:.6e}  ({n_evals} evals, {seconds:.1f}s)")
+                     f"SSE={sse:.6e}  ({n_evals} evals, {seconds:.1f}s, "
+                     f"{int(sel.sum())}/{int(sel_all.sum())} quotes used{narrowed})")
             T_prev = Ti
         return BootstrapResult(td, m, method, self.objective, self.weights_name, fits)
 
