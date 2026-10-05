@@ -65,7 +65,7 @@ import numpy as np
 from scipy import optimize
 
 from heston_calibration import (
-    I, DEFAULT_BOUNDS, NAN_PENALTY, DOWNSIDE_WEIGHT,
+    I, DEFAULT_BOUNDS, NAN_PENALTY, DOWNSIDE_WEIGHT, VEGA_WEIGHT_CAP,
     MarketData, HestonParams, heston_vols, heston_call, bs_vega,
     EXAMPLE_S0, EXAMPLE_PRICES, EXAMPLE_SVI,
 )
@@ -456,11 +456,6 @@ class BootstrapCalibrator:
         return narrowed
 
     # ---- per-maturity weights, same formulas as Calibrator._weights --------
-    #: weights_name == "vega": cap each quote's 1/vega^2 at this multiple of that
-    #: bucket's OWN median weight, so one near-zero-vega quote can't numerically
-    #: swamp the objective -- see the docstring below for why that risk is real here.
-    VEGA_WEIGHT_CAP = 100.0
-
     def _weights(self, sel: np.ndarray) -> np.ndarray:
         """
         "vega": 1/BS-vega^2 at each quote's own (K, T), vega computed off the
@@ -494,7 +489,7 @@ class BootstrapCalibrator:
         elif self.weights_name == "vega":
             vega = bs_vega(m.S0, m.K[sel], m.T[sel], m.r[sel], m.q[sel], m.vol[sel])
             w = 1.0 / np.maximum(vega, 1e-12) ** 2
-            w = np.minimum(w, self.VEGA_WEIGHT_CAP * np.median(w))
+            w = np.minimum(w, VEGA_WEIGHT_CAP * np.median(w))
         elif self.weights_name == "spread":
             if self.objective == "price":
                 if m.bid is None or m.ask is None:

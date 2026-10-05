@@ -40,6 +40,8 @@ Usage
     python test_constant_vs_time_dependent.py                  # quick (SLSQP), recalibrates
     python test_constant_vs_time_dependent.py --use-saved       # read existing JSON files instead
     python test_constant_vs_time_dependent.py --method asa+solver --max-evals 3000
+    python test_constant_vs_time_dependent.py --source csv --csv my_options.csv --S0 1234.5
+    python test_constant_vs_time_dependent.py --weights vega    # both models, vega weighting
 Exit code 0 = both gates passed, 1 = a gate failed (message explains which).
 """
 from __future__ import annotations
@@ -101,13 +103,24 @@ def test_self_consistency(verbose=True) -> bool:
 # =============================================================================
 # market data (shared by both calibrations, so the comparison is apples-to-apples)
 # =============================================================================
-def build_market() -> MarketData:
-    r, T, K, px, bid, ask = EXAMPLE_PRICES.T
-    return MarketData.from_prices(EXAMPLE_S0, T, K, px, r=r, q=0.0, option_type="call",
-                                  bid=bid, ask=ask)
+def build_market(source="prices", csv_file=None, S0=None, r=0.0, q=0.0) -> MarketData:
+    """source="prices": EXAMPLE_PRICES (Moodley 2005 Anglo American calls), the default
+    so the gate keeps running out of the box with no files to supply.
+    source="csv": header T,K,price[,bid,ask][,type][,r][,q] -- same format
+    MarketData.from_csv / run_calibration_time_heston.py's own CSV path expect; missing
+    r/q columns fall back to the r, q arguments here."""
+    if source == "prices":
+        rate, T, K, px, bid, ask = EXAMPLE_PRICES.T
+        return MarketData.from_prices(EXAMPLE_S0, T, K, px, r=rate, q=0.0,
+                                      option_type="call", bid=bid, ask=ask)
+    if source == "csv":
+        if not (csv_file and S0):
+            raise ValueError("source='csv' needs both csv_file and S0")
+        return MarketData.from_csv(csv_file, S0, r=r, q=q)
+    raise ValueError("source must be 'prices' or 'csv'")
 
 
-def get_constant(market, method, max_evals, seed, use_saved):
+def get_constant(market, method, max_evals, seed, use_saved, weights="spread"):
     if use_saved:
         try:
             p, _ = load_params("heston_params_vol.json")
@@ -115,12 +128,12 @@ def get_constant(market, method, max_evals, seed, use_saved):
             return p
         except FileNotFoundError:
             print("heston_params_vol.json not found, calibrating instead")
-    cal = Calibrator(market, weights="spread", objective="vol")
+    cal = Calibrator(market, weights=weights, objective="vol")
     res = cal.calibrate(method=method, max_evals=max_evals, seed=seed, verbose=False)
     return res.params
 
 
-def get_time_dependent(market, method, max_evals, seed, use_saved):
+def get_time_dependent(market, method, max_evals, seed, use_saved, weights="spread"):
     if use_saved:
         try:
             td, _ = load_td_params("heston_td_params_vol.json")
@@ -128,7 +141,7 @@ def get_time_dependent(market, method, max_evals, seed, use_saved):
             return td
         except FileNotFoundError:
             print("heston_td_params_vol.json not found, calibrating instead")
-    cal = BootstrapCalibrator(market, weights="spread", objective="vol")
+    cal = BootstrapCalibrator(market, weights=weights, objective="vol")
     res = cal.calibrate(method=method, max_evals=max_evals, seed=seed, verbose=False)
     return res.td
 
@@ -182,10 +195,22 @@ def test_fit_by_maturity(market, const_params, td_params, verbose=True) -> bool:
 # =============================================================================
 def main():
     ap = argparse.ArgumentParser(description="Test gate: constant vs time-dependent Heston")
+    ap.add_argument("--source", choices=["prices", "csv"], default="prices",
+                    help="market data: 'prices' (default) = EXAMPLE_PRICES, the Moodley "
+                         "2005 Anglo American calls, needs no files; 'csv' reads --csv")
+    ap.add_argument("--csv", help="source='csv': path to a T,K,price[,bid,ask][,type][,r,q] file")
+    ap.add_argument("--S0", type=float, help="source='csv': spot (required)")
+    ap.add_argument("--r", type=float, default=0.0, help="source='csv': fallback rate for rows "
+                                                           "with no r column")
+    ap.add_argument("--q", type=float, default=0.0, help="source='csv': fallback dividend yield "
+                                                           "for rows with no q column")
     ap.add_argument("--method", choices=["solver", "asa", "asa+solver"], default="solver",
                     help="recalibration method if --use-saved is not given or files are "
                          "missing; 'solver' (fast, local) is the default so this test runs "
                          "quickly -- pass asa+solver to check the production calibration")
+    ap.add_argument("--weights", choices=["spread", "equal", "downside", "vega"], default="spread",
+                    help="same weighting schemes as Calibrator/BootstrapCalibrator, applied "
+                         "to BOTH models so the comparison stays apples-to-apples")
     ap.add_argument("--max-evals", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--use-saved", action="store_true",
@@ -196,9 +221,11 @@ def main():
 
     gate1 = test_self_consistency()
 
-    market = build_market()
-    const_params = get_constant(market, args.method, args.max_evals, args.seed, args.use_saved)
-    td_params = get_time_dependent(market, args.method, args.max_evals, args.seed, args.use_saved)
+    market = build_market(args.source, args.csv, args.S0, args.r, args.q)
+    const_params = get_constant(market, args.method, args.max_evals, args.seed, args.use_saved,
+                                args.weights)
+    td_params = get_time_dependent(market, args.method, args.max_evals, args.seed, args.use_saved,
+                                   args.weights)
     print(f"\nConstant Heston:  {const_params}\n")
 
     gate2 = test_fit_by_maturity(market, const_params, td_params)
