@@ -28,8 +28,13 @@ METHOD = "asa+solver"       # "solver" | "asa" | "asa+solver" -- same choices as
                              # the constant model, applied once PER BUCKET
 OBJECTIVE = "price"           # "vol" = implied-vol errors | "price" = Moodley's S(Omega)
 FELLER = True                # enforce 2*kappa_i*theta_i > sigma_i^2 in EVERY bucket
-WEIGHTS = "spread"           # "spread" | "equal" | "downside" -- same formulas as
-                             # Calibrator._weights, applied within each maturity slice
+WEIGHTS = "spread"           # "spread" | "equal" | "downside" | "vega" -- same formulas
+                             # as Calibrator._weights, applied within each maturity slice.
+                             # "vega" = 1/BS-vega^2: downweights ATM, upweights the wings
+                             # (capped per-bucket so one illiquid quote can't dominate --
+                             # see BootstrapCalibrator._weights' docstring). Opposite
+                             # direction from MONEYNESS_BOUNDS -- don't use both on the
+                             # same bucket.
 MAX_EVALS = 3000             # ASA iterations PER BUCKET (5 buckets x 3000 ~ 15000 evals total)
 SEED = 0
 BOUNDS = BUCKET_BOUNDS       # kappa, theta, sigma, rho bounds (v0 fixed from the shortest maturity)

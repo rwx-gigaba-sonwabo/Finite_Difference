@@ -66,7 +66,7 @@ from scipy import optimize
 
 from heston_calibration import (
     I, DEFAULT_BOUNDS, NAN_PENALTY, DOWNSIDE_WEIGHT,
-    MarketData, HestonParams, heston_vols, heston_call,
+    MarketData, HestonParams, heston_vols, heston_call, bs_vega,
     EXAMPLE_S0, EXAMPLE_PRICES, EXAMPLE_SVI,
 )
 
@@ -456,13 +456,45 @@ class BootstrapCalibrator:
         return narrowed
 
     # ---- per-maturity weights, same formulas as Calibrator._weights --------
+    #: weights_name == "vega": cap each quote's 1/vega^2 at this multiple of that
+    #: bucket's OWN median weight, so one near-zero-vega quote can't numerically
+    #: swamp the objective -- see the docstring below for why that risk is real here.
+    VEGA_WEIGHT_CAP = 100.0
+
     def _weights(self, sel: np.ndarray) -> np.ndarray:
+        """
+        "vega": 1/BS-vega^2 at each quote's own (K, T), vega computed off the
+        MARKET's own quoted mid implied vol (model-free, fixed once from market data
+        -- NOT recomputed from the Heston candidate during optimisation, which would
+        make the weights move every iteration). First order, dPrice ~ vega*dVol, so
+        dPrice^2/vega^2 ~ dVol^2 -- this turns a "price" objective's SSE into an
+        approximate vol-space SSE, i.e. every quote's IMPLIED VOL error counts
+        roughly equally regardless of its price magnitude.
+
+        Vega peaks ATM and decays toward the wings, so this DOWNWEIGHTS ATM and
+        UPWEIGHTS the wings -- the OPPOSITE direction from moneyness_bounds, which
+        excludes wings outright. Deliberately combining the two on the SAME bucket
+        is contradictory (moneyness_bounds removes the wings; vega weighting asks
+        the optimiser to care about them extra). Use vega weighting on buckets whose
+        wings are liquid and trustworthy and you want the skew SHAPE respected
+        evenly; use moneyness_bounds on buckets whose wings are the problem.
+
+        A genuinely near-zero vega (deep OTM/ITM, very short T) can make 1/vega^2
+        enormous, so each bucket's weights are capped at VEGA_WEIGHT_CAP times that
+        bucket's own median weight -- without this, a single illiquid quote could
+        numerically dominate the fit, which is exactly the failure mode this whole
+        weighting discussion started from.
+        """
         m = self.m
         n = int(sel.sum())
         if self.weights_name == "equal":
             w = np.ones(n)
         elif self.weights_name == "downside":
             w = np.where(m.K[sel] <= m.S0, DOWNSIDE_WEIGHT, 1.0)
+        elif self.weights_name == "vega":
+            vega = bs_vega(m.S0, m.K[sel], m.T[sel], m.r[sel], m.q[sel], m.vol[sel])
+            w = 1.0 / np.maximum(vega, 1e-12) ** 2
+            w = np.minimum(w, self.VEGA_WEIGHT_CAP * np.median(w))
         elif self.weights_name == "spread":
             if self.objective == "price":
                 if m.bid is None or m.ask is None:
@@ -473,7 +505,7 @@ class BootstrapCalibrator:
                 band = m.vol_band()
                 w = np.ones(n) if band is None else 1.0 / band[sel] ** 2
         else:
-            raise ValueError("weights must be 'spread', 'equal' or 'downside'")
+            raise ValueError("weights must be 'spread', 'equal', 'downside' or 'vega'")
         return w if self.objective == "price" else w / w.mean()
 
     def _bucket_feasible(self, x) -> bool:
