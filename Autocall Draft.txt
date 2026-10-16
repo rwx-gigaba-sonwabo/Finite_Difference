@@ -1,0 +1,37 @@
+Good afternoon,
+
+Please find below an update on the autocall validation.
+
+1. Base valuation: largely complete
+
+Using the agreed approach (forward/flat volatility, with each autocall priced as its booked components), we have tested RiskFlow's base valuation across a broad set of autocall trades. Our independent challenger model shows close alignment, and we are comfortable with the general pricing mechanics.
+
+One issue has been identified. It concerns the digital skew adjustment, the setting that accounts for the volatility smile when pricing digital options:
+
+RiskFlow applies the adjustment to the European digital option, but not to the barrier digital option booked to offset it when an autocall is called.
+With the adjustment switched on, the European digital's price moves by roughly 25–30%, depending on where spot sits relative to the autocall barrier. The offsetting barrier digital does not move.
+With the adjustment switched off, RiskFlow and our challenger align closely.
+We are now quantifying the net effect on the overall autocall price. If it is material, a code change will be needed in RiskFlow so that the barrier digital is priced on the same basis.
+
+2. Future exposure profiles (PFE): in progress
+
+Work on pricing the autocalls through future exposure simulation, a prerequisite for the PFE calculations, has begun. We expect to complete it over the next week.
+
+3. SIMM sensitivities: subject to timelines
+
+Once the SIMM calculations in RiskFlow have been updated, we will validate the corresponding sensitivities and include them in the validation document. If this cannot be completed before the mid-November deadline, it will be carried forward as an agreed post-deadline action item, as previously discussed.
+
+Priorities, in order:
+
+Base valuation pricing
+Future exposure simulation (PFE)
+SIMM sensitivities
+4. Market data limitation
+
+Up-to-date volatility surfaces are currently available only for the S&P 500 and EURO STOXX 50. We will therefore compare base valuations against hedge counterparty prices for those trades only.
+
+This does not affect the validation of RiskFlow's pricing mechanics.
+It does limit our ability to show the impact of the forward/flat volatility model across the full portfolio.
+The remaining volatility data is going through legal and procurement. Once approved, IPV will source quotes from ICE and calibrate SVI surfaces for the other underlyings.
+Kind regards,
+Sonwabo
