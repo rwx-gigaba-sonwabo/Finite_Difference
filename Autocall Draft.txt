@@ -1,37 +1,35 @@
-Good afternoon,
+Subject: RE: Riskworx Autocall Validation Update (23/10/2026)
+
+Good day all,
 
 Please find below an update on the autocall validation.
 
 1. Base valuation: largely complete
+Using the agreed approach (forward/flat volatility, with each autocall priced as its booked components), we have tested RiskFlow's base valuation across a broad set of autocall trades. Our independent Monte Carlo challenger model shows close alignment, and we are comfortable with the pricing mechanics. The results now need to be written up in the validation document.
 
-Using the agreed approach (forward/flat volatility, with each autocall priced as its booked components), we have tested RiskFlow's base valuation across a broad set of autocall trades. Our independent challenger model shows close alignment, and we are comfortable with the general pricing mechanics.
+The digital skew issue raised last week has been resolved and verified. RiskFlow and the validation model now apply the same method for the volatility skew adjustment on both the digital and the digital contra options.
 
-One issue has been identified. It concerns the digital skew adjustment, the setting that accounts for the volatility smile when pricing digital options:
+As further evidence, we will plot the convergence of our full Monte Carlo against RiskFlow's One-Step Survival (OSS) pricing for the base trades. This will show the number of simulations at which the two converge and confirm that the OSS pricing works as expected. It will also support our use of OSS in the future exposure work (see below).
 
-RiskFlow applies the adjustment to the European digital option, but not to the barrier digital option booked to offset it when an autocall is called.
-With the adjustment switched on, the European digital's price moves by roughly 25–30%, depending on where spot sits relative to the autocall barrier. The offsetting barrier digital does not move.
-With the adjustment switched off, RiskFlow and our challenger align closely.
-We are now quantifying the net effect on the overall autocall price. If it is material, a code change will be needed in RiskFlow so that the barrier digital is priced on the same basis.
+2. Future exposure profiles (PFE): in progress, approximately 60% complete
+We expect to complete this by Friday, 30 October 2026.
 
-2. Future exposure profiles (PFE): in progress
+Pricing the autocalls with a full Monte Carlo inside the outer exposure simulation is not feasible on the available hardware. As OSS computes survival probabilities analytically, it is far more efficient. We will therefore validate RiskFlow's OSS pricer on future exposure dates using our own OSS implementation. To confirm this remains appropriate, we will also test the convergence of our full Monte Carlo against RiskFlow's OSS on a sample of exposure dates. The rationale for this choice will be recorded in the validation document.
 
-Work on pricing the autocalls through future exposure simulation, a prerequisite for the PFE calculations, has begun. We expect to complete it over the next week.
-
-3. SIMM sensitivities: subject to timelines
-
-Once the SIMM calculations in RiskFlow have been updated, we will validate the corresponding sensitivities and include them in the validation document. If this cannot be completed before the mid-November deadline, it will be carried forward as an agreed post-deadline action item, as previously discussed.
+3. SIMM sensitivities: planned for 29 October to 6 November 2026
+This depends on the SIMM calculation code in RiskFlow being ready. Once available, we will validate the sensitivities and include them in the validation document. If this cannot be completed before the mid-November deadline, it will be carried forward as an agreed post-deadline action item, as discussed in today's meeting.
 
 Priorities, in order:
+1) Base valuation
+2) Future exposure simulation (PFE)
+3) SIMM sensitivities
 
-Base valuation pricing
-Future exposure simulation (PFE)
-SIMM sensitivities
-4. Market data limitation
+Market data
+- Dividends: confirmed by IPV as available in Front Arena and mapped.
+- Correlations: confirmed by IPV as available in Front Arena and mapped.
+- Volatility: up-to-date surfaces are currently available only for the S&P 500 and EURO STOXX 50. The business has approved the cost of the remaining data, which is now going through procurement and legal. Once approved, IPV will source quotes from ICE and calibrate SVI surfaces for the other underlyings. We expect these to be mapped in the coming weeks.
 
-Up-to-date volatility surfaces are currently available only for the S&P 500 and EURO STOXX 50. We will therefore compare base valuations against hedge counterparty prices for those trades only.
+The volatility constraint does not affect the validation of RiskFlow's pricing mechanics. It does mean that, for now, comparisons against hedge counterparty valuations are limited to trades on the two indices above. We believe these trades are sufficient to assess the materiality of the forward/flat volatility approach.
 
-This does not affect the validation of RiskFlow's pricing mechanics.
-It does limit our ability to show the impact of the forward/flat volatility model across the full portfolio.
-The remaining volatility data is going through legal and procurement. Once approved, IPV will source quotes from ICE and calibrate SVI surfaces for the other underlyings.
 Kind regards,
-Sonwabo
+Gigaba Sonwabo
