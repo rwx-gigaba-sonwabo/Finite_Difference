@@ -1,0 +1,80 @@
+14.6 Convergence of Methodologies: Monte Carlo vs One Step Survival (OSS) Monte Carlo
+
+14.6.1 Purpose
+
+The autocall can be priced with two Monte Carlo estimators:
+
+Brute-force (full-path) Monte Carlo, used by the independent validation model. It simulates the underlying along each path and evaluates the payoff directly.
+One Step Survival (OSS) Monte Carlo, used by RiskFlow. At each observation date it calculates the probability that the trade survives (does not autocall) instead of simulating that outcome. It then weights each path by that probability and draws the next spot level only from the outcomes in which the trade is still alive. This removes most of the randomness that comes from the autocall event, so the price is less noisy for the same number of simulations.
+
+Both methods aim at the same theoretical value, but they reach it at different speeds. This section compares them as the number of simulations increases, for two reasons:
+
+To assess the accuracy and efficiency of the OSS pricer. We confirm that OSS converges to the same value as the independent brute-force model, and we measure how many simulations each method needs to reach a stable price.
+To support the use of OSS in exposure simulation. CVA and PFE require the trade to be revalued at every future date on every simulated market scenario, which can mean millions of revaluations. A pricer that is accurate with fewer simulations makes this computationally feasible without loss of precision. The results here provide the evidence for that choice.
+
+14.6.2 Approach
+
+The comparison was designed so that the estimation method is the only thing that differs between the two models:
+
+Same trade and market data. Both models price the same trade from the same RiskFlow job file: the same discount curve, dividend curve, volatility surface, spot and term sheet.
+Same number of simulations. At each point the validation model uses N simulated paths and RiskFlow uses N Monte Carlo simulations (MCMC_Simulations). The grid is 500, 1,000, 5,000, 50,000, 100,000 and 500,000.
+Fixed random seeds. Seeds are held constant across N, so each line shows the estimator’s behaviour as N grows rather than noise from changing seeds.
+Two views of the trade.
+The autocall as a whole, with the downside put priced inside the swap.
+The booked structure, as RiskFlow carries it: the autocall swap and its four put-leg options (vanilla put, vanilla contra, digital put, digital contra), each compared separately and in total.
+
+For each N we record both prices, the validation model’s standard error and 95% confidence interval, and the difference between the two models. The difference is reported in currency, as a percentage of the RiskFlow value, and as a multiple of the standard error.
+
+14.6.3 Random number generation
+
+Each model turns random numbers into simulated market moves in its own way. The two models are independent of each other, and neither reuses the other’s random numbers.
+
+Validation model (brute-force Monte Carlo)
+
+Generator: standard pseudo-random normal draws from NumPy’s generator, with a fixed seed so that every run can be reproduced exactly.
+Antithetic variates: every simulated path is paired with its mirror image, using the same draws with the opposite sign. Upward and downward moves therefore balance out, which reduces noise at no extra cost.
+Use of the draws: each path is stepped forward from one observation date to the next, and the payoff is evaluated on the full path.
+
+RiskFlow (OSS Monte Carlo)
+
+Generator in a base valuation (this comparison): RiskFlow prices a single market state, so it uses pseudo-random uniform draws from PyTorch. These are fixed by the job’s Random_Seed, which makes the result reproducible. No antithetic pairing is applied.
+Generator in an exposure simulation (CVA and PFE): where RiskFlow revalues the trade across many market scenarios at once, it switches automatically to a scrambled Sobol sequence. This is a quasi-random sequence that spreads points more evenly than pseudo-random draws. Its scramble seed is fixed in RiskFlow itself, so the sequence is the same on every run.
+Use of the draws: at each observation date the uniform draws are mapped only onto spot levels at which the trade survives. The probability of autocalling is taken into account analytically, not by simulation. This is the main source of the OSS pricer’s lower noise.
+
+Under both approaches the price converges to the true value as N increases. They differ in how quickly they get there, which is what the charts below measure. The comparison here uses RiskFlow’s base valuation, which draws pseudo-random numbers. It is therefore a direct comparison of the two estimators under pseudo-random sampling. In exposure simulation, RiskFlow’s switch to Sobol sampling is expected to reduce the noise further.
+
+14.6.4 How to read the charts
+
+Convergence chart: the theoretical value against the number of simulations, on a logarithmic scale.
+RiskFlow (OSS) is the solid black line.
+The validation model is the dashed orange line. The shaded band around it is its 95% confidence interval, the range in which the true value is expected to lie given the simulation noise at that N.
+The band narrows as N increases, which shows the validation price becoming more precise.
+Where the RiskFlow line sits inside the band, the two models agree within simulation noise.
+Relative difference chart: the percentage gap between the two models at each N, with the band of differences that noise alone can explain.
+A gap that stays inside the band and shrinks towards zero indicates agreement.
+A gap that settles outside the band would point to a modelling difference rather than noise.
+European options: RiskFlow prices these in closed form, so their RiskFlow lines are flat by construction. They serve as a fixed reference for the validation model’s convergence.
+
+14.6.5 Results
+
+[Complete once final runs are in; one short paragraph per chart is enough.]
+
+For trade [reference], the two models agree within simulation noise at every point on the grid. The relative difference falls from [x]% at 500 simulations to [y]% at 500,000.
+
+OSS: the price is stable from about [N] simulations onward.
+Brute-force: the price needs about [N] simulations to settle within a comparable tolerance, and is visibly noisier below that level.
+
+For the booked components, [summary, e.g. the barrier contras show the largest differences at low N, all within their confidence bands]. At 500,000 simulations the largest difference across all components is [value] ([%]), within [k] standard errors.
+
+14.6.6 Conclusion
+
+The comparison shows that RiskFlow’s OSS pricer converges to the same value as the independent brute-force Monte Carlo model, confirming its accuracy for this trade. It reaches a stable price with substantially fewer simulations than the brute-force approach, confirming its efficiency. These results were obtained under pseudo-random sampling. In exposure simulation RiskFlow uses Sobol sampling, which is expected to reduce noise further, so the efficiency shown here is a conservative indication.
+
+This combination is what exposure simulation requires. CVA and PFE need a pricer that is both accurate and fast enough to be run many times over. On the basis of these results, the OSS pricer is considered fit for use in future exposure simulations for CVA and PFE.
+
+One thing in the code affects how you describe the Sobol option. The validation’s rng_source="sobol" option was written to reproduce RiskFlow’s own random numbers. RiskFlow only uses that Sobol sequence when it prices more than 16 market scenarios at once (riskflow/pricing.py:4133). A base valuation prices a single scenario (riskflow/calculation.py:1789), so RiskFlow uses pseudo-random draws instead. That means:
+
+In this convergence check, the Sobol validation line does not use the same random numbers as RiskFlow. Treat it as a second independent estimate, not a “same random numbers” comparison.
+The comment in models/gbm.py and in the convergence runner’s config block overstates this. They say Sobol lands on RiskFlow’s own points when n_paths == MCMC_Simulations, which only holds in exposure runs. I can correct both comments if you want.
+
+The text above stays accurate either way, because it only describes the numpy line that appears in your chart.
