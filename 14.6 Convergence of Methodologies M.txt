@@ -78,3 +78,24 @@ In this convergence check, the Sobol validation line does not use the same rando
 The comment in models/gbm.py and in the convergence runner’s config block overstates this. They say Sobol lands on RiskFlow’s own points when n_paths == MCMC_Simulations, which only holds in exposure runs. I can correct both comments if you want.
 
 The text above stays accurate either way, because it only describes the numpy line that appears in your chart.
+
+
+
+
+Speed of convergence. The two estimators behave very differently as M increases:
+
+RiskFlow (OSS). The price is stable from about 500 simulations onward. Across the whole grid it lies between −56,417.54 and −56,382.65, a range of 0.06% of its value. From 5,000 simulations onward the range is 0.01%.
+Validation (full-path MC). The price moves between −55,857.63 and −57,358.01 across the grid, a range of 2.7%. Its 95% confidence interval narrows only in proportion to 1/√M, from ±18% at 500 simulations to ±0.66% at 500,000. About 170,000 simulations are needed for the interval to fall within ±1% of the price.
+
+The difference comes from how each method treats the autocall decision. The full-path model records each autocall as a 0 or 1 event, so every path carries the full noise of that outcome. OSS computes the autocall probability on each observation date analytically, books the coupon in expectation, and simulates only the surviving part of the path. Most of the randomness is therefore removed before any path is drawn.
+
+15.3 Conclusion
+
+For this test trade, the results support the use of OSS in future exposure simulation on two counts:
+
+Accuracy. RiskFlow’s OSS pricer converges to the same value as the independent full-path model, within simulation noise at every simulation count tested.
+Efficiency. OSS reaches a stable price (within 0.06%) at 500 simulations. The full-path model needs about 170,000 simulations to reach a ±1% confidence interval. For a comparable precision, OSS therefore needs more than two orders of magnitude fewer simulations.
+
+Exposure simulation revalues the trade on every future date of every market scenario, so the number of inner simulations per revaluation directly drives the run time. A pricer that is accurate with a few hundred to a few thousand inner simulations makes CVA and PFE pricing of the autocall computationally feasible without loss of precision.
+
+These results were obtained under pseudo-random sampling, as used in RiskFlow’s base valuation. In exposure simulation RiskFlow switches to scrambled Sobol sampling, which is expected to reduce noise further, so the efficiency shown here is a conservative indication. On this basis, the OSS pricer is considered fit for use in future exposure simulations for CVA and PFE.
