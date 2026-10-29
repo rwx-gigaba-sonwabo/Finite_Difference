@@ -99,3 +99,24 @@ Efficiency. OSS reaches a stable price (within 0.06%) at 500 simulations. The fu
 Exposure simulation revalues the trade on every future date of every market scenario, so the number of inner simulations per revaluation directly drives the run time. A pricer that is accurate with a few hundred to a few thousand inner simulations makes CVA and PFE pricing of the autocall computationally feasible without loss of precision.
 
 These results were obtained under pseudo-random sampling, as used in RiskFlow’s base valuation. In exposure simulation RiskFlow switches to scrambled Sobol sampling, which is expected to reduce noise further, so the efficiency shown here is a conservative indication. On this basis, the OSS pricer is considered fit for use in future exposure simulations for CVA and PFE.
+
+Agreement between the two models. At every simulation count, the RiskFlow price lies inside the validation model’s 95% confidence interval (Table 25, CI 95% columns). Figure 2 shows the same result as a relative difference: the RiskFlow price stays within the ±1.96 SE band at every point on the grid. Any remaining difference between the two models is therefore consistent with simulation noise in the validation estimate. It does not indicate a difference in methodology.
+
+Conclusion
+
+For this test trade, the results support the use of OSS in RiskFlow on two counts:
+
+Accuracy. RiskFlow’s OSS pricer converges to the same value as the independent full-path model. The RiskFlow price lies within the validation 95% confidence interval at every simulation count tested.
+Efficiency. OSS reaches a stable price (within 0.06%) at 500 simulations. The full-path model needs far more simulations to reach a comparable precision.
+
+Choice of 500,000 simulations for the base valuation comparisons. Because the full-path model converges slowly, its simulation count sets the precision of every base valuation comparison in this document (Section [X]). At 500,000 simulations:
+
+the validation standard error is 189.19, about 0.34% of the price, giving a 95% confidence interval of ±370.82 (±0.66%);
+the RiskFlow price (−56,383.39) lies inside that interval (−56,987.33 to −56,245.71), with a relative difference of 0.41%;
+the RiskFlow price itself is fully converged, so the comparison is limited only by the noise in the validation model.
+
+A difference larger than about 0.7% between the two models at 500,000 simulations can therefore be attributed to the models rather than to simulation noise. Halving the confidence interval again would need four times as many paths (2,000,000), at four times the run time, for a gain in precision that would not change any conclusion in this document. 500,000 simulations is therefore a sound balance between precision and run time for the base valuation comparisons.
+
+Implication for exposure simulation. Exposure simulation revalues the trade on every future date of every market scenario, so the number of inner simulations per revaluation directly drives the run time. A pricer that is accurate with a few hundred to a few thousand inner simulations makes CVA and PFE pricing of the autocall computationally feasible without loss of precision.
+
+These results were obtained under pseudo-random sampling, as used in RiskFlow’s base valuation. In exposure simulation, RiskFlow switches to scrambled Sobol sampling, which is expected to reduce noise further, so the efficiency shown here is a conservative indication. On this basis, the OSS pricer is considered fit for use in future exposure simulations for CVA and PFE (Section 16).
