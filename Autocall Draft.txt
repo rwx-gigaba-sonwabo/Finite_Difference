@@ -1,32 +1,38 @@
-Subject: RE: Riskworx Autocall Validation Update (30/10/2026)
-
 Good afternoon all,
 
-Please find below an update on the autocall validation.
+Please find below an update on the autocall validation following yesterday’s pre-MRF.
 
 Summary
-Base valuation and future exposure testing are complete, and both are reflected in the validation document. SIMM sensitivities have been put on hold until after the MRF. Excluding SIMM, the validation is approximately 80% complete, and we remain on track for the mid-November deadline.
+The autocall validation was presented at the pre-MRF on Thursday 12 November 2026, 14:00–15:00. After discussion of the validation’s scope, the OSS methodology and its accuracy, the forum provisionally concluded that RiskFlow’s autocall implementation is fit for its intended purpose. The validation will be presented for approval at the MRF next week, with the points raised at the pre-MRF addressed up front.
 
-1. Base valuation: Completed
-- Using the agreed approach (forward/flat volatility, with each autocall priced as its booked components), we tested RiskFlow's base valuation across a broad set of autocall trades. Our independent Monte Carlo model aligns closely with RiskFlow, with relative differences well below 1%. We are comfortable with the pricing mechanics.
-- We also compared our full-path Monte Carlo with RiskFlow's One-Step Survival (OSS) pricing. RiskFlow's OSS pricer converges to the same value as our model, but with far fewer simulations (approximately 1,000 against 500,000). This confirms both the accuracy and the efficiency of RiskFlow's OSS implementation. On this basis, 500,000 simulations were used for all base valuation comparisons.
+1. Pre-MRF presentation
 
-2. Future exposure profiles (PFE/CVA): Completed
-- Exposure simulation requires the trade to be repriced on every future date of every market scenario (5,000 to 10,000 simulations on both the outer and inner paths). With full-path Monte Carlo, this proved too computationally intensive for the available hardware, with very long run times per trade.
-- As OSS calculates survival probabilities analytically, it is far more efficient, and the convergence analysis above supports its use. We therefore validated RiskFlow's OSS pricer on future exposure dates using our own OSS implementation.
-- The results show close alignment between the validation model and RiskFlow (relative differences below 1%). This confirms the accuracy of RiskFlow's OSS implementation for pricing autocalls in exposure simulation.
+The results and findings were presented within the context set out in previous updates:
+each autocall is priced in RiskFlow as its booked components;
+volatility is modelled as forward variance;
+all trades are executed under the back-to-back framework.
+The scope of the validation was stated explicitly in the document. Under the back-to-back framework, Investec carries no traded market risk, and official prices for P&L are sourced from the hedge counterparty. RiskFlow’s valuations are used to monitor counterparty credit exposure to the hedge counterparty, not for P&L. The validation assesses the suitability of RiskFlow for that purpose.
+Two main points were discussed:
+What MRF approval covers. The forum clarified that the approval sought is for the use of RiskFlow’s current autocall model to monitor counterparty credit exposure under the back-to-back framework. The forward-variance volatility model is not the preferred approach. However, it is adequate for this purpose, and we confirmed that we are comfortable with it on that basis.
+The OSS Monte Carlo method (raised by Investec UK).
+We explained that One-Step Survival is a variance reduction technique. It calculates the probability of the note surviving each observation date analytically and simulates only the surviving paths. As a result, it reaches a stable price with far fewer simulations than full-path Monte Carlo.
+We demonstrated its accuracy using the convergence analysis and the base valuation and exposure comparisons against our independent full-path model, all of which agreed within the 1% tolerance.
+Investec UK confirmed that they were comfortable with the OSS approach.
+After these clarifications, Investec UK confirmed they were comfortable with the autocall implementation in the context in which it is used. The forum provisionally agreed that the model is fit for purpose.
 
-3. SIMM sensitivities: On hold until after the MRF
-- On 29 October 2026 we were advised that the SIMM calculation code in RiskFlow is ready. However, no SIMM implementation or development documentation is available to us, and this was stated as a prerequisite for the validation.
-- SIMM has also not previously been validated in RiskFlow. As discussed in today's meeting, an internal discussion between Investec and Riskworx is likely needed on what an inception SIMM validation would require.
-- With 6 to 7 business days remaining before the target pre-MRF date (approximately Thursday, 12 November 2026), the SIMM component has been put on hold. It will be addressed after the proposed MRF date (approximately 16 November 2026).
-- The validation document presented at the MRF will therefore cover base valuation and future exposure results only (points 1 and 2 above).
+2. MRF next week
+To reflect the pre-MRF discussion, the MRF presentation will be structured as follows:
 
-Market data (unchanged from the update of 16 October 2026)
-- Dividends and correlations: up to date in Front Arena and mapped.
-- Volatility: up-to-date surfaces are currently available only for the S&P 500 and EURO STOXX 50. The business has approved the cost of the remaining data, which is going through procurement and legal. Once approved, IPV will source quotes from ICE and calibrate SVI surfaces for the other underlyings.
+Context and approval sought: a summary of the pre-MRF discussion points, setting out the scope of the validation under the back-to-back framework and the specific approval requested.
+OSS methodology: a brief explanation of the One-Step Survival method and its variance reduction benefit relative to the full-path Monte Carlo approach of our independent model.
+Results and findings: a short summary of the base valuation, exposure and convergence results, and the key findings.
+Conclusion: confirmation that we consider the model fit for purpose for counterparty credit exposure monitoring, with the recommendation to move to a more sophisticated volatility model, stochastic or local-stochastic volatility, in future.
 
-This does not affect the validation of RiskFlow's pricing mechanics. It does limit comparisons against hedge counterparty valuations to trades on the two indices above. We believe these trades are sufficient to assess the materiality of the forward/flat volatility approach.
+3. SIMM sensitivities (unchanged from 06/11/2026)
+On hold until after the MRF, pending implementation documentation and an internal decision on the scope of an inception SIMM validation.
+
+Market data (unchanged from 16/10/2026)
+Volatility surfaces for the remaining underlyings remain in procurement. This does not affect the validation of RiskFlow’s pricing mechanics.
 
 Kind regards,
-Gigaba Sonwabo
+Sonwabo
